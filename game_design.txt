@@ -603,10 +603,11 @@ and three concrete gaps were found and fixed by porting the relevant logic
      turning scrolls it, walking never does, giving the "infinitely far
      away" look. skyAngularRepeats=4 (the sky texture's width tiles 4
      times across one full 360° turn) is id's own ANGLETOSKYSHIFT constant
-     translated to this project's terms, not a guess. Vertically, the
-     texture is simply stretched to fill whatever screen range asks for
-     it — a simplification against the original's own vertical scale
-     constant, which wasn't tracked down; see the roadmap.
+     translated to this project's terms, not a guess. Vertically, a
+     *fixed* mapping (a column-independent skyVScale texels/row, anchored
+     to the pitch-shifted horizon row) is used — see 12.4 below for why
+     that specifically matters, and where an earlier version of this got
+     it wrong.
 
 12.3 Movement momentum/friction (engine/game.go's handleMovement, new
      VelX/VelY fields) — ported from p_mobj.c's P_XYMovement and p_user.c's
@@ -626,7 +627,46 @@ and three concrete gaps were found and fixed by porting the relevant logic
      application into continuous time via frictionPerTic^(dt*35) so it
      stays frame-rate independent.
 
+12.4 Collision: destination-sector-based step check (collision.go's
+     canMoveTo) — ported from p_map.c's P_TryMove/PIT_CheckLine. This
+     fixed a real, reproducible bug: walking off a raised platform left
+     the player unable to move in *any* direction afterward. The earlier
+     version compared each nearby Linedef's opening (regardless of which
+     side was "current" vs. "destination") against the player's current
+     floor — so standing right next to the ledge just fallen off (which,
+     with no fall arc simulated, is exactly where landing puts you: X/Y
+     doesn't change, only Z snaps down), *every* move, including further
+     away from the ledge, stayed within collision radius of that same
+     boundary line and got rejected as "too high a step," forever, since
+     moving away didn't change which line was nearby. PrBoom's actual
+     tmfloorz is seeded from the *destination point's own sector*
+     (a direct BSP point-location at the target position, refined by
+     touched lines only for a real "can't fit" case) — not from a nearby
+     line's far side — and, separately, real Doom's dropoff protection
+     (P_TryMove's tmfloorz-tmdropoffz check) is skipped entirely for
+     player-controlled movement; only monsters avoid walking off ledges on
+     their own. canMoveTo now does the same: a destination-sector lookup
+     drives the step-up check, and there's no "too far to drop" rejection
+     at all, matching how freely a real Doom player can walk off any ledge.
+
+12.5 Aspect-ratio-preserving presentation (render/vulkan/frame.go's new
+     letterboxViewport) — not ported from a specific PrBoom function (this
+     is a modern-display concern the original 4:3-CRT-only engine never
+     had), but directly motivated by comparing behavior against it: PrBoom
+     (like every accuracy-focused port) letterboxes/pillarboxes its
+     320x200 output to preserve its exact aspect ratio on a non-4:3
+     display rather than stretching it. This project's Vulkan blit
+     previously drew its fullscreen triangle across the *entire* swapchain
+     viewport regardless of the window's actual shape — on the extremely
+     common case of a 16:9-ish window (1.78:1) displaying a 320x200
+     (1.6:1) source, that stretched the image wider relative to its
+     height than intended, which is exactly what "the ceiling looks too
+     close to the floor" looks like. DrawFrame's viewport/scissor now
+     compute the largest centered rectangle that preserves 320:200
+     exactly, letterboxing or pillarboxing with the render pass's black
+     clear color into whatever space is left over.
+
 None of this touched collision's brute-force-over-every-Linedef approach
-(section 9.1) — PrBoom's p_map.c does use the WAD's own BLOCKMAP for this,
-and porting that over remains the obvious next efficiency win; see the
-roadmap.
+otherwise (section 9.1) — PrBoom's p_map.c does use the WAD's own BLOCKMAP
+for this, and porting that over remains the obvious next efficiency win;
+see the roadmap.

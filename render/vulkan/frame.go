@@ -209,6 +209,31 @@ func (r *Renderer) DrawFrame(pix []byte) error {
 	return nil
 }
 
+// letterboxViewport returns the largest centered rectangle within the
+// current swapchain extent that preserves the source frame's exact
+// srcWidth:srcHeight aspect ratio (320:200, i.e. 1.6:1 — see
+// raster.InternalWidth/InternalHeight), letterboxing or pillarboxing with
+// the render pass's black clear color rather than stretching to fill an
+// arbitrary window shape. Without this, a window whose aspect ratio isn't
+// exactly 1.6:1 (nearly every window — a 16:9 window is 1.778:1) visibly
+// distorted the image: stretched wider than tall, which is exactly what
+// made rooms look vertically compressed ("ceiling too close to the floor").
+func (r *Renderer) letterboxViewport() vk.Viewport {
+	srcAspect := float32(r.srcWidth) / float32(r.srcHeight)
+	winW, winH := float32(r.swapchainExtent.Width), float32(r.swapchainExtent.Height)
+
+	w, h := winW, winH
+	if winW/winH > srcAspect {
+		w = winH * srcAspect // window wider than source: pillarbox (bars left/right)
+	} else {
+		h = winW / srcAspect // window taller than source: letterbox (bars top/bottom)
+	}
+	return vk.Viewport{
+		X: (winW - w) / 2, Y: (winH - h) / 2,
+		Width: w, Height: h, MaxDepth: 1,
+	}
+}
+
 // recordCommandBuffer records one frame's commands: transition the frame
 // texture to a transfer destination, copy the freshly-uploaded staging
 // buffer into it, transition it to shader-readable, then run the blit
@@ -274,11 +299,13 @@ func (r *Renderer) recordCommandBuffer(cmd vk.CommandBuffer, imageIndex uint32) 
 	}
 	vk.CmdBeginRenderPass(cmd, &renderPassInfo, vk.SubpassContentsInline)
 
+	vp := r.letterboxViewport()
 	vk.CmdBindPipeline(cmd, vk.PipelineBindPointGraphics, r.pipeline)
-	vk.CmdSetViewport(cmd, 0, 1, []vk.Viewport{{
-		Width: float32(r.swapchainExtent.Width), Height: float32(r.swapchainExtent.Height), MaxDepth: 1,
+	vk.CmdSetViewport(cmd, 0, 1, []vk.Viewport{vp})
+	vk.CmdSetScissor(cmd, 0, 1, []vk.Rect2D{{
+		Offset: vk.Offset2D{X: int32(vp.X), Y: int32(vp.Y)},
+		Extent: vk.Extent2D{Width: uint32(vp.Width), Height: uint32(vp.Height)},
 	}})
-	vk.CmdSetScissor(cmd, 0, 1, []vk.Rect2D{{Extent: r.swapchainExtent}})
 	vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, r.pipelineLayout, 0, 1, []vk.DescriptorSet{r.descriptorSet}, 0, nil)
 	vk.CmdDraw(cmd, 3, 1, 0, 0)
 

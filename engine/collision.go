@@ -45,18 +45,41 @@ func (g *Game) tryMove(dx, dy float64) {
 
 // canMoveTo reports whether a player-radius circle centered at (x, y) can
 // stand there, given fromFloor (the floor height of the sector the player
-// is moving from, used for the step-height check below) — mirroring the
-// two checks Doom's own PIT_CheckLine made against each nearby linedef.
+// is moving from, for the step-height check below).
+//
+// Two independent checks, deliberately split apart — collapsing them into
+// one nearby-line scan (this project's earlier approach) caused a real
+// bug: standing right next to a ledge you'd just walked off, *any* move —
+// including further away from it — got rejected, because that boundary
+// line's "high side" was still within collision radius and got compared
+// against fromFloor regardless of which way you were actually headed.
+//
+//  1. A one-sided line, or a two-sided line whose opening is too short to
+//     fit through (a closed door, a low crawlspace), blocks outright,
+//     regardless of movement direction — this part is still a per-line
+//     scan, correctly, since "can a body physically fit here" doesn't
+//     depend on which way you're facing.
+//  2. The step-up check instead uses the *destination point's own*
+//     sector floor — a direct BSP point-location, mirroring how PrBoom's
+//     P_TryMove seeds tmfloorz from newsubsec->sector->floorheight — not
+//     any nearby line's opening. A nearby wall's far side only matters
+//     once you're actually crossing onto it, which the destination
+//     sector lookup already reflects; and real Doom exempts the player
+//     (though not monsters, which avoid "dropoffs" on their own) from any
+//     "too far to step down" restriction at all — walking off a ledge is
+//     always allowed, only climbing up more than maxStepUp is not.
 func (g *Game) canMoveTo(x, y, fromFloor float64) bool {
-	return !g.anyLineWithin(x, y, playerRadius, func(open wallOpening) bool {
-		if !open.twoSided {
-			return true // one-sided: always solid
-		}
-		if open.top-open.bottom < playerHeight {
-			return true // too short to stand in (includes a fully-closed door)
-		}
-		return open.bottom-fromFloor > maxStepUp // too high a step to climb
-	})
+	if g.anyLineWithin(x, y, playerRadius, func(open wallOpening) bool {
+		return !open.twoSided || open.top-open.bottom < playerHeight
+	}) {
+		return false
+	}
+
+	destFloor := fromFloor
+	if sec := bsp.PointSector(g.BSP, g.Level, float32(x), float32(y)); sec != nil {
+		destFloor = float64(sec.FloorHeight)
+	}
+	return destFloor-fromFloor <= maxStepUp
 }
 
 // wallOpening is the vertical gap a two-sided Linedef's front/back sectors
