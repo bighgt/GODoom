@@ -3,6 +3,7 @@
 *.exe
 *.test
 *.log
+*.pid
 
 # Doom-engine WAD data files are id Software's copyrighted content (even the
 # freely-redistributable shareware episode has its own distribution terms) —
