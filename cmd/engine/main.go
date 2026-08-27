@@ -96,6 +96,10 @@ func run() error {
 		return err
 	}
 	defer renderer.Destroy()
+	log.Printf("engine: rendering on %s (%s)", renderer.DeviceName, renderer.DeviceTypeName)
+	if renderer.DeviceTypeName == "CPU (software rasterizer — not real GPU rendering)" {
+		log.Println("engine: WARNING — Vulkan selected a CPU/software device; this is not real hardware rendering")
+	}
 
 	game := engine.NewGame(win, renderer, ras, w, level, tree, cam)
 

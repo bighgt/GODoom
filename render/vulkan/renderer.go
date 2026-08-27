@@ -33,6 +33,13 @@ type Renderer struct {
 	win   *window.Window
 	debug bool
 
+	// DeviceName/DeviceTypeName identify the physical GPU New selected
+	// (set by pickPhysicalDevice) — read these after New returns to
+	// confirm rendering is actually happening on a real GPU rather than a
+	// software/CPU Vulkan implementation; see cmd/engine/main.go.
+	DeviceName     string
+	DeviceTypeName string
+
 	instance       vk.Instance
 	surface        vk.Surface
 	physicalDevice vk.PhysicalDevice

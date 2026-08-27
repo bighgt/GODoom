@@ -26,6 +26,7 @@ func (r *Renderer) pickPhysicalDevice() error {
 		bestScore = -1
 		bestGFam  uint32
 		bestPFam  uint32
+		bestProps vk.PhysicalDeviceProperties
 	)
 	for _, dev := range devices {
 		gfam, pfam, ok := r.findQueueFamilies(dev)
@@ -42,7 +43,7 @@ func (r *Renderer) pickPhysicalDevice() error {
 			score = 2
 		}
 		if score > bestScore {
-			best, bestScore, bestGFam, bestPFam = dev, score, gfam, pfam
+			best, bestScore, bestGFam, bestPFam, bestProps = dev, score, gfam, pfam, props
 		}
 	}
 
@@ -53,7 +54,27 @@ func (r *Renderer) pickPhysicalDevice() error {
 	r.physicalDevice = best
 	r.graphicsFamily = bestGFam
 	r.presentFamily = bestPFam
+	// Exposed so the caller can log/assert real GPU rendering is in effect
+	// rather than a CPU fallback (VK_PHYSICAL_DEVICE_TYPE_CPU) — see
+	// DeviceName/DeviceTypeName and cmd/engine/main.go.
+	r.DeviceName = vk.ToString(bestProps.DeviceName[:])
+	r.DeviceTypeName = physicalDeviceTypeName(bestProps.DeviceType)
 	return nil
+}
+
+func physicalDeviceTypeName(t vk.PhysicalDeviceType) string {
+	switch t {
+	case vk.PhysicalDeviceTypeDiscreteGpu:
+		return "discrete GPU"
+	case vk.PhysicalDeviceTypeIntegratedGpu:
+		return "integrated GPU"
+	case vk.PhysicalDeviceTypeVirtualGpu:
+		return "virtual GPU"
+	case vk.PhysicalDeviceTypeCpu:
+		return "CPU (software rasterizer — not real GPU rendering)"
+	default:
+		return "unknown device type"
+	}
 }
 
 // findQueueFamilies looks for a queue family that supports graphics commands
