@@ -1,0 +1,15 @@
+# Build output
+/bin/
+*.exe
+*.test
+*.log
+
+# Doom-engine WAD data files are id Software's copyrighted content (even the
+# freely-redistributable shareware episode has its own distribution terms) —
+# never commit them. Supply your own locally; see game_design.txt.
+#
+# testdata/DOOM1.WAD is a deliberate, local-only exception used by the
+# automated tests (wad/wad_test.go, bsp/bsp_test.go) — it's still excluded
+# here in case this project is ever pushed to a shared/public remote.
+*.wad
+*.WAD

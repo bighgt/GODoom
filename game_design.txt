@@ -1,0 +1,432 @@
+================================================================================
+TwoPointFive — a Doom-style 2.5D game engine in Go
+================================================================================
+This file is the living design document for the project. It is kept at the
+repo root and updated whenever the design changes — treat it as the source
+of truth for *why* the code looks the way it does, not just what it does.
+
+Last updated: 2026-08-27 (Phase 1 complete)
+
+
+--------------------------------------------------------------------------------
+1. VISION
+--------------------------------------------------------------------------------
+A game engine, written in Go, that plays like Doom: fake-3D ("2.5D")
+first-person movement through levels built from 2D floor plans extruded into
+walls, floors and ceilings — no true 3D geometry, no looking straight up or
+down, exactly like the original. It loads the exact WAD file format Doom
+used, so any Doom/Doom II/Ultimate Doom IWAD (and most PWADs) can be dropped
+in and played. Rendering is 100% GPU-driven via the Vulkan API. Level
+traversal is driven by the same BSP (binary space partitioning) tree data
+that id Software's original WAD format already carries. The platform target
+is Windows first. The codebase is written in an idiomatic-Go realization of
+object-oriented design (see section 6).
+
+Non-goals for now: networking/multiplayer, a level editor, non-Windows
+platforms (the code is written to be portable where it costs nothing, but
+Windows is the only tested/supported target today), and modding beyond what
+loading a PWAD naturally gives you.
+
+
+--------------------------------------------------------------------------------
+2. PROJECT STATUS
+--------------------------------------------------------------------------------
+PHASE 1 — COMPLETE. A full vertical slice: the engine asks for a WAD file
+via a native Windows file dialog, parses it, builds the level's BSP tree,
+opens a window, stands up a complete Vulkan pipeline, and renders (clears)
+every frame in a live loop, with no crashes. Verified end-to-end against the
+real shareware doom1.wad: E1M1 loads (467 vertexes, 475 linedefs, 648
+sidedefs, 85 sectors, 138 things, 732 segs, 237 subsectors, 236 BSP nodes),
+the BSP tree traversal visits all 237/237 subsectors from the player start,
+and the window stays open rendering a cleared frame every tick until closed.
+
+Everything past this point (walls actually drawn, textures, player
+movement, collision, monsters, sound) is future work — see section 8,
+ROADMAP.
+
+
+--------------------------------------------------------------------------------
+3. PREREQUISITES / ENVIRONMENT
+--------------------------------------------------------------------------------
+- Go 1.26+.
+- A cgo-capable C compiler on PATH. This project used WinLibs' MinGW-w64
+  (POSIX threads, UCRT runtime) build, installed via:
+      winget install --id BrechtSanders.WinLibs.POSIX.UCRT
+  Both the GLFW bindings and the Vulkan bindings are cgo packages; without a
+  C compiler, `go build` fails at the cgo compile step, not with a helpful
+  Go-level error.
+- A Vulkan-capable GPU + driver (i.e. vulkan-1.dll present and a real ICD
+  registered — practically every discrete/integrated GPU driver from the
+  last decade). No Vulkan SDK install is required to *build* this project
+  (the vulkan bindings are pregenerated), only later, in Phase 2, to run
+  `glslc`/`glslangValidator` for compiling GLSL shaders to SPIR-V.
+- Your own Doom-engine IWAD or PWAD file. None is bundled — see section 4.
+
+
+--------------------------------------------------------------------------------
+4. WAD FILE FORMAT (as implemented in package `wad`)
+--------------------------------------------------------------------------------
+WAD ("Where's All the Data?") is the single-file archive format Doom (1993)
+introduced and every id Tech 1-derived engine since has reused. This is a
+from-scratch Go implementation of the format, cross-checked against the
+Doom Wiki / Doom Fandom wiki's WAD format documentation.
+
+IMPORTANT: no WAD file ships with this repo. IWADs (doom.wad, doom2.wad,
+...) are id Software's commercial, copyrighted game data. Even the
+shareware episode (doom1.wad) — used locally in testdata/ purely to exercise
+the parser in automated tests — carries its own historical shareware
+distribution terms and is excluded from version control via .gitignore.
+Supply your own IWAD, or use a free/open replacement such as Freedoom
+(freedoom1.wad / freedoom2.wad).
+
+4.1 Header (12 bytes, package wad: Header, decoded in wad.Parse)
+    offset  size  field      meaning
+    0       4     Magic      ASCII "IWAD" (a complete, standalone game) or
+                              "PWAD" (a patch — overrides/adds lumps when
+                              loaded alongside an IWAD)
+    4       4     NumLumps   int32, number of entries in the directory
+    8       4     DirOfs     int32, byte offset of the directory in the file
+    All multi-byte integers are little-endian (x86 native order).
+
+4.2 Directory (wad.DirEntry) — one 16-byte entry per lump, starting at DirOfs:
+    offset  size  field      meaning
+    0       4     FilePos    int32, byte offset of this lump's data
+    4       4     Size       int32, byte length of this lump's data
+    8       8     Name       ASCII, zero-padded, NOT necessarily
+                              zero-terminated if exactly 8 characters long
+
+    Lump lookup is by name (case-insensitive in practice; this engine
+    upper-cases on load). Where the same name appears more than once (a
+    PWAD overriding an IWAD lump, e.g.), the *last* directory entry with
+    that name wins — that's Doom's own patch/override convention, and
+    wad.WAD.Find/IndexOf implement it by keeping every index per name and
+    returning the last one.
+
+4.3 Level lumps — a fixed run of lumps immediately following a "map marker"
+    lump whose own name IS the map's name (e.g. "E1M1" for
+    Doom/Ultimate Doom episodic maps, "MAP01".."MAP32" for Doom II and
+    almost all PWADs). wad.WAD.LoadLevel walks forward from the marker,
+    decoding each lump it recognizes by name until it hits something that
+    isn't part of the block (typically the next map's own marker):
+
+      THINGS    — monsters, items, decorations, player starts (wad.Thing,
+                  10 bytes/entry): int16 X, int16 Y, uint16 Angle,
+                  uint16 Type, uint16 Flags.
+
+      LINEDEFS  — wall segments between two vertices (wad.Linedef,
+                  14 bytes/entry): uint16 StartVertex, uint16 EndVertex,
+                  uint16 Flags, uint16 SpecialType, uint16 SectorTag,
+                  uint16 FrontSidedef, uint16 BackSidedef (0xFFFF = none).
+
+      SIDEDEFS  — per-face texturing of a Linedef (wad.Sidedef,
+                  30 bytes/entry): int16 XOffset, int16 YOffset,
+                  8-byte UpperTexture name, 8-byte LowerTexture name,
+                  8-byte MiddleTexture name, uint16 Sector index.
+
+      VERTEXES  — 2D map-space points (wad.Vertex, 4 bytes/entry):
+                  int16 X, int16 Y.
+
+      SEGS      — one straight fragment of a Subsector's boundary
+                  (wad.Seg, 12 bytes/entry): uint16 StartVertex,
+                  uint16 EndVertex, int16 Angle (BAM, see below),
+                  uint16 Linedef, int16 Direction (0 = same direction as
+                  the linedef, 1 = opposite), int16 Offset.
+
+      SSECTORS  — convex BSP tree leaves (wad.Subsector, 4 bytes/entry):
+                  uint16 SegCount, uint16 FirstSeg (index into SEGS).
+
+      NODES     — the precomputed BSP tree itself (wad.Node,
+                  28 bytes/entry): int16 X, Y, DX, DY (the partition
+                  line's start point and direction vector), a
+                  [4]int16 bounding box for the right child then one for
+                  the left child (each: top, bottom, left, right),
+                  then uint16 RightChild, uint16 LeftChild. If bit 15
+                  (0x8000, wad.SubsectorBit) is set on a child index, the
+                  low 15 bits index into SSECTORS (a leaf) rather than
+                  back into NODES. See section 5 for how this becomes a
+                  real tree.
+
+      SECTORS   — floor/ceiling definition (wad.Sector, 26 bytes/entry):
+                  int16 FloorHeight, int16 CeilingHeight, 8-byte
+                  FloorTexture ("flat") name, 8-byte CeilingTexture name,
+                  int16 LightLevel, uint16 SpecialType, uint16 Tag.
+
+      REJECT    — a bit table (sectorCount^2 bits) used by the original
+                  engine for a monster/sound line-of-sight fast-reject.
+                  Stored as raw bytes (wad.Level.Reject); not yet decoded
+                  into a queryable form (Phase 3).
+
+      BLOCKMAP  — a spatial hash grid over the map used for collision
+                  detection. Stored as raw bytes (wad.Level.Blockmap);
+                  not yet decoded (Phase 3).
+
+    BAM ("binary angle measure"): Doom represents a full 360° turn as the
+    full range of a 16-bit value (0..65535), so a Seg's Angle field is a
+    fraction of a circle rather than degrees or radians — converting it is
+    `radians = float64(angle) / 65536 * 2 * math.Pi` (not yet needed until
+    Phase 2's texture UV mapping).
+
+4.4 Graphics lumps (package wad, graphics.go)
+      PLAYPAL   — 14 palettes x 256 colors x 3 bytes (RGB), decoded by
+                  wad.LoadPlaypal into []wad.Palette. Every other graphic
+                  lump stores palette *indices*, not RGB, so nothing else
+                  can be rendered in color without this.
+      COLORMAP  — 34 x 256-byte remap tables (one per light level/effect),
+                  decoded by wad.LoadColormap. Not yet used by the renderer
+                  (Phase 2 will use it, or a GPU-side equivalent, for
+                  Doom-style sector lighting).
+      "picture format" — the column-major, run-length-encoded graphic
+                  format used for wall texture patches, sprites and UI
+                  lumps alike: an 8-byte header (uint16 Width, uint16
+                  Height, int16 LeftOffset, int16 TopOffset), then one
+                  uint32 column offset per column, then per column a
+                  sequence of "posts" (a run of opaque pixels): byte
+                  topDelta (0xFF ends the column), byte length, 1 padding
+                  byte, `length` pixel-index bytes, 1 more padding byte.
+                  Decoded by wad.DecodePatch into a flat, row-major
+                  []int16 (-1 = transparent) — verified against real
+                  Doom graphic lumps in wad/wad_test.go.
+
+
+--------------------------------------------------------------------------------
+5. BSP TREE DESIGN (package `bsp`)
+--------------------------------------------------------------------------------
+Doom's WAD format doesn't just describe a level's geometry — it ships a
+*precomputed* BSP tree for that geometry, built once offline by the level
+editor's node builder (the original engine could not have run in real time
+on 1993 hardware otherwise). This engine does not build a BSP tree from
+scratch; it reconstructs the exact tree the WAD already encodes.
+
+  bsp.Node       — an interface, not a tagged struct, so tree-walking code
+                   is polymorphic over the two kinds of node instead of
+                   switching on a type tag everywhere it matters:
+    bsp.InnerNode  — a split: X,Y,DX,DY (the partition line) plus Right
+                     and Left child Nodes.
+    bsp.Leaf       — a convex subsector: wraps a wad.Subsector and its
+                     index.
+
+  bsp.Build(level *wad.Level) — walks the level's NODES array once,
+  starting from the last entry (Doom always stores the tree's root as the
+  final NODES entry), turning each RightChild/LeftChild index into either
+  another InnerNode (recurse) or a Leaf (if wad.SubsectorBit is set).
+
+  bsp.Traverse(root, camX, camY, visit) — the classic front-to-back walk
+  Doom's own renderer used: at each InnerNode, evaluate which side of the
+  partition line the camera point is on (InnerNode.Side, using the same
+  cross-product test as the original engine), recurse into that near side
+  first, then the far side. visit(*Leaf) fires once per subsector reached,
+  in strict front-to-back order.
+
+  Why keep this at all, when a GPU depth buffer already resolves
+  occlusion correctly regardless of draw order? Two reasons: (1) it's
+  still the right tool for visibility culling — walking the tree lets the
+  renderer skip subsectors that can't possibly be visible before ever
+  building geometry for them, which a depth buffer can't do for you; and
+  (2) it's the same structure Phase 3's collision system will want (point
+  location: "which sector is the player standing in" is exactly a BSP
+  descent). Section 7 elaborates on how this changes the rendering
+  approach versus the original software renderer.
+
+  Verified in bsp/bsp_test.go against the real shareware WAD: E1M1's 236
+  NODES entries and 237 SSECTORS entries reconstruct into a tree with
+  exactly 236 InnerNodes and 237 Leaves, and Traverse visits every leaf
+  exactly once.
+
+
+--------------------------------------------------------------------------------
+6. OOP PHILOSOPHY
+--------------------------------------------------------------------------------
+Go deliberately has no classes and no inheritance, so "the core essential
+of the engine is OOP" is realized idiomatically rather than by fighting the
+language:
+
+  - Encapsulation: every package keeps its decode/implementation details
+    unexported (e.g. wad's cleanName, decodeVertexes, ...; render/vulkan's
+    entire step-by-step createXxx sequence) and exposes only the types and
+    methods callers need.
+
+  - Interfaces as contracts, not structs, at every seam that might one day
+    have more than one implementation:
+      engine.Entity     — anything alive in the game world
+      engine.System      — a per-frame slice of engine behavior
+      render.Renderer    — a GPU backend (today: render/vulkan.Renderer)
+      bsp.Node            — a BSP tree node (InnerNode or Leaf)
+    Code that consumes these (engine.Game.Run, bsp.Traverse, ...) is
+    written against the interface and is unaware of, and unaffected by,
+    which concrete type it's holding — this is the engine's polymorphism.
+
+  - Composition over inheritance: engine.BaseEntity is an embeddable struct
+    that gives any concrete entity type (a future Player, Monster, Item,
+    ...) its ID/position bookkeeping and a default no-op Update "for free"
+    by embedding, exactly the way a base class would in a classical OOP
+    language — except a concrete type "overrides" behavior simply by
+    defining its own method of the same name, which Go's method dispatch
+    picks over the embedded one.
+
+  - One deliberate, documented exception: render/vulkan.Renderer.New takes
+    a concrete *window.Window, not a generic surface interface. Vulkan
+    window-surface creation is fundamentally tied to GLFW's C window
+    handle (vk.SurfaceFromPointer(win.Handle().CreateWindowSurface(...))),
+    and this project has exactly one windowing backend — an interface here
+    would add ceremony without a second implementation to justify it. The
+    render.Renderer interface itself (DrawFrame/WaitIdle/Destroy) is still
+    what engine.Game holds and calls through, so the actual OOP boundary
+    that matters (game logic vs. GPU backend) is real, not simulated.
+
+
+--------------------------------------------------------------------------------
+7. RENDERING APPROACH (Vulkan)
+--------------------------------------------------------------------------------
+The original Doom renderer worked by casting one ray per screen column
+against the BSP tree and drawing textured vertical strips directly into a
+CPU framebuffer — it never had a GPU to hand triangles to. This engine
+takes a different, GPU-appropriate route while still producing the same
+*kind* of fake-3D image and movement feel Doom is known for:
+
+  - Walls become vertical textured quads, built from each Linedef's
+    Sidedef(s) and the floor/ceiling heights of the Sector(s) it borders.
+  - Floors and ceilings become flat, textured polygons built by
+    triangulating each Subsector's Segs.
+  - All of that geometry is submitted as vertex/index buffers to a
+    standard Vulkan graphics pipeline, viewed through a perspective camera
+    whose pitch is fixed/clamped — true 2.5D, matching Doom's movement
+    (no true verticality, no looking straight up/down), rather than
+    Doom's original per-column software rasterization.
+  - Occlusion is handled by the GPU's depth buffer instead of Doom's
+    strictly-ordered painter's-algorithm-avoidance rendering. The BSP tree
+    is still walked front-to-back (see section 5) to drive traversal order
+    and, eventually, visibility culling — just not to guarantee correct
+    overdraw the way it had to in 1993.
+
+None of the above (wall/flat geometry, textures, shaders) is built yet —
+that's Phase 2. What Phase 1 built is the complete supporting pipeline
+those draw calls will slot into, package render/vulkan:
+
+  instance.go   — vk.Instance creation (via GLFW's resolved
+                  vkGetInstanceProcAddr), with the
+                  VK_LAYER_KHRONOS_validation layer enabled automatically
+                  when running in debug mode and the layer is present on
+                  the system (so mistakes surface as validation messages,
+                  not silent GPU corruption or a black screen).
+  device.go     — physical device enumeration/scoring (prefers a discrete
+                  GPU, requires a graphics-capable queue family, a
+                  present-capable queue family, and VK_KHR_swapchain
+                  support) and logical device + queue creation.
+  swapchain.go  — swapchain creation (preferring VK_FORMAT_B8G8R8A8_SRGB /
+                  SRGB_NONLINEAR, mailbox present mode when available,
+                  falling back to FIFO which every implementation must
+                  support) and image views.
+  frame.go      — a single-subpass render pass (one color attachment,
+                  load-op CLEAR / store-op STORE, transitioned to
+                  PRESENT_SRC), framebuffers, a command pool + one primary
+                  command buffer per swapchain image, double-buffered
+                  (maxFramesInFlight = 2) semaphore/fence sync objects, and
+                  DrawFrame/recordCommandBuffer, which today only clears
+                  the screen (Renderer.ClearColor) — the exact place
+                  Phase 2's vkCmdBindPipeline/vkCmdDrawIndexed calls get
+                  inserted.
+
+Known Phase 1 limitation, intentionally deferred rather than built
+speculatively: window resize / minimize is not handled — DrawFrame returns
+an error on VK_ERROR_OUT_OF_DATE_KHR instead of recreating the swapchain.
+render/vulkan/swapchain.go's destroySwapchain already separates
+swapchain-dependent teardown from the rest of the renderer specifically so
+a future recreateSwapchain can reuse it.
+
+
+--------------------------------------------------------------------------------
+8. ENGINE CORE (package `engine`) AND ENTRY POINT
+--------------------------------------------------------------------------------
+engine.Game owns the Window, the Renderer (held as the render.Renderer
+interface — see section 6), the loaded wad.WAD/wad.Level/bsp.Node, and the
+live entity/system lists. Game.Run is the main loop: poll input, run every
+System, run every Entity's Update, draw one frame, repeat until the window
+is asked to close. No Systems or Entities exist yet beyond the framework
+itself — Phase 3 populates this with real gameplay.
+
+cmd/engine/main.go is the executable: it pins the process to the main OS
+thread (required by GLFW on Windows), calls window.PickWADFile() (a native
+Win32 "Open" dialog via github.com/sqweek/dialog, filtered to *.wad) before
+any window exists, loads and parses the chosen WAD, picks a starting map
+(preferring E1M1 or MAP01 if present), builds its BSP tree, logs lump/tree
+stats and a sample front-to-back traversal from the map's player start,
+opens the GLFW window, stands up the Vulkan renderer, and hands off to
+engine.Game.Run.
+
+
+--------------------------------------------------------------------------------
+9. REPO LAYOUT
+--------------------------------------------------------------------------------
+  go.mod, go.sum        module twopointfive
+  game_design.txt        this file
+  .gitignore             excludes build output and any *.wad/*.WAD data
+  cmd/engine/main.go      entry point (see section 8)
+  wad/                    WAD parsing — wad.go (header/directory/lookup),
+                          level.go (level lumps), graphics.go
+                          (PLAYPAL/COLORMAP/patch format), wad_test.go
+  bsp/                    BSP tree — tree.go (Node/InnerNode/Leaf),
+                          build.go (reconstruct from a wad.Level),
+                          traverse.go (front-to-back walk), bsp_test.go
+  window/                 window.go (GLFW window wrapper), picker.go
+                          (native WAD file-open dialog)
+  render/                 renderer.go (the Renderer interface)
+    vulkan/               renderer.go (struct + New/Destroy orchestration),
+                          instance.go, device.go, swapchain.go, frame.go,
+                          util.go (see the NUL-termination note below)
+  engine/                 entity.go, system.go, game.go
+  testdata/DOOM1.WAD       local-only shareware WAD used by wad_test.go /
+                          bsp_test.go (gitignored — see section 4)
+
+A note on package github.com/goki/vulkan specifically, because it cost real
+debugging time to discover: its generated struct wrappers pass Go strings
+to C as a raw, zero-copy pointer into the Go string's own backing array —
+NOT a freshly-allocated, C.CString-style null-terminated copy. Every string
+handed to a Vk*CreateInfo field (application/engine name, extension names,
+layer names, and later shader entry points) must already end in a NUL byte
+or the C side reads past the end of the Go string looking for one.
+render/vulkan/util.go's nz/nzAll helpers exist purely so this requirement
+is visible and hard to forget at each call site; every call site in
+instance.go and device.go uses them.
+
+
+--------------------------------------------------------------------------------
+10. ROADMAP (not built yet)
+--------------------------------------------------------------------------------
+Phase 2 — Real rendering
+  - Build wall (Linedef/Sidedef/Sector-height) and flat
+    (Subsector/Seg-triangulation) vertex/index geometry from a loaded
+    Level.
+  - Decode wall texture / flat lumps (via wad.DecodePatch + PLAYPAL) into
+    GPU images; a texture atlas or descriptor-indexed array to avoid a
+    pipeline/descriptor-set switch per texture.
+  - A real graphics pipeline: vertex/fragment shaders (GLSL compiled to
+    SPIR-V via glslc — first point this project needs the Vulkan SDK, not
+    just the runtime), vertex input layout, depth buffer + depth testing.
+  - Swapchain recreation on resize/minimize (VK_ERROR_OUT_OF_DATE_KHR /
+    VK_SUBOPTIMAL_KHR handling — swapchain.go's destroySwapchain is
+    already split out for this).
+  - A first-person camera (position + yaw + clamped pitch) feeding the
+    pipeline's view/projection matrices (github.com/go-gl/mathgl already
+    in go.mod for this).
+
+Phase 3 — Player movement & collision
+  - Decode BLOCKMAP for broad-phase collision, REJECT for
+    sound/visibility fast-reject.
+  - Point-in-subsector queries via bsp.Node descent (sector the player is
+    standing in, floor/ceiling height for gravity and step-up).
+  - WASD + mouse-look input, sector-height-aware movement and simple
+    monster/wall collision.
+
+Phase 4 — Things: sprites, monsters, items
+  - Sprite lump decoding and billboard rendering for wad.Thing entries.
+  - engine.Entity implementations (Player, Monster, Item, Decoration) built
+    on engine.BaseEntity; simple monster AI as engine.System(s).
+
+Phase 5 — Audio
+  - Decode Doom's DMX-format sound lumps (DS*) and MUS music lumps;
+    positional playback tied to entity/camera position.
+
+Longer-term / explicitly out of scope for now: networking, a level editor,
+non-Windows platform support, and Hexen/UDMF map format variants (this
+engine only targets vanilla-format Doom levels — checked in
+wad.Level.LoadLevel via the presence of NODES/SSECTORS).
