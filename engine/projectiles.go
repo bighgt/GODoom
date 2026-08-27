@@ -4,7 +4,6 @@ import (
 	"math"
 
 	"twopointfive/raster"
-	"twopointfive/wad"
 )
 
 // Projectile tuning. There's no per-weapon distinction yet (a real rocket,
@@ -88,39 +87,16 @@ func (g *Game) updateProjectiles(dt float64) {
 }
 
 // projectileHitsWall reports whether (x, y) has crossed into a solid
-// linedef: a one-sided line always blocks; a two-sided line blocks only if
-// its two sectors share no vertical opening at all. Unlike player
-// collision (collision.go), this doesn't check the projectile's own Z
-// against a step-height tolerance — a flying shot either has a way through
-// at some height or it doesn't; see game_design.txt for the simplification
-// this implies (a shot can pass through a two-sided line's opening
-// regardless of exactly how high up it is).
+// linedef, reusing the same per-line wall-opening query player movement
+// does (collision.go's anyLineWithin/wallOpeningAt): a one-sided line
+// always blocks; a two-sided line blocks only if its two sectors share no
+// vertical opening at all. Unlike player collision, this doesn't check the
+// projectile's own Z against a step-height tolerance — a flying shot
+// either has a way through at some height or it doesn't; see
+// game_design.txt for the simplification this implies (a shot can pass
+// through a two-sided line's opening regardless of exactly how high up it is).
 func (g *Game) projectileHitsWall(x, y float64) bool {
-	for i := range g.Level.Linedefs {
-		ld := &g.Level.Linedefs[i]
-		v1 := g.Level.Vertexes[ld.StartVertex]
-		v2 := g.Level.Vertexes[ld.EndVertex]
-		if distancePointToSegment(x, y, float64(v1.X), float64(v1.Y), float64(v2.X), float64(v2.Y)) >= projectileRadius {
-			continue
-		}
-		if ld.BackSidedef == wad.NoSidedef {
-			return true
-		}
-		if int(ld.FrontSidedef) >= len(g.Level.Sidedefs) || int(ld.BackSidedef) >= len(g.Level.Sidedefs) {
-			return true
-		}
-		frontSD := g.Level.Sidedefs[ld.FrontSidedef]
-		backSD := g.Level.Sidedefs[ld.BackSidedef]
-		if int(frontSD.Sector) >= len(g.Level.Sectors) || int(backSD.Sector) >= len(g.Level.Sectors) {
-			return true
-		}
-		front := g.Level.Sectors[frontSD.Sector]
-		back := g.Level.Sectors[backSD.Sector]
-		openBottom := math.Max(float64(front.FloorHeight), float64(back.FloorHeight))
-		openTop := math.Min(float64(front.CeilingHeight), float64(back.CeilingHeight))
-		if openTop <= openBottom {
-			return true
-		}
-	}
-	return false
+	return g.anyLineWithin(x, y, projectileRadius, func(open wallOpening) bool {
+		return !open.twoSided || open.top <= open.bottom
+	})
 }

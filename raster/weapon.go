@@ -38,34 +38,12 @@ func (r *Renderer) DrawWeapon(spritePrefix, flashPrefix string, firing bool, rai
 	}
 }
 
+// drawWeaponSprite bottom-anchors and horizontally centers sp, ignoring its
+// own hotspot metadata (unlike blitSpriteImage) — a simple, robust
+// convention that doesn't depend on exactly how each weapon graphic's
+// offset was authored.
 func (r *Renderer) drawWeaponSprite(sp *assets.RGBA, raiseOffset float64) {
 	x := (r.Width - sp.Width) / 2
 	y := r.Height - sp.Height + int(raiseOffset*float64(sp.Height+weaponDropPx))
-	r.blitRaw(sp, x, y)
-}
-
-// blitRaw copies sp's opaque pixels onto r.Pix at (x, y) directly — unlike
-// blitSpriteImage, it ignores the source patch's own offset metadata,
-// which is what lets DrawWeapon use a simple, robust bottom-anchor
-// convention instead of depending on exactly how each weapon graphic's
-// hotspot was authored.
-func (r *Renderer) blitRaw(sp *assets.RGBA, x, y int) {
-	for sy := 0; sy < sp.Height; sy++ {
-		dy := y + sy
-		if dy < 0 || dy >= r.Height {
-			continue
-		}
-		for sx := 0; sx < sp.Width; sx++ {
-			dx := x + sx
-			if dx < 0 || dx >= r.Width {
-				continue
-			}
-			c := sp.At(sx, sy)
-			if c[3] == 0 {
-				continue
-			}
-			i := (dy*r.Width + dx) * 4
-			r.Pix[i], r.Pix[i+1], r.Pix[i+2], r.Pix[i+3] = c[0], c[1], c[2], c[3]
-		}
-	}
+	r.blit(sp, x, y, false)
 }

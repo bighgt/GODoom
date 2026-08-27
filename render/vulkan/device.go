@@ -59,6 +59,7 @@ func (r *Renderer) pickPhysicalDevice() error {
 	// DeviceName/DeviceTypeName and cmd/engine/main.go.
 	r.DeviceName = vk.ToString(bestProps.DeviceName[:])
 	r.DeviceTypeName = physicalDeviceTypeName(bestProps.DeviceType)
+	r.DeviceIsSoftware = bestProps.DeviceType == vk.PhysicalDeviceTypeCpu
 	return nil
 }
 

@@ -39,6 +39,12 @@ type Renderer struct {
 	// software/CPU Vulkan implementation; see cmd/engine/main.go.
 	DeviceName     string
 	DeviceTypeName string
+	// DeviceIsSoftware reports whether the selected device is a CPU/software
+	// Vulkan implementation (VK_PHYSICAL_DEVICE_TYPE_CPU) rather than real
+	// GPU hardware. Callers should check this field directly instead of
+	// comparing DeviceTypeName against a string, since the latter is meant
+	// for display and may be reworded independently of this check.
+	DeviceIsSoftware bool
 
 	instance       vk.Instance
 	surface        vk.Surface

@@ -45,49 +45,73 @@ func (g *Game) tryMove(dx, dy float64) {
 
 // canMoveTo reports whether a player-radius circle centered at (x, y) can
 // stand there, given fromFloor (the floor height of the sector the player
-// is moving from, used for the step-height check below).
+// is moving from, used for the step-height check below) — mirroring the
+// two checks Doom's own PIT_CheckLine made against each nearby linedef.
 func (g *Game) canMoveTo(x, y, fromFloor float64) bool {
-	for i := range g.Level.Linedefs {
-		if g.lineBlocks(&g.Level.Linedefs[i], x, y, fromFloor) {
-			return false
+	return !g.anyLineWithin(x, y, playerRadius, func(open wallOpening) bool {
+		if !open.twoSided {
+			return true // one-sided: always solid
 		}
-	}
-	return true
+		if open.top-open.bottom < playerHeight {
+			return true // too short to stand in (includes a fully-closed door)
+		}
+		return open.bottom-fromFloor > maxStepUp // too high a step to climb
+	})
 }
 
-// lineBlocks mirrors the two checks Doom's own PIT_CheckLine made against
-// each nearby linedef: a one-sided line is always solid; a two-sided line
-// only blocks if the opening between the sectors it borders is too short
-// to stand in, or too high a step up from fromFloor to climb.
-func (g *Game) lineBlocks(ld *wad.Linedef, x, y, fromFloor float64) bool {
-	v1 := g.Level.Vertexes[ld.StartVertex]
-	v2 := g.Level.Vertexes[ld.EndVertex]
-	if distancePointToSegment(x, y, float64(v1.X), float64(v1.Y), float64(v2.X), float64(v2.Y)) >= playerRadius {
-		return false
-	}
+// wallOpening is the vertical gap a two-sided Linedef's front/back sectors
+// share — the shared fact both player movement (above) and projectile
+// flight (projectiles.go) need from a nearby wall, even though they judge
+// it differently (a step-height tolerance for the player; none for a
+// flying shot).
+type wallOpening struct {
+	bottom, top float64
+	twoSided    bool
+}
 
+// wallOpeningAt resolves ld's opening, or twoSided=false if it's one-sided
+// or its sector data doesn't resolve — either way, callers should treat it
+// as solid.
+func (g *Game) wallOpeningAt(ld *wad.Linedef) wallOpening {
 	if ld.BackSidedef == wad.NoSidedef {
-		return true
+		return wallOpening{}
 	}
 	if int(ld.FrontSidedef) >= len(g.Level.Sidedefs) || int(ld.BackSidedef) >= len(g.Level.Sidedefs) {
-		return true
+		return wallOpening{}
 	}
 	frontSD := g.Level.Sidedefs[ld.FrontSidedef]
 	backSD := g.Level.Sidedefs[ld.BackSidedef]
 	if int(frontSD.Sector) >= len(g.Level.Sectors) || int(backSD.Sector) >= len(g.Level.Sectors) {
-		return true
+		return wallOpening{}
 	}
 	front := g.Level.Sectors[frontSD.Sector]
 	back := g.Level.Sectors[backSD.Sector]
-
-	openBottom := math.Max(float64(front.FloorHeight), float64(back.FloorHeight))
-	openTop := math.Min(float64(front.CeilingHeight), float64(back.CeilingHeight))
-
-	if openTop-openBottom < playerHeight {
-		return true // too short to stand in (includes a fully-closed door)
+	return wallOpening{
+		bottom:   math.Max(float64(front.FloorHeight), float64(back.FloorHeight)),
+		top:      math.Min(float64(front.CeilingHeight), float64(back.CeilingHeight)),
+		twoSided: true,
 	}
-	if openBottom-fromFloor > maxStepUp {
-		return true // too high a step to climb
+}
+
+// anyLineWithin reports whether any Linedef passes within radius of
+// (x, y) and blocks(...) says its opening counts as a hit — the per-frame
+// "what walls are near this point" scan every collision query in this
+// package (player movement, projectile flight) is built on. A brute-force
+// scan over every Linedef is fine at this project's map sizes (a few
+// hundred lines); a spatial index (the level's own BLOCKMAP lump would be
+// the authentic choice) is the obvious next step if that ever changes —
+// see game_design.txt.
+func (g *Game) anyLineWithin(x, y, radius float64, blocks func(wallOpening) bool) bool {
+	for i := range g.Level.Linedefs {
+		ld := &g.Level.Linedefs[i]
+		v1 := g.Level.Vertexes[ld.StartVertex]
+		v2 := g.Level.Vertexes[ld.EndVertex]
+		if distancePointToSegment(x, y, float64(v1.X), float64(v1.Y), float64(v2.X), float64(v2.Y)) >= radius {
+			continue
+		}
+		if blocks(g.wallOpeningAt(ld)) {
+			return true
+		}
 	}
 	return false
 }

@@ -194,26 +194,9 @@ func (r *Renderer) blitSprite(name string, x, y int) {
 }
 
 // blitSpriteImage draws sp with its own hotspot (OffsetX, OffsetY) aligned
-// to (x, y) — the same convention the original engine's V_DrawPatch used —
-// copying only opaque source pixels.
+// to (x, y) — the same convention the original engine's V_DrawPatch used.
+// Thin wrapper around the shared blit (blit.go), which every sprite draw
+// in this package (and DrawWeapon's own non-offset variant) goes through.
 func (r *Renderer) blitSpriteImage(sp *assets.RGBA, x, y int) {
-	ox, oy := x-sp.OffsetX, y-sp.OffsetY
-	for sy := 0; sy < sp.Height; sy++ {
-		dy := oy + sy
-		if dy < 0 || dy >= r.Height {
-			continue
-		}
-		for sx := 0; sx < sp.Width; sx++ {
-			dx := ox + sx
-			if dx < 0 || dx >= r.Width {
-				continue
-			}
-			c := sp.At(sx, sy)
-			if c[3] == 0 {
-				continue
-			}
-			i := (dy*r.Width + dx) * 4
-			r.Pix[i], r.Pix[i+1], r.Pix[i+2], r.Pix[i+3] = c[0], c[1], c[2], c[3]
-		}
-	}
+	r.blit(sp, x, y, true)
 }

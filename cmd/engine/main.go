@@ -97,7 +97,7 @@ func run() error {
 	}
 	defer renderer.Destroy()
 	log.Printf("engine: rendering on %s (%s)", renderer.DeviceName, renderer.DeviceTypeName)
-	if renderer.DeviceTypeName == "CPU (software rasterizer — not real GPU rendering)" {
+	if renderer.DeviceIsSoftware {
 		log.Println("engine: WARNING — Vulkan selected a CPU/software device; this is not real hardware rendering")
 	}
 
