@@ -6,7 +6,8 @@ repo root and updated whenever the design changes — treat it as the source
 of truth for *why* the code looks the way it does, not just what it does.
 
 Last updated: 2026-08-27 (Phase 3 in progress: collision, doors, status bar,
-sound/music, weapons+projectiles all playable; see section 2)
+sound/music, weapons+projectiles all playable, plus PrBoom-source-derived
+rendering/movement fixes — see section 2 and section 12)
 
 
 --------------------------------------------------------------------------------
@@ -452,21 +453,28 @@ it, present via the GPU renderer.
     for a real pickup system not existing yet, so switching to a weapon is
     what makes its status-bar digit light up.
 
-9.5 Projectiles (projectiles.go, raster/billboard.go) — FireWeapon spawns
-    one Projectile per shot along the camera's full 3D aim direction
-    (aimDirection combines yaw and pitch, so looking up/down with
-    mouselook genuinely changes a shot's trajectory) at
-    projectileSpeed=1000 units/sec; updateProjectiles advances it each
-    frame and kills it via the same wallOpeningAt query collision uses
-    (projectileHitsWall) — a one-sided line always blocks it, a two-sided
-    line blocks it only if there's no vertical opening at all (no
-    step-height tolerance, unlike the player: a shot either has a way
-    through or it doesn't). There's exactly one projectile "kind" for all
-    six weapons right now — a real rocket, plasma bolt, and hitscan bullet
-    all behave identically (a visible orange-yellow marker,
-    raster.DrawBillboard, flying in a straight line) — see section 10 for
-    the more authentic split (instant hitscan vs. true traveling
-    projectile, per weapon) this is standing in for.
+9.5 Projectiles (projectiles.go, raster/sprite.go) — matches the real
+    id split, ported after analyzing PrBoom's source (see section 12):
+    Pistol/Shotgun/Chaingun are hitscan (WeaponDef.Projectile is nil —
+    FireWeapon never creates or simulates anything for them, exactly as
+    instant as a real Doom bullet). Rocket Launcher/Plasma Rifle/BFG9000
+    each carry a ProjectileDef (sprite, speed, explosion animation/sound)
+    and FireWeapon spawns a real Projectile for them along the camera's
+    full 3D aim direction (aimDirection combines yaw and pitch, so aiming
+    up/down with mouselook genuinely changes a shot's trajectory).
+    updateProjectiles advances a flying one each frame and, on hitting a
+    wall (via the same wallOpeningAt query collision uses,
+    projectileHitsWall — no step-height tolerance, unlike the player: a
+    shot either has a way through or it doesn't), freezes it in place,
+    plays its ExplodeSound once, and steps it through ExplodeFrames
+    (raster.DrawWorldSprite, a real perspective-scaled billboard using the
+    sprite's own hotspot offsets — unlike DrawWeapon's viewmodel sprites,
+    ordinary thing sprites use offsets the straightforward way) before
+    removing it. Rocket Launcher's data (MISLA1 flying sprite, BEXPA0-E0's
+    5-frame explosion, DSBAREXP sound — rockets and exploding barrels
+    share an explosion sound in vanilla, not an approximation) is verified
+    against testdata/DOOM1.WAD; Plasma Rifle/BFG9000's data is
+    unverified — that WAD has no plasma/BFG assets at all to check against.
 
 
 --------------------------------------------------------------------------------
@@ -476,9 +484,6 @@ Near-term, filling in Phase 3's remaining simplifications:
   - Real player state: health/armor/ammo that actually change (damage,
     pickups, ammo consumption already deducts on fire but nothing ever
     refills it), replacing raster.DefaultPlayerStats' fixed loadout.
-  - Hitscan vs. true projectile weapons: pistol/shotgun/chaingun as
-    instant hitscans (no travel time), rocket/plasma/BFG as the traveling
-    projectiles they already are — today all six behave like the latter.
   - Depth-tested sprite rendering (a real depth buffer or per-column depth
     tracking) so projectiles/things draw correctly behind nearer walls.
   - BLOCKMAP-based spatial indexing for collision instead of the current
@@ -537,10 +542,11 @@ Doom levels, checked via the presence of NODES/SSECTORS in LoadLevel).
                             pipeline.go (blit pipeline + embedded SPIR-V),
                             shaders/blit.vert|frag(.spv), util.go
   raster/                   renderer.go (the CPU rasterizer — walls/flats),
+                            sky.go (the sky flat's special-case rendering),
                             camera.go, blit.go (shared sprite-copy
                             primitive), statusbar.go, weapon.go, hud.go
-                            (debug text overlay), billboard.go (world-space
-                            markers)
+                            (debug text overlay), sprite.go (world-space
+                            billboards — projectiles today)
   audio/                    audio.go (oto-based SFX Device), midi_windows.go
                             (winmm MIDI music player), midi_other.go (stub)
   engine/                   entity.go, system.go, game.go (Game + Run loop),
@@ -556,3 +562,71 @@ handed to a Vk*CreateInfo field must already end in a NUL byte or the C
 side reads past the end of the Go string looking for one. render/vulkan/
 util.go's nz/nzAll helpers exist purely so this requirement is visible and
 hard to forget at each call site.
+
+
+--------------------------------------------------------------------------------
+12. PRBOOM-DERIVED ENHANCEMENTS
+--------------------------------------------------------------------------------
+At the user's request, this project's own rendering/movement code was
+checked against PrBoom+ (github.com/coelckers/prboom-plus) — a well-known,
+accuracy-focused Doom source port — rather than against memory/assumption,
+and three concrete gaps were found and fixed by porting the relevant logic
+(not just the general idea) from its source:
+
+12.1 Wall texture pegging (raster/renderer.go's drawWallSpan) — ported from
+     r_segs.c's R_StoreWallRange (its rw_midtexturemid/rw_toptexturemid/
+     rw_bottomtexturemid setup). Before this, every wall texture was always
+     anchored the same way (top-pegged for middle/upper, matching only one
+     of the two behaviors a Linedef's ML_DONTPEGTOP/ML_DONTPEGBOTTOM flags
+     (wad.LinedefUpperUnpegged/LowerUnpegged, 0x0008/0x0010) select between)
+     regardless of what the map data actually specified — meaning upper
+     textures on two-sided lines (the common, unflagged case) were anchored
+     backwards, and doors/steps whose textures are meant to stay flush with
+     a moving ceiling/floor instead of stretching would have looked wrong
+     once the door animation (section 9.2) started moving them. See
+     drawWallSpan's doc comment for the exact anchor formula per piece/flag
+     combination, including the lower-unpegged case's well-known original-
+     engine quirk (it anchors to the *front ceiling*, nowhere near the
+     lower piece itself) — confirmed as genuine PrBoom behavior, not
+     assumed to be a bug and "fixed away."
+
+12.2 Sky rendering (raster/sky.go, dispatched from renderer.go's new
+     drawCeilingSpan) — ported from r_bsp.c's sector->ceilingpic==skyflatnum
+     check. Before this, a sector with the special "F_SKY1" ceiling flat
+     (verified present in 7 of E1M1's 85 sectors — this is genuinely
+     visible in normal play, not a rare edge case) was rendered like any
+     other flat, which either showed a nonsense texture or the missing-
+     texture checkerboard, since F_SKY1 has no real pixel data of its own.
+     Doom's actual technique — confirmed against source rather than
+     invented — is to paint the SKY1 *wall* texture directly from the
+     camera's view angle instead of via world-position floor-casting:
+     turning scrolls it, walking never does, giving the "infinitely far
+     away" look. skyAngularRepeats=4 (the sky texture's width tiles 4
+     times across one full 360° turn) is id's own ANGLETOSKYSHIFT constant
+     translated to this project's terms, not a guess. Vertically, the
+     texture is simply stretched to fill whatever screen range asks for
+     it — a simplification against the original's own vertical scale
+     constant, which wasn't tracked down; see the roadmap.
+
+12.3 Movement momentum/friction (engine/game.go's handleMovement, new
+     VelX/VelY fields) — ported from p_mobj.c's P_XYMovement and p_user.c's
+     P_Thrust. Before this, WASD set the camera's velocity directly each
+     frame (capped at a fixed top speed, no ramp-up, instant stop on key
+     release) — a materially different feel from vanilla Doom, which never
+     sets a player's velocity directly: holding a direction key adds a
+     fixed thrust to momentum every tic, and a multiplicative friction
+     (id's ORIG_FRICTION, 0xE800 in 16.16 fixed point) is applied every
+     tic regardless of input, with a STOPSPEED cutoff (0x1000 fixed point)
+     below which momentum snaps to zero rather than decaying forever. This
+     project's version reproduces that exact mechanism — see the
+     frictionPerTic/stopSpeed constants' doc comments for the fixed-point
+     values themselves and how thrustAccel is derived (not ported: it's
+     back-calculated so the thrust/friction equilibrium lands at this
+     project's own chosen top speed) — converting id's per-tic (1/35s)
+     application into continuous time via frictionPerTic^(dt*35) so it
+     stays frame-rate independent.
+
+None of this touched collision's brute-force-over-every-Linedef approach
+(section 9.1) — PrBoom's p_map.c does use the WAD's own BLOCKMAP for this,
+and porting that over remains the obvious next efficiency win; see the
+roadmap.

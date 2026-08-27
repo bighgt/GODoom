@@ -168,6 +168,10 @@ func (r *Renderer) renderSeg(level *wad.Level, seg wad.Seg, cam Camera) {
 	if frontSD == nil || frontSec == nil {
 		return
 	}
+	var flags uint16
+	if int(seg.Linedef) < len(level.Linedefs) {
+		flags = level.Linedefs[seg.Linedef].Flags
+	}
 
 	invD1, invD2 := 1/d1, 1/d2
 	tOverD1, tOverD2 := t1*invD1, t2*invD2
@@ -182,7 +186,7 @@ func (r *Renderer) renderSeg(level *wad.Level, seg wad.Seg, cam Camera) {
 		segT := (tOverD1 + (tOverD2-tOverD1)*alpha) * depth
 
 		texX := int(math.Floor(float64(frontSD.XOffset) + float64(seg.Offset) + segT))
-		r.renderColumn(x, depth, texX, frontSD, backSD, frontSec, backSec, cam)
+		r.renderColumn(x, depth, texX, frontSD, backSD, frontSec, backSec, flags, cam)
 	}
 	_ = backSD // reserved: masked (transparent) middle textures on two-sided lines are Phase 3
 }
@@ -202,7 +206,9 @@ func (r *Renderer) horizonY() float64 {
 // the wall piece(s) it defines, and the floor/ceiling flat spans the wall
 // newly exposes — then narrows r.ceilClip/r.floorClip to reflect what's now
 // been drawn, exactly mirroring Doom's own per-column occlusion tracking.
-func (r *Renderer) renderColumn(x int, depth float64, texX int, frontSD, backSD *wad.Sidedef, frontSec, backSec *wad.Sector, cam Camera) {
+// flags is the seg's parent Linedef's flag bits, for texture pegging (see
+// drawWallSpan) — the only reason this needs the raw Linedef data at all.
+func (r *Renderer) renderColumn(x int, depth float64, texX int, frontSD, backSD *wad.Sidedef, frontSec, backSec *wad.Sector, flags uint16, cam Camera) {
 	top := r.ceilClip[x]
 	bottom := r.floorClip[x]
 
@@ -213,8 +219,9 @@ func (r *Renderer) renderColumn(x int, depth float64, texX int, frontSD, backSD 
 		// One-sided (solid) wall: the middle texture fills the entire
 		// floor-to-ceiling gap and nothing behind this seg can ever be
 		// seen through it — close the column completely.
-		r.drawFlatSpan(x, top, ceilY, frontSec.CeilingTexture, float64(frontSec.CeilingHeight), cam)
-		r.drawWallSpan(x, ceilY, floorY, texX, frontSD.MiddleTexture, frontSD, float64(frontSec.CeilingHeight), depth, cam)
+		r.drawCeilingSpan(x, top, ceilY, frontSec, depth, cam)
+		r.drawWallSpan(x, ceilY, floorY, texX, frontSD.MiddleTexture, frontSD,
+			pieceMiddle, flags&wad.LinedefLowerUnpegged != 0, frontSec, backSec, depth, cam)
 		r.drawFlatSpan(x, floorY, bottom, frontSec.FloorTexture, float64(frontSec.FloorHeight), cam)
 		r.ceilClip[x] = bottom
 		r.floorClip[x] = bottom
@@ -225,16 +232,18 @@ func (r *Renderer) renderColumn(x int, depth float64, texX int, frontSD, backSD 
 	backFloorY := clampInt(r.worldZToScreenY(depth, float64(backSec.FloorHeight), cam.Z), top, bottom)
 
 	// Ceiling flat down to the (possibly stepped) upper wall piece.
-	r.drawFlatSpan(x, top, ceilY, frontSec.CeilingTexture, float64(frontSec.CeilingHeight), cam)
+	r.drawCeilingSpan(x, top, ceilY, frontSec, depth, cam)
 	if backSec.CeilingHeight < frontSec.CeilingHeight {
-		r.drawWallSpan(x, ceilY, backCeilY, texX, frontSD.UpperTexture, frontSD, float64(frontSec.CeilingHeight), depth, cam)
+		r.drawWallSpan(x, ceilY, backCeilY, texX, frontSD.UpperTexture, frontSD,
+			pieceUpper, flags&wad.LinedefUpperUnpegged != 0, frontSec, backSec, depth, cam)
 	}
 	r.ceilClip[x] = maxInt(ceilY, backCeilY)
 
 	// Floor flat up to the (possibly stepped) lower wall piece.
 	r.drawFlatSpan(x, floorY, bottom, frontSec.FloorTexture, float64(frontSec.FloorHeight), cam)
 	if backSec.FloorHeight > frontSec.FloorHeight {
-		r.drawWallSpan(x, backFloorY, floorY, texX, frontSD.LowerTexture, frontSD, float64(backSec.FloorHeight), depth, cam)
+		r.drawWallSpan(x, backFloorY, floorY, texX, frontSD.LowerTexture, frontSD,
+			pieceLower, flags&wad.LinedefLowerUnpegged != 0, frontSec, backSec, depth, cam)
 	}
 	r.floorClip[x] = minInt(floorY, backFloorY)
 
@@ -244,23 +253,64 @@ func (r *Renderer) renderColumn(x int, depth float64, texX int, frontSD, backSD 
 	// still free to draw into it.
 }
 
+// drawCeilingSpan draws a sector's ceiling, dispatching to the sky
+// renderer (sky.go) instead of a normal textured flat when the ceiling is
+// the special sky flat (F_SKY1) — exactly the check PrBoom's r_bsp.c makes
+// (sector->ceilingpic == skyflatnum) before building a normal visplane.
+func (r *Renderer) drawCeilingSpan(x, yTop, yBottom int, sec *wad.Sector, depth float64, cam Camera) {
+	if sec.CeilingTexture == skyFlatName {
+		r.drawSkySpan(x, yTop, yBottom, cam)
+		return
+	}
+	r.drawFlatSpan(x, yTop, yBottom, sec.CeilingTexture, float64(sec.CeilingHeight), cam)
+}
+
+// wallPiece identifies which of a seg's up-to-three wall textures
+// drawWallSpan is drawing — each anchors its texture differently, and two
+// of the three change behavior with the linedef's (un)pegged flags. See
+// drawWallSpan's doc comment.
+type wallPiece int
+
+const (
+	pieceMiddle wallPiece = iota // one-sided line's only texture, floor to ceiling
+	pieceUpper                   // two-sided line's upper piece, front ceiling down to back ceiling
+	pieceLower                   // two-sided line's lower piece, back floor up to front floor
+)
+
 // drawWallSpan draws one wall piece's texture into screen rows [yTop,
-// yBottom) of column x. topWorldZ is the wall piece's true, *unclamped*
-// top edge in world Z (not derived from the possibly-clipped yTop pixel),
-// which anchors the texture's row 0 there (Doom's default, "not unpegged"
-// behavior; sd.YOffset shifts that anchor further).
+// yBottom) of column x. Which world-Z the texture's row 0 anchors to
+// (anchorZ) depends on piece and unpegged — ported directly from PrBoom's
+// r_segs.c (R_StoreWallRange's rw_*texturemid setup), not invented:
+//
+//   - pieceMiddle (one-sided): unpegged anchors the texture's *bottom* to
+//     the floor (anchorZ = floor + texture height); the default anchors
+//     the top to the ceiling (anchorZ = ceiling).
+//   - pieceUpper: unpegged (ML_DONTPEGTOP) anchors the top to the front
+//     ceiling (anchorZ = frontCeiling) — a fixed point that doesn't move
+//     as a door's back ceiling rises/falls, so the texture appears to be
+//     "revealed" from the bottom as the door opens. The default anchors
+//     the *bottom* to the back ceiling (anchorZ = backCeiling + texture
+//     height), which — recomputed fresh every frame from the live,
+//     possibly-animating backCeiling — keeps the texture's bottom edge
+//     flush with a moving door's ceiling instead of stretching.
+//   - pieceLower: the default anchors the top to the back floor (anchorZ
+//     = backFloor, matching the piece's own top edge). Unpegged
+//     (ML_DONTPEGBOTTOM) anchors to the *front ceiling* instead
+//     (anchorZ = frontCeiling) — a well-known original-engine quirk, not
+//     a bug in this port: lower-unpegged textures reference the far-away
+//     front ceiling rather than anything on the lower piece itself.
 //
 // Doom's texture formats store 1 texel per map unit, so the texture row at
-// screen row y is just topWorldZ minus that row's own world Z. Because
-// depth (this column's distance to the wall plane) is constant across a
-// column, world Z is a *linear* function of screen row here — unlike
-// drawFlatSpan, which has to recompute a fresh depth every row — so this
-// reduces to stepping v by a constant `depth/r.focal` texels per row. That
-// step is exactly what makes a texture visibly stretch as a wall gets
-// closer (small depth → small step, few rows needed to reach the next
-// texel) and compress as it recedes (large depth → large step) instead of
-// just showing a fixed number of texels regardless of distance.
-func (r *Renderer) drawWallSpan(x, yTop, yBottom, texX int, texName string, sd *wad.Sidedef, topWorldZ, depth float64, cam Camera) {
+// screen row y is just anchorZ minus that row's own world Z. Because depth
+// (this column's distance to the wall plane) is constant across a column,
+// world Z is a *linear* function of screen row here — unlike drawFlatSpan,
+// which has to recompute a fresh depth every row — so this reduces to
+// stepping v by a constant `depth/r.focal` texels per row. That step is
+// exactly what makes a texture visibly stretch as a wall gets closer
+// (small depth → small step) and compress as it recedes (large depth →
+// large step) instead of just showing a fixed number of texels regardless
+// of distance.
+func (r *Renderer) drawWallSpan(x, yTop, yBottom, texX int, texName string, sd *wad.Sidedef, piece wallPiece, unpegged bool, frontSec, backSec *wad.Sector, depth float64, cam Camera) {
 	if yBottom <= yTop {
 		return
 	}
@@ -268,10 +318,33 @@ func (r *Renderer) drawWallSpan(x, yTop, yBottom, texX int, texName string, sd *
 	if !ok {
 		return
 	}
+
+	var anchorZ float64
+	switch piece {
+	case pieceMiddle:
+		if unpegged {
+			anchorZ = float64(frontSec.FloorHeight) + float64(tex.Height)
+		} else {
+			anchorZ = float64(frontSec.CeilingHeight)
+		}
+	case pieceUpper:
+		if unpegged {
+			anchorZ = float64(frontSec.CeilingHeight)
+		} else {
+			anchorZ = float64(backSec.CeilingHeight) + float64(tex.Height)
+		}
+	case pieceLower:
+		if unpegged {
+			anchorZ = float64(frontSec.CeilingHeight)
+		} else {
+			anchorZ = float64(backSec.FloorHeight)
+		}
+	}
+
 	tx := ((texX % tex.Width) + tex.Width) % tex.Width
 
 	step := depth / r.focal
-	base := topWorldZ - cam.Z + float64(sd.YOffset) - r.horizonY()*step
+	base := anchorZ - cam.Z + float64(sd.YOffset) - r.horizonY()*step
 
 	for y := yTop; y < yBottom; y++ {
 		v := base + (float64(y)+0.5)*step

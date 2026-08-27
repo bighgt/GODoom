@@ -14,6 +14,14 @@ const NoSidedef = 0xFFFF
 // exact bit Doom's own renderer used to tell BSP nodes and leaves apart.
 const SubsectorBit = 0x8000
 
+// Linedef.Flags bits relevant to rendering, from the original Doom Specs
+// (unchanged since 1993). UpperUnpegged/LowerUnpegged control texture
+// alignment — see raster.Renderer.drawWallSpan, ported from PrBoom's r_segs.c.
+const (
+	LinedefUpperUnpegged = 0x0008
+	LinedefLowerUnpegged = 0x0010
+)
+
 // Vertex is one entry of the VERTEXES lump (4 bytes): a 2D map-space point.
 type Vertex struct {
 	X, Y int16

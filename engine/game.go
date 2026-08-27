@@ -17,14 +17,42 @@ import (
 // eyeHeight is the classic Doom player eye height above the floor (map units).
 const eyeHeight = 41.0
 
-// moveSpeed and turnSpeed are Phase 2's placeholder movement tuning (map
-// units/sec and radians/sec); a proper physics/collision-aware System is
-// Phase 3 work — see game_design.txt. mouseSensitivity is radians of
-// look per pixel of raw mouse motion (see window.Window.MouseDelta).
+// turnSpeed (keyboard turning, radians/sec) and mouseSensitivity (radians
+// of look per pixel of raw mouse motion — see window.Window.MouseDelta)
+// are this project's own tuning; turning in vanilla Doom isn't momentum-
+// based, so there's nothing to port for it. Translational movement below
+// is momentum-based, ported from PrBoom's p_mobj.c/p_user.c.
 const (
-	moveSpeed        = 300.0
 	turnSpeed        = 2.5
 	mouseSensitivity = 0.0022
+)
+
+// Movement momentum, ported from PrBoom's p_mobj.c (P_XYMovement) and
+// p_user.c (P_MovePlayer/P_Thrust): id's own engine never sets a player's
+// velocity directly. Instead, holding a direction key adds a fixed thrust
+// to it every tic, and a multiplicative friction is applied every tic
+// regardless — the two settle at whatever speed makes them cancel out,
+// which is how Doom's movement gets its slight "spin-up" on starting and
+// "slide to a stop" on releasing instead of the instant-velocity feel a
+// naive implementation has.
+const (
+	// moveTopSpeed is the steady-state speed (map units/sec) holding a
+	// direction reaches once thrust and friction settle — this project's
+	// own choice of "how fast is fast," not a ported value.
+	moveTopSpeed = 300.0
+	// frictionPerTic is id's ORIG_FRICTION (0xE800 in 16.16 fixed point =
+	// 59392/65536), applied multiplicatively to momentum every 1/35s tic.
+	frictionPerTic = 59392.0 / 65536.0
+	// stopSpeed is id's STOPSPEED (0x1000 fixed point = 4096/65536 map
+	// units/tic, converted to units/sec): below this, momentum snaps to
+	// zero instead of asymptotically approaching it forever.
+	stopSpeed = (4096.0 / 65536.0) * ticsPerSecond
+	// thrustAccel (units/sec²) is derived, not ported: the acceleration
+	// that makes holding a direction key settle at exactly moveTopSpeed
+	// once thrust and per-tic friction reach equilibrium (v = v*friction +
+	// thrustPerTic  =>  thrustPerTic = v*(1-friction), converted from
+	// per-tic to per-second).
+	thrustAccel = moveTopSpeed * (1 - frictionPerTic) * ticsPerSecond
 )
 
 func clamp(v, lo, hi float64) float64 {
@@ -52,8 +80,12 @@ type Game struct {
 	BSP   bsp.Node
 
 	Camera raster.Camera
-	Player raster.PlayerStats
-	Weapon WeaponState
+	// VelX/VelY is the player's current horizontal momentum (map
+	// units/sec) — see the movement-momentum constants above and
+	// handleMovement below.
+	VelX, VelY float64
+	Player     raster.PlayerStats
+	Weapon     WeaponState
 
 	// AudioDevice plays one-shot sound effects (door open/close, weapon
 	// fire); Music streams the level's background track. Both are nil-safe
@@ -229,6 +261,8 @@ func (g *Game) handleMovement(dt float32) {
 	fx, fy := math.Cos(g.Camera.Angle), math.Sin(g.Camera.Angle)
 	rx, ry := math.Sin(g.Camera.Angle), -math.Cos(g.Camera.Angle)
 
+	// Thrust: add to momentum rather than set it, exactly like id's own
+	// P_Thrust — see the movement-momentum constants above.
 	dx, dy := 0.0, 0.0
 	if w.ForwardPressed() {
 		dx += fx
@@ -248,8 +282,21 @@ func (g *Game) handleMovement(dt float32) {
 	}
 	if dx != 0 || dy != 0 {
 		n := math.Hypot(dx, dy)
-		g.tryMove(dx/n*moveSpeed*float64(dt), dy/n*moveSpeed*float64(dt))
+		g.VelX += dx / n * thrustAccel * float64(dt)
+		g.VelY += dy / n * thrustAccel * float64(dt)
 	}
+
+	// Friction: applied every frame regardless of input, converting id's
+	// per-tic multiplicative decay (frictionPerTic every 1/35s) into
+	// continuous time so it's frame-rate independent.
+	decay := math.Pow(frictionPerTic, float64(dt)*ticsPerSecond)
+	g.VelX *= decay
+	g.VelY *= decay
+	if math.Hypot(g.VelX, g.VelY) < stopSpeed {
+		g.VelX, g.VelY = 0, 0
+	}
+
+	g.tryMove(g.VelX*float64(dt), g.VelY*float64(dt))
 
 	if sec := bsp.PointSector(g.BSP, g.Level, float32(g.Camera.X), float32(g.Camera.Y)); sec != nil {
 		g.Camera.Z = float64(sec.FloorHeight) + eyeHeight
