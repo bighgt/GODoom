@@ -1,9 +1,30 @@
 package engine
 
-// WeaponDef describes one of the six switchable weapons: its viewmodel
-// sprite prefix (e.g. "PISG" -> PISGA0 ready / PISGB0 fire-recoil frame,
-// if the WAD has one), muzzle-flash sprite prefix, fire sound lump name,
-// and which PlayerStats.Ammo slot/cost firing it consumes.
+// WeaponFrame is one frame of a weapon's animation, straight from id's own
+// info.c states[] table: which sprite frame letter to show, and how many
+// Doom tics (1/35 sec, the engine's fixed simulation rate) to hold it
+// before advancing. The original expresses this as a linked chain of named
+// states (S_PISTOL1 -> S_PISTOL2 -> ...); this project flattens each
+// weapon's chain into a plain slice, which is all a chain of
+// frame+duration pairs with no branching ever really was.
+type WeaponFrame struct {
+	Frame byte // 'A', 'B', 'C', ... -> sprite lump suffix, e.g. "PISG" + 'B' + "0" = PISGB0
+	Tics  int
+}
+
+// ticsPerSecond is Doom's native simulation rate — every Tics value below
+// is taken directly from info.c and only makes sense against this constant.
+const ticsPerSecond = 35.0
+
+// WeaponDef describes one of the six switchable weapons: its viewmodel/
+// flash sprite prefixes, fire sound, ammo cost, and its fire animation —
+// FireFrames (the gun sprite sequence) and FlashFrames (the muzzle-flash
+// overlay sequence, running in parallel from the same moment firing
+// starts) — both ported from info.c's actual per-weapon state chains; see
+// game_design.txt for exactly which simplifications were made translating
+// id's linked *state* graph (each with its own action-function pointers)
+// into these flat timing tables, and which original behavior (e.g. two
+// weapons' flash frame occasionally chosen at random) wasn't replicated.
 type WeaponDef struct {
 	Name         string
 	SpritePrefix string
@@ -11,6 +32,8 @@ type WeaponDef struct {
 	FireSound    string
 	AmmoType     int // index into raster.PlayerStats.Ammo
 	AmmoCost     int
+	FireFrames   []WeaponFrame
+	FlashFrames  []WeaponFrame // nil/empty if the weapon has no muzzle flash
 }
 
 // Weapons are the six switchable weapons, keys 1-6 in that order. Vanilla
@@ -21,13 +44,68 @@ type WeaponDef struct {
 // approximations — that's the original's actual data (a well-known bit of
 // Doom trivia in the chaingun's case).
 var Weapons = [6]WeaponDef{
-	{Name: "Pistol", SpritePrefix: "PISG", FlashPrefix: "PISF", FireSound: "DSPISTOL", AmmoType: 0, AmmoCost: 1},
-	{Name: "Shotgun", SpritePrefix: "SHTG", FlashPrefix: "SHTF", FireSound: "DSSHOTGN", AmmoType: 1, AmmoCost: 1},
-	{Name: "Chaingun", SpritePrefix: "CHGG", FlashPrefix: "CHGF", FireSound: "DSPISTOL", AmmoType: 0, AmmoCost: 1},
-	{Name: "Rocket Launcher", SpritePrefix: "MISG", FlashPrefix: "MISF", FireSound: "DSRLAUNC", AmmoType: 3, AmmoCost: 1},
-	{Name: "Plasma Rifle", SpritePrefix: "PLSG", FlashPrefix: "PLSF", FireSound: "DSPLASMA", AmmoType: 2, AmmoCost: 1},
-	{Name: "BFG9000", SpritePrefix: "BFGG", FlashPrefix: "BFGF", FireSound: "DSBFG", AmmoType: 2, AmmoCost: 40},
+	{
+		Name: "Pistol", SpritePrefix: "PISG", FlashPrefix: "PISF", FireSound: "DSPISTOL",
+		AmmoType: 0, AmmoCost: 1,
+		// S_PISTOL1..4
+		FireFrames: []WeaponFrame{{'A', 4}, {'B', 6}, {'C', 4}, {'B', 5}},
+		// S_PISTOLFLASH
+		FlashFrames: []WeaponFrame{{'A', 7}},
+	},
+	{
+		Name: "Shotgun", SpritePrefix: "SHTG", FlashPrefix: "SHTF", FireSound: "DSSHOTGN",
+		AmmoType: 1, AmmoCost: 1,
+		// S_SGUN1..9 — the pump-action cycle: A A B C D C B A A
+		FireFrames: []WeaponFrame{
+			{'A', 3}, {'A', 7}, {'B', 5}, {'C', 5}, {'D', 4}, {'C', 5}, {'B', 5}, {'A', 3}, {'A', 7},
+		},
+		// S_SGUNFLASH1..2
+		FlashFrames: []WeaponFrame{{'A', 4}, {'B', 3}},
+	},
+	{
+		Name: "Chaingun", SpritePrefix: "CHGG", FlashPrefix: "CHGF", FireSound: "DSPISTOL",
+		AmmoType: 0, AmmoCost: 1,
+		// S_CHAIN1..2 (S_CHAIN3 is the same frame held 0 tics — an
+		// instant passthrough back to ready, so it contributes nothing visible)
+		FireFrames: []WeaponFrame{{'A', 4}, {'B', 4}},
+		// S_CHAINFLASH1 (vanilla picks between two near-identical flash
+		// states at random each shot for subtle variety; always using the
+		// first is this project's simplification)
+		FlashFrames: []WeaponFrame{{'A', 5}},
+	},
+	{
+		Name: "Rocket Launcher", SpritePrefix: "MISG", FlashPrefix: "MISF", FireSound: "DSRLAUNC",
+		AmmoType: 3, AmmoCost: 1,
+		// S_MISSILE1..2 (S_MISSILE3 is another 0-tic instant passthrough);
+		// both real frames are the same letter, so they're merged into one
+		FireFrames: []WeaponFrame{{'B', 20}},
+		// S_MISSILEFLASH1..4
+		FlashFrames: []WeaponFrame{{'A', 3}, {'B', 4}, {'C', 4}, {'D', 4}},
+	},
+	{
+		Name: "Plasma Rifle", SpritePrefix: "PLSG", FlashPrefix: "PLSF", FireSound: "DSPLASMA",
+		AmmoType: 2, AmmoCost: 1,
+		// S_PLASMA1..2
+		FireFrames: []WeaponFrame{{'A', 3}, {'B', 20}},
+		// S_PLASMAFLASH1 (vanilla randomly picks S_PLASMAFLASH2 instead
+		// about half the time; same simplification as the chaingun above)
+		FlashFrames: []WeaponFrame{{'A', 4}},
+	},
+	{
+		Name: "BFG9000", SpritePrefix: "BFGG", FlashPrefix: "BFGF", FireSound: "DSBFG",
+		AmmoType: 2, AmmoCost: 40,
+		// S_BFG1..4
+		FireFrames: []WeaponFrame{{'A', 20}, {'B', 10}, {'B', 10}, {'B', 20}},
+		// S_BFGFLASH1..2
+		FlashFrames: []WeaponFrame{{'A', 11}, {'B', 6}},
+	},
 }
+
+// weaponRaiseSpeed is id's own RAISESPEED/LOWERSPEED (6 fixed-point units
+// per tic, over a WEAPONBOTTOM-WEAPONTOP span of 96 units — see p_pspr.c),
+// converted into this project's 0..1 Offset space and real seconds:
+// 96/6 = 16 tics to fully raise or lower.
+const weaponRaiseSpeed = ticsPerSecond / 16.0
 
 type weaponPhase int
 
@@ -38,27 +116,33 @@ const (
 	weaponFiring
 )
 
-// weaponRaiseSpeed and weaponFireDuration are this project's own tuning
-// (Doom's exact per-weapon frame timing comes from info.c's state tables,
-// which this project doesn't replicate — see game_design.txt); chosen to
-// read as a quick, responsive raise/lower/fire without needing that data.
-const (
-	weaponRaiseSpeed   = 3.0 // 0..1 raise-offset units/sec
-	weaponFireDuration = 0.3 // seconds the fire pose/flash holds
-)
-
 // WeaponState is the equipped weapon's animation state.
 type WeaponState struct {
-	Current  int
-	pending  int // weapon index queued to switch to once lowering completes; -1 if none
-	phase    weaponPhase
-	Offset   float64 // 0 = fully raised/ready, 1 = fully lowered/hidden — read by raster.DrawWeapon
-	fireTime float64
+	Current int
+	pending int // weapon index queued to switch to once lowering completes; -1 if none
+	phase   weaponPhase
+	Offset  float64 // 0 = fully raised/ready, 1 = fully lowered/hidden — read by raster.DrawWeapon
+
+	fireElapsedTics float64 // time since FireWeapon, in Doom tics — indexes into FireFrames/FlashFrames
 }
 
 // NewWeaponState starts the first weapon (Pistol) already raising in.
 func NewWeaponState() WeaponState {
 	return WeaponState{Current: 0, pending: -1, phase: weaponRaising, Offset: 1}
+}
+
+// frameAt walks frames' cumulative durations and returns whichever is
+// active at elapsedTics, or ok=false once elapsedTics has run past the end
+// of the whole sequence.
+func frameAt(frames []WeaponFrame, elapsedTics float64) (frame WeaponFrame, ok bool) {
+	t := 0.0
+	for _, f := range frames {
+		t += float64(f.Tics)
+		if elapsedTics < t {
+			return f, true
+		}
+	}
+	return WeaponFrame{}, false
 }
 
 // SwitchWeapon requests weapon index (0-5) become current, via the same
@@ -84,11 +168,11 @@ func (g *Game) SwitchWeapon(index int) {
 }
 
 // FireWeapon fires the current weapon if it's ready and there's enough
-// ammo: plays its sound, starts the fire animation, deducts ammo, and
-// launches a visible projectile from the camera along its facing/pitch
-// direction (see projectiles.go) — there's no damage dealt yet (no
-// monsters exist to damage — see game_design.txt), just the shot itself
-// and what it hits.
+// ammo: plays its sound, starts its fire animation (see WeaponDef's
+// FireFrames/FlashFrames), deducts ammo, and launches a visible projectile
+// from the camera along its facing/pitch direction (see projectiles.go) —
+// there's no damage dealt yet (no monsters exist to damage — see
+// game_design.txt), just the shot itself and what it hits.
 func (g *Game) FireWeapon() {
 	if g.Weapon.phase != weaponReady {
 		return
@@ -101,7 +185,7 @@ func (g *Game) FireWeapon() {
 		g.Player.Ammo[def.AmmoType] -= def.AmmoCost
 	}
 	g.Weapon.phase = weaponFiring
-	g.Weapon.fireTime = weaponFireDuration
+	g.Weapon.fireElapsedTics = 0
 	g.playSound(def.FireSound)
 	g.spawnProjectile()
 }
@@ -128,8 +212,8 @@ func (g *Game) updateWeapon(dt float64) {
 			w.phase = weaponReady
 		}
 	case weaponFiring:
-		w.fireTime -= dt
-		if w.fireTime <= 0 {
+		w.fireElapsedTics += dt * ticsPerSecond
+		if _, ok := frameAt(Weapons[w.Current].FireFrames, w.fireElapsedTics); !ok {
 			w.phase = weaponReady
 		}
 	case weaponReady:
@@ -138,4 +222,23 @@ func (g *Game) updateWeapon(dt float64) {
 		}
 	}
 	g.Player.CurrentAmmo = Weapons[w.Current].AmmoType
+}
+
+// currentSprite reports which viewmodel sprite frame letter is showing
+// right now ('A' — Doom's own ready/raise/lower states are always frame
+// A — unless mid-fire, per FireFrames), and which flash frame (if any) is
+// overlaid, per FlashFrames.
+func (g *Game) currentSprite() (gunFrame byte, flashFrame byte, hasFlash bool) {
+	gunFrame = 'A'
+	if g.Weapon.phase != weaponFiring {
+		return gunFrame, 0, false
+	}
+	def := Weapons[g.Weapon.Current]
+	if f, ok := frameAt(def.FireFrames, g.Weapon.fireElapsedTics); ok {
+		gunFrame = f.Frame
+	}
+	if f, ok := frameAt(def.FlashFrames, g.Weapon.fireElapsedTics); ok {
+		return gunFrame, f.Frame, true
+	}
+	return gunFrame, 0, false
 }

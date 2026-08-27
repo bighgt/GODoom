@@ -171,7 +171,8 @@ func (g *Game) Run() error {
 			g.Raster.DrawBillboard(g.Camera, p.X, p.Y, p.Z, projectileBillboardSize, projectileColor)
 		}
 		def := Weapons[g.Weapon.Current]
-		g.Raster.DrawWeapon(def.SpritePrefix, def.FlashPrefix, g.Weapon.phase == weaponFiring, g.Weapon.Offset)
+		gunFrame, flashFrame, hasFlash := g.currentSprite()
+		g.Raster.DrawWeapon(def.SpritePrefix, gunFrame, def.FlashPrefix, flashFrame, hasFlash, g.Weapon.Offset)
 		g.Raster.DrawStatusBar(g.Player)
 		if g.ShowHUD {
 			g.Raster.DrawHUD([]string{
