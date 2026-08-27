@@ -34,6 +34,29 @@ type WeaponDef struct {
 	AmmoCost     int
 	FireFrames   []WeaponFrame
 	FlashFrames  []WeaponFrame // nil/empty if the weapon has no muzzle flash
+	// Projectile is non-nil for the three weapons that fire a true,
+	// visible, traveling shot (Rocket Launcher, Plasma Rifle, BFG9000) —
+	// nil for the three hitscan weapons (Pistol, Shotgun, Chaingun),
+	// which fire instantly with nothing to simulate or draw at all,
+	// exactly matching the original: real Doom never gives a bullet a
+	// travel time, only rockets/plasma/BFG bolts are actual moving things.
+	Projectile *ProjectileDef
+}
+
+// ProjectileDef is a weapon's true traveling projectile (id's "missile"
+// thing): a single flying sprite (this project always shows the same
+// view of it rather than the original's full set of rotation frames —
+// see projectiles.go) that travels at Speed until it hits a wall, then
+// plays ExplodeFrames (one letter per ExplodePrefix-lump frame, held
+// ExplodeTics each) and plays ExplodeSound once, in place, before
+// disappearing.
+type ProjectileDef struct {
+	Sprite        string
+	Speed         float64 // map units/sec
+	ExplodePrefix string
+	ExplodeFrames []byte
+	ExplodeTics   int
+	ExplodeSound  string
 }
 
 // Weapons are the six switchable weapons, keys 1-6 in that order. Vanilla
@@ -81,6 +104,15 @@ var Weapons = [6]WeaponDef{
 		FireFrames: []WeaponFrame{{'B', 20}},
 		// S_MISSILEFLASH1..4
 		FlashFrames: []WeaponFrame{{'A', 3}, {'B', 4}, {'C', 4}, {'D', 4}},
+		// MT_ROCKET: speed 20*35=700 units/sec; deathsound sfx_barexp
+		// (DSBAREXP) — rockets and exploding barrels share an explosion
+		// sound in vanilla, not an approximation. All verified present in
+		// testdata/DOOM1.WAD (MISLA1, BEXPA0-E0, DSBAREXP).
+		Projectile: &ProjectileDef{
+			Sprite: "MISLA1", Speed: 700,
+			ExplodePrefix: "BEXP", ExplodeFrames: []byte{'A', 'B', 'C', 'D', 'E'}, ExplodeTics: 4,
+			ExplodeSound: "DSBAREXP",
+		},
 	},
 	{
 		Name: "Plasma Rifle", SpritePrefix: "PLSG", FlashPrefix: "PLSF", FireSound: "DSPLASMA",
@@ -90,6 +122,17 @@ var Weapons = [6]WeaponDef{
 		// S_PLASMAFLASH1 (vanilla randomly picks S_PLASMAFLASH2 instead
 		// about half the time; same simplification as the chaingun above)
 		FlashFrames: []WeaponFrame{{'A', 4}},
+		// MT_PLASMA: speed 25*35=875 units/sec. Sprite/explosion/sound
+		// names (PLSS the flying ball, PLSE its splat, DSPLASMA reused for
+		// no distinct impact sound in vanilla) are NOT verified against
+		// any WAD — the shareware IWAD this project was built and tested
+		// against has no plasma rifle assets at all (it's Episode 2/3-only
+		// content), so this has never actually been exercised.
+		Projectile: &ProjectileDef{
+			Sprite: "PLSSA0", Speed: 875,
+			ExplodePrefix: "PLSE", ExplodeFrames: []byte{'A', 'B', 'C', 'D', 'E'}, ExplodeTics: 4,
+			ExplodeSound: "DSFIRXPL",
+		},
 	},
 	{
 		Name: "BFG9000", SpritePrefix: "BFGG", FlashPrefix: "BFGF", FireSound: "DSBFG",
@@ -98,6 +141,14 @@ var Weapons = [6]WeaponDef{
 		FireFrames: []WeaponFrame{{'A', 20}, {'B', 10}, {'B', 10}, {'B', 20}},
 		// S_BFGFLASH1..2
 		FlashFrames: []WeaponFrame{{'A', 11}, {'B', 6}},
+		// MT_BFG: speed 25*35=875 units/sec. Same caveat as Plasma Rifle
+		// above — BFS1/BFE1 names are unverified, no BFG assets exist in
+		// the shareware IWAD this project was tested against.
+		Projectile: &ProjectileDef{
+			Sprite: "BFS1A0", Speed: 875,
+			ExplodePrefix: "BFE1", ExplodeFrames: []byte{'A', 'B', 'C', 'D'}, ExplodeTics: 8,
+			ExplodeSound: "DSRXPLOD",
+		},
 	},
 }
 
@@ -169,10 +220,14 @@ func (g *Game) SwitchWeapon(index int) {
 
 // FireWeapon fires the current weapon if it's ready and there's enough
 // ammo: plays its sound, starts its fire animation (see WeaponDef's
-// FireFrames/FlashFrames), deducts ammo, and launches a visible projectile
-// from the camera along its facing/pitch direction (see projectiles.go) —
-// there's no damage dealt yet (no monsters exist to damage — see
-// game_design.txt), just the shot itself and what it hits.
+// FireFrames/FlashFrames), deducts ammo, and — only for the three weapons
+// with a ProjectileDef (Rocket Launcher, Plasma Rifle, BFG9000) — launches
+// a real visible shot from the camera along its facing/pitch direction
+// (see projectiles.go). The other three (Pistol, Shotgun, Chaingun) are
+// hitscan: nothing travels or gets simulated at all, matching how
+// instantaneous a real Doom bullet is. There's no damage dealt yet (no
+// monsters exist to damage — see game_design.txt), just the shot itself
+// and what it hits.
 func (g *Game) FireWeapon() {
 	if g.Weapon.phase != weaponReady {
 		return
@@ -187,7 +242,9 @@ func (g *Game) FireWeapon() {
 	g.Weapon.phase = weaponFiring
 	g.Weapon.fireElapsedTics = 0
 	g.playSound(def.FireSound)
-	g.spawnProjectile()
+	if def.Projectile != nil {
+		g.spawnProjectile(def.Projectile)
+	}
 }
 
 // updateWeapon advances the raise/lower/fire animation by dt seconds and

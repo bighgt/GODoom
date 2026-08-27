@@ -73,7 +73,6 @@ type Game struct {
 
 	doorThinkers map[int]*doorThinker // by Sector index; see doors.go
 	spaceWasDown bool                 // for edge-detecting the "use" key
-	fireWasDown  bool                 // for edge-detecting the fire button
 	projectiles  []*Projectile        // in-flight shots; see projectiles.go
 
 	entities []Entity
@@ -144,11 +143,17 @@ func (g *Game) Run() error {
 				g.SwitchWeapon(i - 1)
 			}
 		}
-		fireDown := g.Window.FirePressed()
-		if fireDown && !g.fireWasDown {
+		// Held, not edge-triggered: real Doom refires every weapon
+		// automatically for as long as the fire button stays down, at
+		// whatever cadence that weapon's own animation allows —
+		// FireWeapon already no-ops unless the weapon is fully back in
+		// its ready state (weaponReady), so this alone reproduces each
+		// gun's actual rate of fire (e.g. the chaingun's ~4.4 rounds/sec
+		// from its 8-tic cycle) instead of capping every weapon at one
+		// shot per mouse click.
+		if g.Window.FirePressed() {
 			g.FireWeapon()
 		}
-		g.fireWasDown = fireDown
 		g.updateWeapon(float64(dt))
 		g.updateProjectiles(float64(dt))
 
@@ -167,8 +172,14 @@ func (g *Game) Run() error {
 		}
 
 		g.Raster.Render(g.Level, g.BSP, g.Camera)
+		// Only the three true-projectile weapons (Rocket Launcher, Plasma
+		// Rifle, BFG9000) ever populate g.projectiles at all — the three
+		// hitscan weapons never spawn one, so this loop simply does
+		// nothing for them, matching how instant a real bullet is.
 		for _, p := range g.projectiles {
-			g.Raster.DrawBillboard(g.Camera, p.X, p.Y, p.Z, projectileBillboardSize, projectileColor)
+			if name, ok := p.CurrentSprite(); ok {
+				g.Raster.DrawWorldSprite(g.Camera, p.X, p.Y, p.Z, name)
+			}
 		}
 		def := Weapons[g.Weapon.Current]
 		gunFrame, flashFrame, hasFlash := g.currentSprite()

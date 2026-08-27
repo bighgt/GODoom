@@ -28,13 +28,21 @@ type PlayerStats struct {
 	Keys [6]bool
 }
 
-// DefaultPlayerStats is a fresh-spawn loadout: full health, the starting
-// pistol and its ammo, no armor or keys.
+// DefaultPlayerStats is a fresh-spawn loadout: full health, no armor or
+// keys, and — unlike a real Doom start, where you only ever have bullets
+// until you find something else — starting ammo for *every* type. There's
+// no pickup system yet (see game_design.txt) to ever grant shells/cells/
+// rockets otherwise, and firing a weapon with no ammo for its type is a
+// silent no-op (see engine.Game.FireWeapon), so leaving those at their
+// zero value made every weapon but the pistol/chaingun (which shares the
+// pistol's bullets) look simply broken rather than just unloaded.
 func DefaultPlayerStats() PlayerStats {
 	ps := PlayerStats{Health: 100, CurrentAmmo: 0}
-	ps.Ammo[0], ps.MaxAmmo[0] = 50, 200
-	ps.MaxAmmo[1], ps.MaxAmmo[2], ps.MaxAmmo[3] = 50, 300, 50
-	ps.Weapons[2] = true // pistol
+	ps.Ammo[0], ps.MaxAmmo[0] = 50, 200  // bullets
+	ps.Ammo[1], ps.MaxAmmo[1] = 50, 50   // shells
+	ps.Ammo[2], ps.MaxAmmo[2] = 300, 300 // cells (BFG's 40/shot draws this down fast on purpose)
+	ps.Ammo[3], ps.MaxAmmo[3] = 50, 50   // rockets
+	ps.Weapons[2] = true                 // pistol
 	return ps
 }
 
