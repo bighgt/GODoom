@@ -257,6 +257,10 @@ func (g *Game) handleMovement(dt float32) {
 		g.Camera.Pitch -= mdy * mouseSensitivity
 		g.Camera.Pitch = clamp(g.Camera.Pitch, -raster.MaxPitch, raster.MaxPitch)
 	}
+	// Keep Angle bounded to (-2π, 2π] rather than letting it accumulate
+	// without limit over a long session — sin/cos handle a large argument
+	// correctly, but there's no reason to let it grow forever either.
+	g.Camera.Angle = math.Mod(g.Camera.Angle, 2*math.Pi)
 
 	fx, fy := math.Cos(g.Camera.Angle), math.Sin(g.Camera.Angle)
 	rx, ry := math.Sin(g.Camera.Angle), -math.Cos(g.Camera.Angle)

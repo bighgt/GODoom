@@ -23,10 +23,19 @@ const skyTextureName = "SKY1"
 const skyAngularRepeats = 4.0
 
 // skyVScale is the vertical texels-per-screen-row rate the sky is drawn
-// at — a fixed 1:1, chosen (rather than ported; PrBoom's own skyiscale
-// wasn't tracked down to its exact fixed-point value) to keep the sky at
-// a stable, plausible size regardless of window/internal resolution.
+// at. id's r_plane.c sets dc_iscale = pspriteiscale>>detailshift for sky
+// columns — the same fixed scale weapon-viewmodel sprites use, which in
+// the normal (non-low-detail) case is exactly FRACUNIT, i.e. 1:1 — this
+// project's internal resolution matches vanilla's 320x200 exactly, so
+// that 1:1 carries over directly with no rescaling needed.
 const skyVScale = 1.0
+
+// skyTextureMidRow is id's own skytexturemid (R_InitSkyMap:
+// "skytexturemid = 100*FRACUNIT"): the texture row that lands at the
+// screen's vertical center — not the texture's own midpoint (64, for a
+// 128-tall sky), a fixed constant chosen so a sky texture's usually-plain
+// upper portion gets more room than its horizon-detail lower portion.
+const skyTextureMidRow = 100.0
 
 // drawSkySpan fills screen rows [yTop, yBottom) of column x with the sky
 // texture, using Doom's actual technique: rather than being positioned in
@@ -65,12 +74,12 @@ func (r *Renderer) drawSkySpan(x, yTop, yBottom int, cam Camera) {
 	u := colAngle / (2 * math.Pi) * float64(tex.Width) * skyAngularRepeats
 	tx := wrapInt(int(math.Floor(u)), tex.Width)
 
-	// Anchored to the texture's vertical center at the (pitch-shifted)
-	// horizon row, so looking up/down scrolls the sky vertically the same
-	// consistent way in every column.
+	// Anchored to skyTextureMidRow at the (pitch-shifted) horizon row —
+	// id's own skytexturemid convention — so looking up/down scrolls the
+	// sky vertically the same consistent way in every column.
 	horizon := r.horizonY()
 	for y := yTop; y < yBottom; y++ {
-		v := float64(tex.Height)/2 + (float64(y)-horizon)*skyVScale
+		v := skyTextureMidRow + (float64(y)-horizon)*skyVScale
 		ty := wrapInt(int(math.Floor(v)), tex.Height)
 		r.setPixel(x, y, tex.At(tx, ty))
 	}

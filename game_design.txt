@@ -605,9 +605,11 @@ and three concrete gaps were found and fixed by porting the relevant logic
      times across one full 360° turn) is id's own ANGLETOSKYSHIFT constant
      translated to this project's terms, not a guess. Vertically, a
      *fixed* mapping (a column-independent skyVScale texels/row, anchored
-     to the pitch-shifted horizon row) is used — see 12.4 below for why
-     that specifically matters, and where an earlier version of this got
-     it wrong.
+     to skyTextureMidRow — id's own skytexturemid, R_InitSkyMap's
+     "100*FRACUNIT", not the texture's own vertical center) is used —
+     see 12.6 for the investigation behind these exact numbers, and where
+     an earlier version's *column-local* vertical mapping caused a
+     fisheye-like "goldfish bowl" distortion.
 
 12.3 Movement momentum/friction (engine/game.go's handleMovement, new
      VelX/VelY fields) — ported from p_mobj.c's P_XYMovement and p_user.c's
@@ -665,6 +667,55 @@ and three concrete gaps were found and fixed by porting the relevant logic
      compute the largest centered rectangle that preserves 320:200
      exactly, letterboxing or pillarboxing with the render pass's black
      clear color into whatever space is left over.
+
+12.6 Sky scroll-rate investigation (raster/sky.go) — per user report that
+     the sky scrolled faster than wall panning while turning. This got an
+     unusually deep investigation, worth recording precisely because most
+     of it did *not* turn up a bug in the rate formula, which is worth
+     knowing before anyone touches this code again:
+       - skyAngularRepeats=4 was re-verified directly against source (not
+         just re-derived): id's r_defs.h has a comment reading exactly
+         "sky map is 256*128*4 maps" next to ANGLETOSKYSHIFT's definition
+         (22) — 2^(32-22)=1024 steps per 360°, and 1024/256=4, matching
+         this project's SKY1 (confirmed 256x128 via ComposeTexture against
+         testdata/DOOM1.WAD) exactly.
+       - A careful re-derivation of "how fast does a *fixed sky detail*
+         cross the screen as the camera turns" (solving the column-to-
+         angle relationship for screen position at constant texture
+         coordinate, rather than the more obvious but subtly wrong
+         question of "how fast does the texture coordinate change at a
+         fixed column") shows the formula moves in velocity-lockstep with
+         true perspective-projected wall panning at screen center — i.e.
+         mathematically, it should already track wall motion correctly.
+         (An earlier pass at this same derivation, asking the wrong
+         question, wrongly concluded the sky ran ~27% fast; that
+         conclusion was discarded once the correct derivative was taken.)
+       - Confirmed via the same source dive: skyAngularRepeats itself
+         doesn't affect the on-screen scroll *rate* at all (only how
+         zoomed-in the sky pattern appears) — the rate is governed purely
+         by focal/FOV, identically to how wall panning rate is. This rules
+         out "just change the repeat count" as a fix for a rate complaint.
+     What *did* come out of this: skytexturemid — id's fixed vertical
+     anchor for the sky column (R_InitSkyMap: "skytexturemid =
+     100*FRACUNIT"), tied to the same pspriteiscale weapon-sprite scale
+     constant (dc_iscale = pspriteiscale>>detailshift in r_plane.c, which
+     is FRACUNIT — 1:1 — outside the obsolete low-detail mode) rather than
+     the texture's own geometric center. Both are now ported exactly
+     (skyTextureMidRow=100, skyVScale=1) instead of the guessed
+     tex.Height/2 anchor an earlier revision used, which should improve
+     how the sky looks even though it isn't why the *rate* was reported
+     wrong. Camera.Angle is now also wrapped to (-2π, 2π] every frame
+     (engine/game.go) as unrelated defensive hygiene — sin/cos handle
+     large arguments correctly, so this wasn't expected to be the rate
+     bug either, but there's no reason to let it accumulate unbounded
+     over a long session regardless.
+     If the scroll rate still reads as wrong after this, the formula
+     itself has now been checked about as thoroughly as is possible
+     without live pixel-level observation; the next place to look is
+     probably not raster/sky.go at all — e.g. whether the FOV being
+     compared against (a screenshot/memory of some specific source port
+     or configuration) actually used vanilla's 90°, since several popular
+     configurations don't.
 
 None of this touched collision's brute-force-over-every-Linedef approach
 otherwise (section 9.1) — PrBoom's p_map.c does use the WAD's own BLOCKMAP
