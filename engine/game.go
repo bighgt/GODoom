@@ -178,7 +178,7 @@ func (g *Game) Run() error {
 		// nothing for them, matching how instant a real bullet is.
 		for _, p := range g.projectiles {
 			if name, ok := p.CurrentSprite(); ok {
-				g.Raster.DrawWorldSprite(g.Camera, p.X, p.Y, p.Z, name)
+				g.Raster.DrawWorldSprite(g.Camera, p.X, p.Y, p.Z, p.SizeMultiplier(), name)
 			}
 		}
 		def := Weapons[g.Weapon.Current]

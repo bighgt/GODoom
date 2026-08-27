@@ -124,6 +124,23 @@ func (p *Projectile) CurrentSprite() (name string, ok bool) {
 	return fmt.Sprintf("%s%c0", p.def.ExplodePrefix, frame), true
 }
 
+// explosionSizeMultiplier makes the explosion animation read as roughly
+// twice the size its sprite pixels would naturally draw at (on top of,
+// not instead of, the usual distance-based perspective scaling every
+// world sprite gets — see raster.DrawWorldSprite) — a blast is meant to
+// feel big, not just be a literal reproduction of a fairly small sprite.
+const explosionSizeMultiplier = 2.0
+
+// SizeMultiplier is the value to pass raster.DrawWorldSprite for p's
+// current sprite: 1 (native size) while flying, explosionSizeMultiplier
+// once it's exploding.
+func (p *Projectile) SizeMultiplier() float64 {
+	if p.exploding {
+		return explosionSizeMultiplier
+	}
+	return 1
+}
+
 // projectileHitsWall reports whether (x, y) has crossed into a solid
 // linedef, reusing the same per-line wall-opening query player movement
 // does (collision.go's anyLineWithin/wallOpeningAt): a one-sided line

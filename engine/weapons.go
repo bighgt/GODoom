@@ -104,12 +104,13 @@ var Weapons = [6]WeaponDef{
 		FireFrames: []WeaponFrame{{'B', 20}},
 		// S_MISSILEFLASH1..4
 		FlashFrames: []WeaponFrame{{'A', 3}, {'B', 4}, {'C', 4}, {'D', 4}},
-		// MT_ROCKET: speed 20*35=700 units/sec; deathsound sfx_barexp
-		// (DSBAREXP) — rockets and exploding barrels share an explosion
-		// sound in vanilla, not an approximation. All verified present in
-		// testdata/DOOM1.WAD (MISLA1, BEXPA0-E0, DSBAREXP).
+		// MT_ROCKET's canon speed is 20*35=700 units/sec; per user
+		// feedback this project's own rocket runs 20% faster than that.
+		// deathsound sfx_barexp (DSBAREXP) — rockets and exploding barrels
+		// share an explosion sound in vanilla, not an approximation. All
+		// verified present in testdata/DOOM1.WAD (MISLA1, BEXPA0-E0, DSBAREXP).
 		Projectile: &ProjectileDef{
-			Sprite: "MISLA1", Speed: 700,
+			Sprite: "MISLA1", Speed: 700 * 1.2,
 			ExplodePrefix: "BEXP", ExplodeFrames: []byte{'A', 'B', 'C', 'D', 'E'}, ExplodeTics: 4,
 			ExplodeSound: "DSBAREXP",
 		},

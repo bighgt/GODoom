@@ -12,10 +12,16 @@ package raster
 // sprites use their offsets in exactly this straightforward way; there's
 // no pseudo-3D-projection quirk to work around here.
 //
+// sizeMultiplier scales the sprite beyond its natural 1-texel-per-map-unit
+// size (still perspective-scaled by distance on top of that — a
+// multiplier doesn't change *whether* a nearer hit reads as bigger than a
+// farther one, only the size both ends of that range land on). 1 draws it
+// at native size, as e.g. a flying projectile's own sprite should.
+//
 // Like the rest of this package, there's no depth test against the walls
 // Render already drew (see game_design.txt) — a sprite always draws on
 // top regardless of what should occlude it.
-func (r *Renderer) DrawWorldSprite(cam Camera, wx, wy, wz float64, name string) {
+func (r *Renderer) DrawWorldSprite(cam Camera, wx, wy, wz, sizeMultiplier float64, name string) {
 	sp, ok := r.textures.Sprite(name)
 	if !ok {
 		return
@@ -25,7 +31,7 @@ func (r *Renderer) DrawWorldSprite(cam Camera, wx, wy, wz float64, name string) 
 	if depth < nearPlane {
 		return
 	}
-	scale := r.focal / depth
+	scale := r.focal / depth * sizeMultiplier
 
 	centerX := float64(r.Width)/2 + horiz/depth*r.focal
 	centerY := r.horizonY() - (wz-cam.Z)/depth*r.focal
