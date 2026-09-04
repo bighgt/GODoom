@@ -54,3 +54,7 @@
 
 # Auto-installed local tooling (shader compiler, etc.) — not committed.
 /.tooling/
+
+# Personal working notes on porting GZDoom/UZDoom features — local scratch
+# log, not meant for the public repo.
+/uzdoom-recommendations.md
