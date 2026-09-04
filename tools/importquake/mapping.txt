@@ -478,7 +478,7 @@ TLITE6_1   ikgrlit2       flat
 TLITE6_4   ikgrlit2       flat
 TLITE6_5   ikgrlit2       flat
 TLITE6_6   ikgrlit2       flat
-GATE1      ikbflr02       flat
-GATE2      ikbflr02       flat
-GATE3      ikbflr01       flat
-GATE4      ikbflr01       flat
+GATE1      #RTeleport15   flat
+GATE2      #RTeleport15   flat
+GATE3      #teleport0     flat
+GATE4      #teleport0     flat
