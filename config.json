@@ -39,7 +39,7 @@
   "//fogColor": "hex \"RRGGBB\" (leading # ok)  —  distance-fog colour. Empty (default) disables fog. Works in all three render paths (software vanilla/enhanced, hardware)",
   "fogColor": "",
   "//fogDensity": "0 .. 0.02  —  exponential distance-fog strength: fogFactor = 1 - exp(-density * distance) in map units. 0 (default) = off. ~0.0006 a light haze, ~0.003 a heavy murk. Fog is only applied when fogColor is also set",
-  "fogDensity": 0,
+  "fogDensity": 0.4,
   "//textureQuality": "nearest | bilinear | trilinear | aniso2x | aniso4x | aniso8x | aniso16x  —  one global texture filter for walls, flats, sprites and voxels. nearest = classic hard pixels (fastest). The filtered modes are CPU-heavy: ~5x the frame cost at trilinear, ~8x at aniso8x/16x (1080p). Unknown -> nearest (default nearest)",
   "textureQuality": "aniso8x",
 
