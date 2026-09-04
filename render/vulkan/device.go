@@ -114,6 +114,12 @@ func (r *Renderer) findQueueFamilies(dev vk.PhysicalDevice) (graphics, present u
 }
 
 func deviceSupportsSwapchain(dev vk.PhysicalDevice) bool {
+	return deviceHasExtension(dev, swapchainExtensionName)
+}
+
+// deviceHasExtension reports whether the physical device advertises a
+// device-level extension by name.
+func deviceHasExtension(dev vk.PhysicalDevice, name string) bool {
 	var count uint32
 	vk.EnumerateDeviceExtensionProperties(dev, "", &count, nil)
 	if count == 0 {
@@ -123,7 +129,7 @@ func deviceSupportsSwapchain(dev vk.PhysicalDevice) bool {
 	vk.EnumerateDeviceExtensionProperties(dev, "", &count, props)
 	for i := range props {
 		props[i].Deref()
-		if vk.ToString(props[i].ExtensionName[:]) == swapchainExtensionName {
+		if vk.ToString(props[i].ExtensionName[:]) == name {
 			return true
 		}
 	}
@@ -144,8 +150,34 @@ func (r *Renderer) createLogicalDevice() error {
 		})
 	}
 
-	extensions := []string{nz(swapchainExtensionName)}
+	extNames := []string{swapchainExtensionName}
+	// A portability-subset device (MoltenVK, some layered drivers) MUST have
+	// VK_KHR_portability_subset enabled when it's present — the Vulkan spec
+	// requires it. Native Windows / Linux devices never advertise it, so
+	// this is inert there.
+	if deviceHasExtension(r.physicalDevice, vk.KhrPortabilitySubsetExtensionName) {
+		extNames = append(extNames, vk.KhrPortabilitySubsetExtensionName)
+	}
+	extensions := nzAll(extNames)
 	features := []vk.PhysicalDeviceFeatures{{}}
+	// The hardware-geometry path samples mip-mapped wall/flat textures; turn
+	// on anisotropic filtering when the device offers it so minified,
+	// oblique surfaces stay sharp (the software path's textureQuality knob,
+	// done in fixed-function hardware here). Inert for the vanilla / lit
+	// blit paths.
+	if r.hw {
+		var supported vk.PhysicalDeviceFeatures
+		vk.GetPhysicalDeviceFeatures(r.physicalDevice, &supported)
+		supported.Deref()
+		if supported.SamplerAnisotropy == vk.True {
+			features[0].SamplerAnisotropy = vk.True
+			var props vk.PhysicalDeviceProperties
+			vk.GetPhysicalDeviceProperties(r.physicalDevice, &props)
+			props.Deref()
+			props.Limits.Deref()
+			r.maxAnisotropy = props.Limits.MaxSamplerAnisotropy
+		}
+	}
 
 	createInfo := vk.DeviceCreateInfo{
 		SType:                   vk.StructureTypeDeviceCreateInfo,

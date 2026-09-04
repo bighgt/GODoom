@@ -1,0 +1,31 @@
+// ============================================================================
+// UMAPINFO.example — per-map metadata overrides. RENAME this file to
+// "UMAPINFO" (no extension) to activate it:
+//
+//     mv assets/mods/UMAPINFO.example assets/mods/UMAPINFO
+//
+// The engine mounts everything in assets/mods/ at startup and reads a
+// UMAPINFO lump from it (as well as from the loaded WAD), so you can rename
+// levels / change their music / sky / progression without touching the WAD.
+// A UMAPINFO lump inside the PWAD you load overrides these per map name.
+//
+// This is the community UMAPINFO format (a small, vanilla-friendly subset of
+// ZDoom MAPINFO). engine/mapinfo is a clean-room reader of it — no GZDoom
+// code. Full ZDoom-style MAPINFO is NOT read.
+//
+// Format reference: https://doomwiki.org/wiki/UMAPINFO
+//
+// Wired keys: levelname, author, next, nextsecret, skytexture, music,
+// partime, endgame. Every other key is parsed and kept but not yet acted on
+// (label, levelpic, exitpic/enterpic, intertext, bossaction, ...).
+// ----------------------------------------------------------------------------
+
+MAP E1M1
+{
+    levelname  = "Hangar"
+    author     = "id Software"
+    // next     = "E1M3"        // skip a level
+    // music    = "D_E1M3"      // any D_* lump in the WAD
+    // skytexture = "SKY2"      // any SKY* texture the WAD defines
+    partime    = 30
+}

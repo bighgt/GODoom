@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 
+	"twopointfive/bsp"
 	"twopointfive/raster"
 )
 
@@ -11,8 +12,13 @@ import (
 // doesn't vary per weapon (each weapon's own ProjectileDef — see
 // weapons.go — carries what does: sprite, speed, explosion animation/sound).
 const (
-	projectileRadius    = 4.0  // for wall-hit testing
+	projectileRadius    = 4.0  // wall-hit test radius, and the flight substep length
 	projectileStartDist = 20.0 // spawn this far in front of the camera, clear of the weapon viewmodel/camera itself
+	// projectileMaxRange is a backstop: the floor/ceiling and left-the-level
+	// checks in advanceProjectile end virtually every shot, but a rocket in
+	// a huge open sector with no wall in range would otherwise fly forever,
+	// staying in the slice and drawn every frame. ~128 tiles.
+	projectileMaxRange = 8192.0
 )
 
 // Projectile is a weapon's true traveling shot in flight (see
@@ -62,10 +68,11 @@ func aimDirection(cam raster.Camera) (dx, dy, dz float64) {
 }
 
 // updateProjectiles advances every live projectile by dt seconds: a
-// flying one moves and, on hitting a wall, freezes in place and starts
-// its explosion animation (playing its ExplodeSound once, right then); an
-// exploding one just counts through that animation until it finishes, at
-// which point it's removed. Compacts the slice to just what's still alive.
+// flying one moves (see advanceProjectile) and, on hitting something,
+// freezes in place and starts its explosion animation (playing its
+// ExplodeSound once, right then); an exploding one just counts through
+// that animation until it finishes, at which point it's removed. Compacts
+// the slice to just what's still alive.
 func (g *Game) updateProjectiles(dt float64) {
 	if len(g.projectiles) == 0 {
 		return
@@ -77,16 +84,13 @@ func (g *Game) updateProjectiles(dt float64) {
 			if _, ok := p.explosionFrame(); !ok {
 				p.Alive = false
 			}
-		} else {
-			step := p.def.Speed * dt
-			nx, ny := p.X+p.DX*step, p.Y+p.DY*step
-			if g.projectileHitsWall(nx, ny) {
-				p.exploding = true
-				p.explodeElapsed = 0
-				g.playSound(p.def.ExplodeSound)
-			} else {
-				p.X, p.Y, p.Z = nx, ny, p.Z+p.DZ*step
-				p.traveled += step
+		} else if g.advanceProjectile(p, dt) {
+			p.exploding = true
+			p.explodeElapsed = 0
+			g.playSound(p.def.ExplodeSound)
+			// Rockets (and any blast-radius shot) hurt everything nearby.
+			if p.def.ExplodeRadius > 0 {
+				g.pRadiusAttack(&Mobj{X: p.X, Y: p.Y, Z: p.Z}, g.playerMobj, p.def.ExplodeRadius)
 			}
 		}
 		if p.Alive {
@@ -94,6 +98,82 @@ func (g *Game) updateProjectiles(dt float64) {
 		}
 	}
 	g.projectiles = alive
+}
+
+// advanceProjectile moves p forward by one frame's worth of travel,
+// checking for impact as it goes, and reports whether it hit something (in
+// which case p is left at its impact position, about to explode).
+//
+// The move is walked in steps no longer than projectileRadius so a fast
+// shot — a rocket covers ~14 map units per 60fps frame, more after a dt
+// spike — can't skip over a wall thinner than that between checks. Each
+// step tests, in order: a shootable monster the shot has flown into
+// (projectileHitMobj — the direct hit id's PIT_CheckThing does, dealing
+// def.Damage before the blast); a solid wall (projectileHitsWall,
+// horizontal only); the floor/ceiling of the sector the shot is now in (so
+// a missile aimed up or down has something to stop against); and whether
+// the shot has left the level's geometry entirely (PointSector nil) or
+// exceeded projectileMaxRange.
+func (g *Game) advanceProjectile(p *Projectile, dt float64) bool {
+	remaining := p.def.Speed * dt
+	for remaining > 0 {
+		seg := remaining
+		if seg > projectileRadius {
+			seg = projectileRadius
+		}
+		remaining -= seg
+
+		nx := p.X + p.DX*seg
+		ny := p.Y + p.DY*seg
+		nz := p.Z + p.DZ*seg
+
+		if mo := g.projectileHitMobj(nx, ny, nz); mo != nil {
+			if p.def.Damage > 0 {
+				dmg := (pRandom()%8 + 1) * p.def.Damage
+				g.pDamageMobj(mo, nil, g.playerMobj, dmg)
+			}
+			p.X, p.Y, p.Z = nx, ny, nz // explode on the target so the blast is centred there
+			return true
+		}
+		if g.projectileHitsWall(nx, ny) {
+			return true
+		}
+		sec := bsp.PointSector(g.BSP, g.Level, float32(nx), float32(ny))
+		if sec == nil || nz <= float64(sec.FloorHeight) || nz >= float64(sec.CeilingHeight) {
+			return true
+		}
+
+		p.X, p.Y, p.Z = nx, ny, nz
+		p.traveled += seg
+		if p.traveled >= projectileMaxRange {
+			return true
+		}
+	}
+	return false
+}
+
+// projectileHitMobj returns the first live, shootable map object whose body
+// the point (x, y, z) has entered — id's missile-vs-thing overlap from
+// PIT_CheckThing: an axis-aligned box test on radius (plus the shot's own
+// ~4u), and a vertical overlap against [thing feet, thing head] with the
+// missile's own 8u height. g.playerMobj is never in g.mobjs, so a player
+// shot can't detonate on the shooter.
+func (g *Game) projectileHitMobj(x, y, z float64) *Mobj {
+	const projHeight = 8.0
+	for _, mo := range g.mobjs {
+		if mo == nil || mo.removed || mo.Flags&MF_SHOOTABLE == 0 || mo.Health <= 0 {
+			continue
+		}
+		block := mo.Radius + projectileRadius
+		if math.Abs(x-mo.X) >= block || math.Abs(y-mo.Y) >= block {
+			continue
+		}
+		if z+projHeight < mo.Z || z > mo.Z+mo.Height {
+			continue // passing over its head or under its feet
+		}
+		return mo
+	}
+	return nil
 }
 
 // explosionFrame reports the explosion frame letter active at p's current
@@ -151,7 +231,7 @@ func (p *Projectile) SizeMultiplier() float64 {
 // game_design.txt for the simplification this implies (a shot can pass
 // through a two-sided line's opening regardless of exactly how high up it is).
 func (g *Game) projectileHitsWall(x, y float64) bool {
-	return g.anyLineWithin(x, y, projectileRadius, func(open wallOpening) bool {
+	return g.anyLineWithin(x, y, projectileRadius, func(open wallOpening, _ bool) bool {
 		return !open.twoSided || open.top <= open.bottom
 	})
 }

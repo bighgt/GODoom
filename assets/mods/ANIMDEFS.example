@@ -1,0 +1,47 @@
+// ANIMDEFS.example — rename to "ANIMDEFS" (no extension) to activate.
+//
+// ZDoom-format data-driven texture/flat animation for TwoPointFive. This
+// engine's parser (engine/animdefs) is clean-room from the format
+// description; it understands `flat` / `texture` animation blocks and the
+// `warp` / `warp2` swimming effect. `switch`, `cameratexture` and
+// `animateddoor` are recognised only well enough to skip (they log a
+// warning). An ANIMDEFS entry for a texture overrides the built-in / BOOM
+// ANIMATED animation for that same name.
+//
+// Both renderers honour these: the software rasteriser and the Vulkan
+// GPU-geometry path resolve textures by name, and the engine rewrites the
+// live name each tic. `warp` is baked into a 32-phase frame cycle at level
+// load (so it costs 32x the texture's size in RAM per warped texture).
+
+// --- explicit frame list, per-frame durations -------------------------
+// A slower, hand-timed nukage cycle (vanilla runs all four frames at 8).
+flat NUKAGE1
+    pic NUKAGE1 tics 10
+    pic NUKAGE2 tics 6
+    pic NUKAGE3 tics 10
+    pic NUKAGE2 tics 6
+
+// Numeric `pic N` — N is a 1-based offset from the base name's number, so
+// this is BLOOD1, BLOOD2, BLOOD3 with a touch of duration jitter.
+flat BLOOD1
+    pic 1 tics 8
+    pic 2 rand 6 12
+    pic 3 tics 8
+
+// `oscillate` plays the list forward then back (no repeated endpoints).
+texture FIREMAG1
+    pic FIREMAG1 tics 4
+    pic FIREMAG2 tics 4
+    pic FIREMAG3 tics 4
+    oscillate
+
+// Short `range` form: animate FIREBLU1..FIREBLU2 at 6 tics/frame.
+texture FIREBLU1 range FIREBLU2 tics 6
+
+// --- warp (swimming texture) -----------------------------------------
+// `warp` = the classic small sine swim; `warp2` = a wider, rounder
+// displacement. An optional trailing number scales the speed (1.0 = the
+// engine's gentle default; higher is faster).
+warp  flat    FWATER1
+warp  flat    LAVA1        1.5
+warp2 texture BFALL1

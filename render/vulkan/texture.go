@@ -99,47 +99,55 @@ func (r *Renderer) createTextureResources(srcW, srcH int) error {
 	return r.createStagingBuffer(srcW * srcH * 4)
 }
 
+// createStagingBuffer allocates one host-visible, host-coherent staging
+// buffer per frame-in-flight slot, each mapped once and kept mapped for the
+// renderer's lifetime. Per-frame (rather than one shared buffer) is what
+// lets maxFramesInFlight be 2: DrawFrame waits on slot i's fence before
+// writing stagingMapped[i], so a memcpy for the next frame can't land on a
+// buffer the GPU is still copying for an earlier one.
 func (r *Renderer) createStagingBuffer(size int) error {
-	bufInfo := vk.BufferCreateInfo{
-		SType:       vk.StructureTypeBufferCreateInfo,
-		Size:        vk.DeviceSize(size),
-		Usage:       vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit),
-		SharingMode: vk.SharingModeExclusive,
-	}
-	var buf vk.Buffer
-	if res := vk.CreateBuffer(r.device, &bufInfo, nil, &buf); res != vk.Success {
-		return fmt.Errorf("vulkan: create staging buffer: %s", vk.Error(res))
-	}
-	r.stagingBuffer = buf
-
-	var memReq vk.MemoryRequirements
-	vk.GetBufferMemoryRequirements(r.device, buf, &memReq)
-	memReq.Deref()
-	memType, err := r.findMemoryType(memReq.MemoryTypeBits,
-		vk.MemoryPropertyFlags(vk.MemoryPropertyHostVisibleBit)|vk.MemoryPropertyFlags(vk.MemoryPropertyHostCoherentBit))
-	if err != nil {
-		return fmt.Errorf("vulkan: staging buffer memory: %w", err)
-	}
-	allocInfo := vk.MemoryAllocateInfo{SType: vk.StructureTypeMemoryAllocateInfo, AllocationSize: memReq.Size, MemoryTypeIndex: memType}
-	var mem vk.DeviceMemory
-	if res := vk.AllocateMemory(r.device, &allocInfo, nil, &mem); res != vk.Success {
-		return fmt.Errorf("vulkan: allocate staging buffer memory: %s", vk.Error(res))
-	}
-	r.stagingMemory = mem
-	if res := vk.BindBufferMemory(r.device, buf, mem, 0); res != vk.Success {
-		return fmt.Errorf("vulkan: bind staging buffer memory: %s", vk.Error(res))
-	}
-
-	// Mapped once and kept for the renderer's lifetime — every frame just
-	// memcpy's into it (safe because DrawFrame waits on this frame slot's
-	// fence, meaning any GPU read of the previous contents has finished,
-	// before writing new pixels; see maxFramesInFlight's doc comment).
-	var mapped unsafe.Pointer
-	if res := vk.MapMemory(r.device, mem, 0, vk.DeviceSize(size), 0, &mapped); res != vk.Success {
-		return fmt.Errorf("vulkan: map staging buffer: %s", vk.Error(res))
-	}
-	r.stagingMapped = mapped
+	r.stagingBuffers = make([]vk.Buffer, maxFramesInFlight)
+	r.stagingMemory = make([]vk.DeviceMemory, maxFramesInFlight)
+	r.stagingMapped = make([]unsafe.Pointer, maxFramesInFlight)
 	r.stagingSize = size
+
+	for i := 0; i < maxFramesInFlight; i++ {
+		bufInfo := vk.BufferCreateInfo{
+			SType:       vk.StructureTypeBufferCreateInfo,
+			Size:        vk.DeviceSize(size),
+			Usage:       vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit),
+			SharingMode: vk.SharingModeExclusive,
+		}
+		var buf vk.Buffer
+		if res := vk.CreateBuffer(r.device, &bufInfo, nil, &buf); res != vk.Success {
+			return fmt.Errorf("vulkan: create staging buffer %d: %s", i, vk.Error(res))
+		}
+		r.stagingBuffers[i] = buf
+
+		var memReq vk.MemoryRequirements
+		vk.GetBufferMemoryRequirements(r.device, buf, &memReq)
+		memReq.Deref()
+		memType, err := r.findMemoryType(memReq.MemoryTypeBits,
+			vk.MemoryPropertyFlags(vk.MemoryPropertyHostVisibleBit)|vk.MemoryPropertyFlags(vk.MemoryPropertyHostCoherentBit))
+		if err != nil {
+			return fmt.Errorf("vulkan: staging buffer memory: %w", err)
+		}
+		allocInfo := vk.MemoryAllocateInfo{SType: vk.StructureTypeMemoryAllocateInfo, AllocationSize: memReq.Size, MemoryTypeIndex: memType}
+		var mem vk.DeviceMemory
+		if res := vk.AllocateMemory(r.device, &allocInfo, nil, &mem); res != vk.Success {
+			return fmt.Errorf("vulkan: allocate staging buffer memory: %s", vk.Error(res))
+		}
+		r.stagingMemory[i] = mem
+		if res := vk.BindBufferMemory(r.device, buf, mem, 0); res != vk.Success {
+			return fmt.Errorf("vulkan: bind staging buffer memory: %s", vk.Error(res))
+		}
+
+		var mapped unsafe.Pointer
+		if res := vk.MapMemory(r.device, mem, 0, vk.DeviceSize(size), 0, &mapped); res != vk.Success {
+			return fmt.Errorf("vulkan: map staging buffer: %s", vk.Error(res))
+		}
+		r.stagingMapped[i] = mapped
+	}
 	return nil
 }
 
@@ -165,7 +173,7 @@ func (r *Renderer) uploadFrame(pix []byte) error {
 	if len(pix) != r.stagingSize {
 		return fmt.Errorf("vulkan: frame is %d bytes, expected %d (%dx%d RGBA8)", len(pix), r.stagingSize, r.srcWidth, r.srcHeight)
 	}
-	vk.Memcopy(r.stagingMapped, pix)
+	vk.Memcopy(r.stagingMapped[r.currentFrame], pix)
 	return nil
 }
 
@@ -186,16 +194,16 @@ func (r *Renderer) destroyTextureResources() {
 		vk.FreeMemory(r.device, r.textureMemory, nil)
 		r.textureMemory = nil
 	}
-	if r.stagingMapped != nil {
-		vk.UnmapMemory(r.device, r.stagingMemory)
-		r.stagingMapped = nil
+	for i := range r.stagingMemory {
+		if r.stagingMapped != nil && r.stagingMapped[i] != nil {
+			vk.UnmapMemory(r.device, r.stagingMemory[i])
+		}
+		if r.stagingBuffers != nil && r.stagingBuffers[i] != nil {
+			vk.DestroyBuffer(r.device, r.stagingBuffers[i], nil)
+		}
+		if r.stagingMemory[i] != nil {
+			vk.FreeMemory(r.device, r.stagingMemory[i], nil)
+		}
 	}
-	if r.stagingBuffer != nil {
-		vk.DestroyBuffer(r.device, r.stagingBuffer, nil)
-		r.stagingBuffer = nil
-	}
-	if r.stagingMemory != nil {
-		vk.FreeMemory(r.device, r.stagingMemory, nil)
-		r.stagingMemory = nil
-	}
+	r.stagingMapped, r.stagingBuffers, r.stagingMemory = nil, nil, nil
 }

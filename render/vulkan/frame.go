@@ -119,7 +119,6 @@ func (r *Renderer) createCommandBuffers() error {
 func (r *Renderer) createSyncObjects() error {
 	r.imageAvailable = make([]vk.Semaphore, maxFramesInFlight)
 	r.inFlight = make([]vk.Fence, maxFramesInFlight)
-	r.renderFinished = make([]vk.Semaphore, len(r.swapchainImages))
 
 	semInfo := vk.SemaphoreCreateInfo{SType: vk.StructureTypeSemaphoreCreateInfo}
 	fenceInfo := vk.FenceCreateInfo{
@@ -135,21 +134,41 @@ func (r *Renderer) createSyncObjects() error {
 			return fmt.Errorf("vulkan: create fence: %s", vk.Error(res))
 		}
 	}
-	for i := range r.renderFinished {
-		if res := vk.CreateSemaphore(r.device, &semInfo, nil, &r.renderFinished[i]); res != vk.Success {
-			return fmt.Errorf("vulkan: create semaphore: %s", vk.Error(res))
-		}
-	}
-	return nil
+	// renderFinished is per swapchain image and gets rebuilt on resize, so
+	// it lives in its own helper (shared with recreateSwapchain).
+	return r.createPerImageSemaphores()
 }
 
-// DrawFrame uploads pix (an RGBA8 raster.InternalWidth x InternalHeight
-// frame) to the GPU and presents it: wait for the previous frame's
+// DrawFrame uploads pix (an RGBA8 frame at the configured render
+// resolution) to the GPU and presents it: wait for the previous frame's
 // resources to be free, copy pix into the staging buffer, acquire a
 // swapchain image, record a command buffer that copies the staging buffer
 // into the frame texture and draws the fullscreen blit triangle, submit,
 // and present.
 func (r *Renderer) DrawFrame(pix []byte) error {
+	if r.lit {
+		return fmt.Errorf("vulkan: DrawFrame called on an enhanced-lighting renderer (use DrawFrameLit)")
+	}
+	if r.hw {
+		return fmt.Errorf("vulkan: DrawFrame called on a hardware-geometry renderer (use DrawWorld)")
+	}
+	// Minimized: nothing to present, and the swapchain can't be (re)built
+	// against a 0x0 surface — skip the frame entirely.
+	if w, h := r.win.FramebufferSize(); w == 0 || h == 0 {
+		return nil
+	}
+	// A resize on a previous frame left the swapchain stale; rebuild it now,
+	// before touching this frame's resources.
+	if r.needRecreate {
+		if err := r.recreateSwapchain(); err != nil {
+			if err == errSwapchainZeroExtent {
+				return nil
+			}
+			return err
+		}
+		r.needRecreate = false
+	}
+
 	frame := r.currentFrame
 
 	vk.WaitForFences(r.device, 1, []vk.Fence{r.inFlight[frame]}, vk.True, vk.MaxUint64)
@@ -161,12 +180,21 @@ func (r *Renderer) DrawFrame(pix []byte) error {
 	var imageIndex uint32
 	acquireRes := vk.AcquireNextImage(r.device, r.swapchain, vk.MaxUint64, r.imageAvailable[frame], nil, &imageIndex)
 	if acquireRes == vk.ErrorOutOfDate {
-		// Phase 1 doesn't yet recreate the swapchain on resize/minimize;
-		// treat it as a soft failure the caller can log and continue past.
-		return fmt.Errorf("vulkan: swapchain out of date (resize handling is a Phase 2 TODO)")
+		// Surface out of date (resize/monitor change): rebuild on the next
+		// call and skip this frame. Not an error — the game loop continues.
+		r.needRecreate = true
+		return nil
 	} else if acquireRes != vk.Success && acquireRes != vk.Suboptimal {
 		return fmt.Errorf("vulkan: acquire next image: %s", vk.Error(acquireRes))
 	}
+
+	// This image may still be referenced by an earlier in-flight frame on
+	// the other slot; wait for that frame before reusing the image's
+	// command buffer, then mark the image as now owned by this slot.
+	if f := r.imagesInFlight[imageIndex]; f != nil {
+		vk.WaitForFences(r.device, 1, []vk.Fence{f}, vk.True, vk.MaxUint64)
+	}
+	r.imagesInFlight[imageIndex] = r.inFlight[frame]
 
 	vk.ResetFences(r.device, 1, []vk.Fence{r.inFlight[frame]})
 
@@ -201,7 +229,10 @@ func (r *Renderer) DrawFrame(pix []byte) error {
 		PImageIndices:      []uint32{imageIndex},
 	}
 	presentRes := vk.QueuePresent(r.presentQueue, &presentInfo)
-	if presentRes != vk.Success && presentRes != vk.Suboptimal && presentRes != vk.ErrorOutOfDate {
+	if presentRes == vk.ErrorOutOfDate || presentRes == vk.Suboptimal {
+		// The frame still presented; rebuild the swapchain before the next one.
+		r.needRecreate = true
+	} else if presentRes != vk.Success {
 		return fmt.Errorf("vulkan: queue present: %s", vk.Error(presentRes))
 	}
 
@@ -211,13 +242,12 @@ func (r *Renderer) DrawFrame(pix []byte) error {
 
 // letterboxViewport returns the largest centered rectangle within the
 // current swapchain extent that preserves the source frame's exact
-// srcWidth:srcHeight aspect ratio (320:200, i.e. 1.6:1 — see
-// raster.InternalWidth/InternalHeight), letterboxing or pillarboxing with
-// the render pass's black clear color rather than stretching to fill an
-// arbitrary window shape. Without this, a window whose aspect ratio isn't
-// exactly 1.6:1 (nearly every window — a 16:9 window is 1.778:1) visibly
-// distorted the image: stretched wider than tall, which is exactly what
-// made rooms look vertically compressed ("ceiling too close to the floor").
+// srcWidth:srcHeight aspect ratio (the configured render resolution),
+// letterboxing or pillarboxing with the render pass's black clear color
+// rather than stretching to fill an arbitrary window shape. Without this, a
+// window whose aspect ratio doesn't match the render target's visibly
+// distorts the image — stretched wider than tall, say, which made rooms
+// look vertically compressed ("ceiling too close to the floor").
 func (r *Renderer) letterboxViewport() vk.Viewport {
 	srcAspect := float32(r.srcWidth) / float32(r.srcHeight)
 	winW, winH := float32(r.swapchainExtent.Width), float32(r.swapchainExtent.Height)
@@ -250,6 +280,11 @@ func (r *Renderer) recordCommandBuffer(cmd vk.CommandBuffer, imageIndex uint32) 
 		AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit), LevelCount: 1, LayerCount: 1,
 	}
 
+	// With two frames in flight the frame texture is shared: this frame's
+	// buffer->image copy must not begin until the previous frame's blit has
+	// finished sampling it. Ordering this barrier's source scope on the
+	// fragment shader's reads (rather than TopOfPipe) enforces that on the
+	// GPU timeline; the CPU still runs a frame ahead.
 	toTransferDst := vk.ImageMemoryBarrier{
 		SType:               vk.StructureTypeImageMemoryBarrier,
 		OldLayout:           r.textureLayout,
@@ -258,17 +293,18 @@ func (r *Renderer) recordCommandBuffer(cmd vk.CommandBuffer, imageIndex uint32) 
 		DstQueueFamilyIndex: vk.QueueFamilyIgnored,
 		Image:               r.textureImage,
 		SubresourceRange:    subresource,
+		SrcAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
 		DstAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
 	}
 	vk.CmdPipelineBarrier(cmd,
-		vk.PipelineStageFlags(vk.PipelineStageTopOfPipeBit), vk.PipelineStageFlags(vk.PipelineStageTransferBit),
+		vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), vk.PipelineStageFlags(vk.PipelineStageTransferBit),
 		0, 0, nil, 0, nil, 1, []vk.ImageMemoryBarrier{toTransferDst})
 
 	copyRegion := vk.BufferImageCopy{
 		ImageSubresource: vk.ImageSubresourceLayers{AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit), LayerCount: 1},
 		ImageExtent:      vk.Extent3D{Width: uint32(r.srcWidth), Height: uint32(r.srcHeight), Depth: 1},
 	}
-	vk.CmdCopyBufferToImage(cmd, r.stagingBuffer, r.textureImage, vk.ImageLayoutTransferDstOptimal, 1, []vk.BufferImageCopy{copyRegion})
+	vk.CmdCopyBufferToImage(cmd, r.stagingBuffers[r.currentFrame], r.textureImage, vk.ImageLayoutTransferDstOptimal, 1, []vk.BufferImageCopy{copyRegion})
 
 	toShaderRead := vk.ImageMemoryBarrier{
 		SType:               vk.StructureTypeImageMemoryBarrier,

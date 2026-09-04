@@ -1,6 +1,10 @@
 package raster
 
-import "math"
+import (
+	"math"
+
+	"twopointfive/wad"
+)
 
 // skyFlatName is Doom's one hardcoded special flat name: a sector whose
 // ceiling texture is exactly this gets the sky rendered instead of a
@@ -8,79 +12,196 @@ import "math"
 // r_bsp.c, which checks "sector->ceilingpic == skyflatnum" the same way.
 const skyFlatName = "F_SKY1"
 
-// skyTextureName is the wall-format texture actually painted for the sky
-// — despite being used for a *ceiling*, Doom's sky is stored and drawn as
-// an ordinary wall texture. SKY1 is the one shareware/Episode 1 IWADs
-// carry; later episodes' SKY2/SKY3 aren't handled — see game_design.txt.
-const skyTextureName = "SKY1"
+// skyReferenceHeight is the texture height vanilla Doom's own sky-vertical
+// constants (skyTextureMidRow below) were tuned for — a Doom sky texture is
+// always 128 tall. The Mars skybox is much taller (2K), so those constants
+// scale up proportionally by (actual height / this) rather than being
+// fixed pixel counts — see drawSkySpan.
+const skyReferenceHeight = 128.0
 
-// skyAngularRepeats is how many times the sky texture's full width tiles
-// across one complete 360° turn — 4, in the original engine (its
-// ANGLETOSKYSHIFT constant, applied to a 32-bit angle against a 256-wide
-// sky texture, works out to exactly this ratio): turning 90° scrolls
-// through the whole texture once, a well-known Doom trivia fact and not
-// this project's own invention.
-const skyAngularRepeats = 4.0
-
-// skyVScale is the vertical texels-per-screen-row rate the sky is drawn
-// at. id's r_plane.c sets dc_iscale = pspriteiscale>>detailshift for sky
-// columns — the same fixed scale weapon-viewmodel sprites use, which in
-// the normal (non-low-detail) case is exactly FRACUNIT, i.e. 1:1 — this
-// project's internal resolution matches vanilla's 320x200 exactly, so
-// that 1:1 carries over directly with no rescaling needed.
-const skyVScale = 1.0
+// skyReferenceScreenHeight is the screen height vanilla's skytexturemid /
+// dc_iscale sky presentation assumed (SCREENHEIGHT = 200). drawSkySpan
+// scales its vertical rate by this / r.Height so the sky fills the same
+// share of the view at any render resolution instead of tiling — PrBoom's
+// sky is likewise resolution-independent (dc_iscale scales with the view).
+const skyReferenceScreenHeight = 200.0
 
 // skyTextureMidRow is id's own skytexturemid (R_InitSkyMap:
-// "skytexturemid = 100*FRACUNIT"): the texture row that lands at the
-// screen's vertical center — not the texture's own midpoint (64, for a
-// 128-tall sky), a fixed constant chosen so a sky texture's usually-plain
-// upper portion gets more room than its horizon-detail lower portion.
+// "skytexturemid = 100*FRACUNIT") at skyReferenceHeight: the texture row
+// that lands at the screen's vertical center — not the texture's own
+// midpoint, a fixed constant chosen so a sky texture's usually-plain upper
+// portion gets more room than its horizon-detail lower portion.
 const skyTextureMidRow = 100.0
 
+// skyPixelsPerTurn is how many sky-texture columns a full 360° yaw scans —
+// id's ANGLETOSKYSHIFT (22) makes a full circle (2^32 BAM) map to
+// 2^32 >> 22 = 1024 texture pixels, so vanilla's 256-wide sky wraps 4x per
+// turn. drawSkySpan keeps that for any narrow (WAD-format) sky; a wide
+// panorama (the Mars skybox) instead maps its whole width to one turn, so
+// it doesn't visibly repeat.
+const skyPixelsPerTurn = 1024.0
+
+// skyTextureForMap returns the sky *texture* name (TEXTURE1 entry, not the
+// patch lump) PrBoom would pick for a given map marker — p_setup.c's
+// P_SetupLevel: SKY1..4 by episode for Doom / Ultimate Doom, and SKY1
+// (MAP01-11) / SKY2 (12-20) / SKY3 (21+) for Doom II & Final Doom. Both
+// games' TEXTURE1 lumps define "SKY1".."SKYn" (the Doom II ones wrap the
+// RSKYn patches), so this name resolves through WallTexture for either.
+func skyTextureForMap(mapName string) string {
+	m := mapName
+	if len(m) >= 4 && (m[0] == 'E' || m[0] == 'e') && (m[2] == 'M' || m[2] == 'm') {
+		switch m[1] {
+		case '2':
+			return "SKY2"
+		case '3':
+			return "SKY3"
+		case '4':
+			return "SKY4"
+		default:
+			return "SKY1"
+		}
+	}
+	if len(m) >= 5 && (m[0] == 'M' || m[0] == 'm') {
+		n := 0
+		for _, c := range m[3:] {
+			if c < '0' || c > '9' {
+				n = 0
+				break
+			}
+			n = n*10 + int(c-'0')
+		}
+		switch {
+		case n >= 21:
+			return "SKY3"
+		case n >= 12:
+			return "SKY2"
+		default:
+			return "SKY1"
+		}
+	}
+	return "SKY1"
+}
+
 // drawSkySpan fills screen rows [yTop, yBottom) of column x with the sky
-// texture, using Doom's actual technique: rather than being positioned in
+// texture, using Doom's core technique: rather than being positioned in
 // the 3D world at all (there is no "sky sector" out past the level's
-// walls), it's painted directly from the camera's view angle, so turning
-// scrolls it but walking never does — the classic "infinitely far away"
-// sky look.
+// walls), it's painted directly from the camera, not from BSP geometry —
+// so walking never moves it. Full-bright: sector light / diminishing
+// (light.go) never applies to the sky.
 //
-// Critically, both axes here use a mapping that's the same for every
-// column and every row — u depends only on cam.Angle and x (not on the
-// wall silhouette in this particular column), and v depends only on y and
-// the camera's pitch-adjusted horizon (not on yTop/yBottom, this
-// particular call's own visible range). An earlier version stretched the
-// texture to fit each column's own [yTop, yBottom) locally, which varies
-// wildly column to column depending on how much sky nearby wall
-// silhouettes happen to expose — different columns ended up sampling the
-// texture at different effective scales, warping what should be a flat
-// backdrop into a fisheye-like bulge (reported as a "goldfish bowl"
-// effect). A real sky has no depth to locally fit anything to; it should
-// look identical in overlapping rows/columns no matter what's drawn
-// around it, which a single shared mapping guarantees.
-func (r *Renderer) drawSkySpan(x, yTop, yBottom int, cam Camera) {
+// Horizontal: turning yaws the sky, at skyPixelsPerTurn texture columns per
+// 360° for a WAD sky (id's ANGLETOSKYSHIFT — a 256-wide sky wraps 4x), or
+// once around for a wide panorama. Vertical: the texture row is a linear
+// function of screen row, anchored so skyTextureMidRow sits at the
+// pitch-adjusted horizon (id's skytexturemid), at a rate scaled to the
+// render height so the sky doesn't tile as resolution rises.
+//
+// Both axes use one mapping shared by every column and row — u depends only
+// on x and cam.Angle, v only on y and the horizon — not fit locally to
+// each column's exposed wall silhouette (an earlier version did, and the
+// per-column scale variance bulged the flat backdrop into a "goldfish
+// bowl").
+func (r *Renderer) drawSkySpan(x, yTop, yBottom int) {
 	if yBottom <= yTop {
 		return
 	}
-	tex, ok := r.textures.WallTexture(skyTextureName)
-	if !ok {
+	tex := r.skyTex
+	if tex == nil {
 		return
 	}
+	tx := r.skyTx[x]
+	scale := r.skyScale
+	texW, texH := tex.Width, tex.Height
+	src := tex.Pix
 
-	// This column's own view angle: cam.Angle plus how far this column
-	// sits from screen center, in the same tangent-based projection every
-	// other column in this renderer uses — mapped to a sky-texture column
-	// via skyAngularRepeats.
-	colAngle := cam.Angle + math.Atan2(float64(x)+0.5-float64(r.Width)/2, r.focal)
-	u := colAngle / (2 * math.Pi) * float64(tex.Width) * skyAngularRepeats
-	tx := wrapInt(int(math.Floor(u)), tex.Width)
+	// Sky panoramas (Mars skybox, or a 128-tall WAD sky) are power-of-two
+	// tall, so mask instead of a per-row modulo.
+	texHMask := texH - 1
+	texHPow2 := texH&texHMask == 0
 
-	// Anchored to skyTextureMidRow at the (pitch-shifted) horizon row —
-	// id's own skytexturemid convention — so looking up/down scrolls the
-	// sky vertically the same consistent way in every column.
-	horizon := r.horizonY()
+	// v is linear in screen row — anchored to skyTextureMidRow at the
+	// (pitch-shifted) horizon — so step it by a constant instead of
+	// recomputing per row. The 200/Height factor keeps the vanilla 200px
+	// presentation at any render resolution.
+	vStep := scale * (skyReferenceScreenHeight / float64(r.Height))
+	v := skyTextureMidRow*scale + (float64(yTop)-r.horizonY())*vStep
+
+	dst := r.Pix
+	i := (yTop*r.Width + x) * 4
+	stride := r.Width * 4
 	for y := yTop; y < yBottom; y++ {
-		v := skyTextureMidRow + (float64(y)-horizon)*skyVScale
-		ty := wrapInt(int(math.Floor(v)), tex.Height)
-		r.setPixel(x, y, tex.At(tx, ty))
+		var ty int
+		if texHPow2 {
+			ty = int(math.Floor(v)) & texHMask
+		} else {
+			ty = wrapInt(int(math.Floor(v)), texH)
+		}
+		v += vStep
+		s := (ty*texW + tx) * 4
+		dst[i] = src[s]
+		dst[i+1] = src[s+1]
+		dst[i+2] = src[s+2]
+		dst[i+3] = src[s+3]
+		i += stride
+	}
+}
+
+// buildSkyTable resolves this frame's sky bitmap and fills r.skyTx (texture
+// column per screen column) so drawSkySpan is a plain texel copy with no
+// trig. The sky texture is the external Mars panorama when present (see
+// assets.LoadSkybox), otherwise the WAD's own sky for this map, picked the
+// way PrBoom does (skyTextureForMap). The per-column view angle only
+// depends on x and the focal length, so it's recomputed only on a FOV
+// change; the resolved WAD sky is cached per map name.
+func (r *Renderer) buildSkyTable(cam *Camera, level *wad.Level) {
+	mapName := ""
+	if level != nil {
+		mapName = level.Name
+	}
+
+	tex := r.skybox // the disk panorama overrides the WAD sky when it loaded
+	if tex == nil {
+		if r.skyWADTex == nil || r.skyWADFor != mapName {
+			name := skyTextureForMap(mapName)
+			if r.skyNameOverride != "" {
+				name = r.skyNameOverride
+			}
+			t, ok := r.textures.WallTexture(name)
+			if !ok || t == nil {
+				t, _ = r.textures.WallTexture("SKY1") // last-ditch: the one every IWAD defines
+			}
+			r.skyWADTex, r.skyWADFor = t, mapName
+		}
+		tex = r.skyWADTex
+	}
+	r.skyTex = tex
+	if tex == nil {
+		return
+	}
+	r.skyScale = float64(tex.Height) / skyReferenceHeight
+
+	// Columns a full 360° yaw scans: a wide panorama maps its whole width to
+	// one turn (so it doesn't repeat); a narrow WAD sky uses id's
+	// ANGLETOSKYSHIFT constant (1024) so a 256-wide sky wraps 4x, the vanilla
+	// feel.
+	pixPerTurn := skyPixelsPerTurn
+	if float64(tex.Width) > skyPixelsPerTurn {
+		pixPerTurn = float64(tex.Width)
+	}
+
+	if r.skyColAngleFocal != r.focal {
+		halfW := float64(r.Width) / 2
+		for x := 0; x < r.Width; x++ {
+			r.skyColAngle[x] = math.Atan2(float64(x)+0.5-halfW, r.focal)
+		}
+		r.skyColAngleFocal = r.focal
+	}
+
+	half := pixPerTurn / 2
+	perRad := pixPerTurn / (2 * math.Pi)
+	for x := 0; x < r.Width; x++ {
+		// Screen-column angle plus the camera yaw, scaled to sky columns.
+		u := half + (r.skyColAngle[x]-cam.Angle)*perRad
+		r.skyTx[x] = wrapInt(int(math.Floor(u)), tex.Width)
 	}
 }

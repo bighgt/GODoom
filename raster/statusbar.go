@@ -6,13 +6,12 @@ import (
 	"twopointfive/assets"
 )
 
-// PlayerStats is the subset of player state Doom's status bar displays.
-// There's no combat/pickup/ammo-consumption system yet (see
-// game_design.txt's roadmap), so these currently start at a fixed loadout
-// and stay static — but DrawStatusBar renders them through the exact same
-// WAD graphics and screen layout the original engine used, so wiring up
-// real values later is a data-plumbing change, not a rendering one.
-type PlayerStats struct {
+// HUDStats is a draw-only snapshot of the player state Doom's status bar
+// displays — the renderer's input, produced fresh each frame by the engine
+// (see engine.PlayerStats.toHUD) from its authoritative gameplay model.
+// DrawStatusBar renders it through the exact same WAD graphics and screen
+// layout the original engine used.
+type HUDStats struct {
 	Health, Armor int
 	// Ammo/MaxAmmo are indexed by ammo type: 0 bullets, 1 shells, 2 cells, 3 rockets.
 	Ammo, MaxAmmo [4]int
@@ -26,24 +25,8 @@ type PlayerStats struct {
 	// Keys[n]: 0 blue card, 1 yellow card, 2 red card, 3 blue skull, 4
 	// yellow skull, 5 red skull.
 	Keys [6]bool
-}
-
-// DefaultPlayerStats is a fresh-spawn loadout: full health, no armor or
-// keys, and — unlike a real Doom start, where you only ever have bullets
-// until you find something else — starting ammo for *every* type. There's
-// no pickup system yet (see game_design.txt) to ever grant shells/cells/
-// rockets otherwise, and firing a weapon with no ammo for its type is a
-// silent no-op (see engine.Game.FireWeapon), so leaving those at their
-// zero value made every weapon but the pistol/chaingun (which shares the
-// pistol's bullets) look simply broken rather than just unloaded.
-func DefaultPlayerStats() PlayerStats {
-	ps := PlayerStats{Health: 100, CurrentAmmo: 0}
-	ps.Ammo[0], ps.MaxAmmo[0] = 50, 200  // bullets
-	ps.Ammo[1], ps.MaxAmmo[1] = 50, 50   // shells
-	ps.Ammo[2], ps.MaxAmmo[2] = 300, 300 // cells (BFG's 40/shot draws this down fast on purpose)
-	ps.Ammo[3], ps.MaxAmmo[3] = 50, 50   // rockets
-	ps.Weapons[2] = true                 // pistol
-	return ps
+	// GodMode: draw the invulnerability face.
+	GodMode bool
 }
 
 // Screen positions below are ported directly from id's own
@@ -70,15 +53,23 @@ const (
 	keysX = 239
 )
 
-var smallAmmoY = [4]int{173, 179, 185, 191}
+// smallAmmoY is the status-bar row for each ammo TYPE's small current/max
+// counter, indexed [clip, shell, cell, rocket]. The STBAR graphic labels
+// the four rows top-to-bottom BULL / SHEL / RCKT / CELL, so the cell count
+// (type 2) belongs on the bottom row and the rocket count (type 3) above
+// it — id's ST_AMMO2Y = ST_Y+23 (191), ST_AMMO3Y = ST_Y+17 (185). (This
+// used to be sequential {173,179,185,191}, which put cells and rockets
+// against the wrong labels.)
+var smallAmmoY = [4]int{173, 179, 191, 185}
 var keyY = [3]int{171, 181, 191}
 
 // DrawStatusBar draws Doom's actual heads-up display onto the bottom 32
-// rows of r.Pix using the real graphic lumps from the loaded WAD (STBAR,
-// STTNUM/STYSNUM/STGNUM digits, STFST faces, STARMS, STKEYS, ...) at the
-// same positions the original engine drew them at. Call after Render (and
-// DrawHUD, if used) so it draws on top.
-func (r *Renderer) DrawStatusBar(ps PlayerStats) {
+// rows of the 320x200 overlay buffer using the real graphic lumps from the
+// loaded WAD (STBAR, STTNUM/STYSNUM/STGNUM digits, STFST faces, STARMS,
+// STKEYS, ...) at the exact positions the original engine drew them at;
+// CompositeOverlay scales the result up onto the frame. Call after Render
+// (and DrawHUD, if used) so it draws on top.
+func (r *Renderer) DrawStatusBar(ps HUDStats) {
 	r.blitSprite("STBAR", 0, stbarY)
 
 	r.drawPercentField(ps.Health, healthX, healthY)
@@ -120,7 +111,15 @@ func (r *Renderer) DrawStatusBar(ps PlayerStats) {
 // = healthiest .. 4 = near death) and draws it looking straight ahead
 // (variant 1) — the original engine's pain/turn/god-mode/berserk variants
 // need combat/item events this project doesn't simulate yet.
-func (r *Renderer) drawFace(ps PlayerStats) {
+func (r *Renderer) drawFace(ps HUDStats) {
+	if ps.Health <= 0 {
+		r.blitSprite("STFDEAD0", faceX, faceY)
+		return
+	}
+	if ps.GodMode {
+		r.blitSprite("STFGOD0", faceX, faceY)
+		return
+	}
 	tier := 0
 	switch {
 	case ps.Health >= 80:
@@ -143,12 +142,12 @@ func (r *Renderer) drawBigNumber(value, rightX, y int) {
 	r.drawDigitsRightAligned(value, "STTNUM", "STTMINUS", rightX, y)
 }
 
-// drawPercentField draws value as a big number in a fixed 3-digit-wide
-// field starting at leftX, followed by a '%' — matching health/armor's
-// fixed-width display in the original regardless of how many digits value
-// actually has.
-func (r *Renderer) drawPercentField(value, leftX, y int) {
-	rightX := leftX + 3*r.digitWidth("STTNUM")
+// drawPercentField draws value as a right-aligned big number whose rightmost
+// digit's right edge sits at rightX, then the '%' sign immediately after —
+// exactly id's STlib_drawPercent, where ST_HEALTHX / ST_ARMORX is that
+// boundary between the number and the '%'. (Passing it as a left edge, as
+// this used to, shoved health and armour ~40px right, over the face.)
+func (r *Renderer) drawPercentField(value, rightX, y int) {
 	r.drawBigNumber(value, rightX, y)
 	r.blitSprite("STTPRCNT", rightX, y)
 }
@@ -168,7 +167,7 @@ func (r *Renderer) drawDigitsRightAligned(value int, digitPrefix, minusName stri
 	x := rightX
 	if value == 0 {
 		if sp, ok := r.textures.Sprite(digitPrefix + "0"); ok {
-			x -= sp.Width
+			x -= logicalWidth(sp)
 			r.blitSpriteImage(sp, x, y)
 		}
 	} else {
@@ -176,23 +175,23 @@ func (r *Renderer) drawDigitsRightAligned(value int, digitPrefix, minusName stri
 			d := value % 10
 			value /= 10
 			if sp, ok := r.textures.Sprite(fmt.Sprintf("%s%d", digitPrefix, d)); ok {
-				x -= sp.Width
+				x -= logicalWidth(sp)
 				r.blitSpriteImage(sp, x, y)
 			}
 		}
 	}
 	if neg && minusName != "" {
 		if sp, ok := r.textures.Sprite(minusName); ok {
-			r.blitSpriteImage(sp, x-sp.Width, y)
+			r.blitSpriteImage(sp, x-logicalWidth(sp), y)
 		}
 	}
 }
 
-func (r *Renderer) digitWidth(prefix string) int {
-	if sp, ok := r.textures.Sprite(prefix + "0"); ok {
-		return sp.Width
-	}
-	return 12 // fallback, matches vanilla STTNUM's actual glyph width
+// logicalWidth is a sprite's width in HUD/map (1x) units — its pixel width
+// divided by any hi-res upscale factor, so status-bar layout stays put
+// whether or not an override is present.
+func logicalWidth(sp *assets.RGBA) int {
+	return int(float64(sp.Width) / tpu(sp))
 }
 
 func (r *Renderer) blitSprite(name string, x, y int) {
@@ -206,5 +205,5 @@ func (r *Renderer) blitSprite(name string, x, y int) {
 // Thin wrapper around the shared blit (blit.go), which every sprite draw
 // in this package (and DrawWeapon's own non-offset variant) goes through.
 func (r *Renderer) blitSpriteImage(sp *assets.RGBA, x, y int) {
-	r.blit(sp, x, y, true)
+	r.blit(sp, x, y, true, 256, false) // status-bar transform (obeys hudScale)
 }

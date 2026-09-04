@@ -7,6 +7,7 @@ package window
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/go-gl/glfw/v3.3/glfw"
 )
@@ -21,26 +22,73 @@ type Window struct {
 	lastMouseX         float64
 	lastMouseY         float64
 	mousePositionKnown bool
+
+	// typed accumulates characters from GLFW's character callback (fired
+	// during PollEvents) until TakeTyped drains them — the raw material the
+	// engine's classic cheat-code matcher scans. Single-threaded: the
+	// callback and TakeTyped both run on the main thread.
+	typed []rune
 }
 
-// New creates and shows a window sized width x height, titled title. It must
-// be called from the main OS thread (see cmd/engine/main.go's
-// runtime.LockOSThread in init).
-func New(width, height int, title string) (*Window, error) {
+// newWindow wraps a freshly created GLFW handle and installs the input
+// callbacks the polling API needs — currently just the character callback
+// that feeds TakeTyped (used for the classic cheat-code sequences).
+func newWindow(handle *glfw.Window, title string) *Window {
+	w := &Window{handle: handle, title: title}
+	handle.SetCharCallback(func(_ *glfw.Window, r rune) {
+		if len(w.typed) < 128 { // a cap so a key held at a broken repeat rate can't grow this unboundedly
+			w.typed = append(w.typed, r)
+		}
+	})
+	return w
+}
+
+// New creates and shows a window titled title. It must be called from the
+// main OS thread (see cmd/engine/main.go's runtime.LockOSThread in init).
+//
+// When fullscreen is true the window covers the primary monitor at its
+// current video mode as a borderless, undecorated window positioned at the
+// monitor origin (windowed fullscreen — alt-tab friendly, no mode switch,
+// and the compositor still hands it an unthrottled present path); width and
+// height are ignored. Otherwise it's a normal resizable window of the given
+// size.
+func New(width, height int, title string, fullscreen bool) (*Window, error) {
 	if err := glfw.Init(); err != nil {
 		return nil, fmt.Errorf("window: glfw init: %w", err)
 	}
 
 	glfw.WindowHint(glfw.ClientAPI, glfw.NoAPI)
-	glfw.WindowHint(glfw.Resizable, glfw.True)
 
+	if fullscreen {
+		mon := glfw.GetPrimaryMonitor()
+		mode := mon.GetVideoMode()
+		// Match the monitor's mode so the borderless window maps 1:1 to the
+		// screen with no rescale by the compositor.
+		glfw.WindowHint(glfw.RedBits, mode.RedBits)
+		glfw.WindowHint(glfw.GreenBits, mode.GreenBits)
+		glfw.WindowHint(glfw.BlueBits, mode.BlueBits)
+		glfw.WindowHint(glfw.RefreshRate, mode.RefreshRate)
+		glfw.WindowHint(glfw.Decorated, glfw.False)
+		glfw.WindowHint(glfw.Resizable, glfw.False)
+		width, height = mode.Width, mode.Height
+
+		handle, err := glfw.CreateWindow(width, height, title, nil, nil)
+		if err != nil {
+			glfw.Terminate()
+			return nil, fmt.Errorf("window: create fullscreen window: %w", err)
+		}
+		mx, my := mon.GetPos()
+		handle.SetPos(mx, my)
+		return newWindow(handle, title), nil
+	}
+
+	glfw.WindowHint(glfw.Resizable, glfw.True)
 	handle, err := glfw.CreateWindow(width, height, title, nil, nil)
 	if err != nil {
 		glfw.Terminate()
 		return nil, fmt.Errorf("window: create window: %w", err)
 	}
-
-	return &Window{handle: handle, title: title}, nil
+	return newWindow(handle, title), nil
 }
 
 // Handle exposes the underlying *glfw.Window for the one place that
@@ -82,14 +130,38 @@ func (w *Window) StrafeRightPressed() bool { return w.handle.GetKey(glfw.KeyD) =
 func (w *Window) TurnLeftPressed() bool    { return w.handle.GetKey(glfw.KeyLeft) == glfw.Press }
 func (w *Window) TurnRightPressed() bool   { return w.handle.GetKey(glfw.KeyRight) == glfw.Press }
 
-// UsePressed reports whether Space — Doom's classic "use" key, opening
-// doors and activating switches — is currently held.
-func (w *Window) UsePressed() bool { return w.handle.GetKey(glfw.KeySpace) == glfw.Press }
+// RunPressed reports whether either Shift is held — Doom's "run" modifier,
+// which doubles movement speed while down.
+func (w *Window) RunPressed() bool {
+	return w.handle.GetKey(glfw.KeyLeftShift) == glfw.Press ||
+		w.handle.GetKey(glfw.KeyRightShift) == glfw.Press
+}
 
-// WeaponKeyPressed reports whether the number key for weapon slot n (1-6)
-// is currently held.
+// UsePressed reports whether E — the "use" key, opening doors and
+// activating switches — is currently held. (Doom's classic bind is Space;
+// Space is the jump key here, see JumpPressed.)
+func (w *Window) UsePressed() bool { return w.handle.GetKey(glfw.KeyE) == glfw.Press }
+
+// JumpPressed reports whether Space — the jump key — is currently held.
+// Edge-detected in engine.handleMovement: a press while the feet are on the
+// ground launches the player upward.
+func (w *Window) JumpPressed() bool { return w.handle.GetKey(glfw.KeySpace) == glfw.Press }
+
+// HUDCyclePressed reports whether F1 — the HUD-style cycle key — is held.
+// Edge-detected in engine.handleMovement: each press cycles the HUD
+// doom -> quake2 -> none -> doom. F1 emits no character event, so it can't
+// disturb the cheat-code matcher.
+func (w *Window) HUDCyclePressed() bool { return w.handle.GetKey(glfw.KeyF1) == glfw.Press }
+
+// FlashlightPressed reports whether F — the head-mounted flashlight toggle
+// — is currently held. Edge-detected in engine.flashlightSystem so a held
+// key doesn't retoggle every frame.
+func (w *Window) FlashlightPressed() bool { return w.handle.GetKey(glfw.KeyF) == glfw.Press }
+
+// WeaponKeyPressed reports whether the number key for weapon slot n (1-7,
+// the classic Doom layout) is currently held.
 func (w *Window) WeaponKeyPressed(n int) bool {
-	if n < 1 || n > 6 {
+	if n < 1 || n > 7 {
 		return false
 	}
 	return w.handle.GetKey(glfw.Key0+glfw.Key(n)) == glfw.Press
@@ -99,6 +171,28 @@ func (w *Window) WeaponKeyPressed(n int) bool {
 // is currently held.
 func (w *Window) FirePressed() bool {
 	return w.handle.GetMouseButton(glfw.MouseButtonLeft) == glfw.Press
+}
+
+// TakeTyped returns the characters typed since the last call and clears the
+// buffer, lower-cased and filtered to ASCII letters and digits — enough to
+// recognise the classic cheat-code sequences (see engine/cheats.go). GLFW
+// delivers these through its character callback during PollEvents, so this
+// must be called on the same (main) thread, once per frame.
+func (w *Window) TakeTyped() string {
+	if len(w.typed) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range w.typed {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+		}
+	}
+	w.typed = w.typed[:0]
+	return b.String()
 }
 
 // EnableMouseLook hides the OS cursor and confines it to the window,

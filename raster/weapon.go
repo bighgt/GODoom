@@ -30,14 +30,26 @@ const weaponDropPx = 300
 // position plus the two sprites' offset delta — the same relative
 // alignment the original data intends, without needing to reproduce its
 // absolute projection math.
-func (r *Renderer) DrawWeapon(spritePrefix string, gunFrame byte, flashPrefix string, flashFrame byte, hasFlash bool, raiseOffset float64) {
+func (r *Renderer) DrawWeapon(spritePrefix string, gunFrame byte, flashPrefix string, flashFrame byte, hasFlash bool, raiseOffset float64, sectorLight int16) {
 	gunSp, ok := r.textures.Sprite(spriteName(spritePrefix, gunFrame))
 	if !ok {
 		return
 	}
-	gunX := (r.Width - gunSp.Width) / 2
-	gunY := r.Height - gunSp.Height + int(raiseOffset*float64(gunSp.Height+weaponDropPx))
-	r.blit(gunSp, gunX, gunY, false)
+	// All layout is in the HUD's 320x200 logical space; a hi-res override
+	// (tpu==4) has the same logical footprint as its 1x original. The blit
+	// calls pass weaponSpace=true, so the viewmodel is sized by hudFit alone
+	// (fills the screen height) and the config hudScale — which sizes the
+	// status bar — does not shrink or grow it.
+	gunTPU := tpu(gunSp)
+	gunW := float64(gunSp.Width) / gunTPU
+	gunH := float64(gunSp.Height) / gunTPU
+	gunX := int((hudLogicalW - gunW) / 2)
+	gunY := int(hudLogicalH - gunH + raiseOffset*(gunH+weaponDropPx))
+	// The held weapon dims with the room it's in — id shades a psprite with
+	// spritelights[MAXLIGHTSCALE-1], the bright end of its sector's
+	// scalelight (see pspriteShade). The muzzle flash overlay stays full
+	// bright (it's an FF_FULLBRIGHT sprite that lights the gun, not lit by it).
+	r.blit(gunSp, gunX, gunY, false, pspriteShade(sectorLight, false), true) // weapon transform (ignores hudScale)
 
 	if !hasFlash {
 		return
@@ -46,9 +58,10 @@ func (r *Renderer) DrawWeapon(spritePrefix string, gunFrame byte, flashPrefix st
 	if !ok {
 		return
 	}
-	flashX := gunX + gunSp.OffsetX - flashSp.OffsetX
-	flashY := gunY + gunSp.OffsetY - flashSp.OffsetY
-	r.blit(flashSp, flashX, flashY, false)
+	flashTPU := tpu(flashSp)
+	flashX := gunX + int(float64(gunSp.OffsetX)/gunTPU) - int(float64(flashSp.OffsetX)/flashTPU)
+	flashY := gunY + int(float64(gunSp.OffsetY)/gunTPU) - int(float64(flashSp.OffsetY)/flashTPU)
+	r.blit(flashSp, flashX, flashY, false, 256, true)
 }
 
 func spriteName(prefix string, frame byte) string {

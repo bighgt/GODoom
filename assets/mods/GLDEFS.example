@@ -1,0 +1,162 @@
+// ============================================================================
+// GLDEFS.example — a sample data-driven dynamic-light set for the stock Doom
+// decorations. RENAME this file to "GLDEFS" (no extension) to activate it:
+//
+//     mv assets/mods/GLDEFS.example assets/mods/GLDEFS
+//
+// then run with lightingMode "enhanced" (config.json). The engine mounts
+// everything in assets/mods/ at startup and reads GLDEFS from it, so a
+// stock shareware IWAD — which ships no GLDEFS lump — now gets these lights.
+//
+// This is the TwoPointFive project's OWN light tuning (the same colours and
+// radii as the built-in engine/maplights.go decoLights table), written out
+// in the ZDoom GLDEFS text format that engine/gldefs parses. It is NOT
+// copied from GZDoom's data. Edit freely; a real GZDoom-mod .pk3 dropped in
+// this folder overrides these per light name.
+//
+// Format reference: https://zdoom.org/wiki/GLDEFS
+// ----------------------------------------------------------------------------
+
+// ---- torches (animate over frames A-D; a 4-char `frame` = all frames) ----
+
+flickerlight TPF_REDTORCH
+{
+	color   1.00 0.45 0.20
+	size    170
+	secondarySize 200
+	chance  0.3
+	offset  0 40 0
+}
+
+flickerlight TPF_REDTORCH_SHORT
+{
+	color   1.00 0.45 0.20
+	size    140
+	secondarySize 160
+	chance  0.3
+	offset  0 24 0
+}
+
+flickerlight TPF_GREENTORCH
+{
+	color   0.45 1.00 0.50
+	size    170
+	secondarySize 200
+	chance  0.3
+	offset  0 40 0
+}
+
+flickerlight TPF_GREENTORCH_SHORT
+{
+	color   0.45 1.00 0.50
+	size    140
+	secondarySize 160
+	chance  0.3
+	offset  0 24 0
+}
+
+flickerlight TPF_BLUETORCH
+{
+	color   0.40 0.55 1.00
+	size    170
+	secondarySize 200
+	chance  0.3
+	offset  0 40 0
+}
+
+flickerlight TPF_BLUETORCH_SHORT
+{
+	color   0.40 0.55 1.00
+	size    140
+	secondarySize 160
+	chance  0.3
+	offset  0 24 0
+}
+
+flickerlight TPF_TORCHTREE
+{
+	color   1.00 0.50 0.22
+	size    190
+	secondarySize 220
+	chance  0.3
+	offset  0 44 0
+}
+
+flickerlight TPF_BURNINGBARREL
+{
+	color   1.00 0.48 0.15
+	size    200
+	secondarySize 235
+	chance  0.35
+	offset  0 28 0
+}
+
+// ---- tech lamps (steady) ----
+
+pointlight TPF_TECHLAMP_TALL
+{
+	color   0.85 0.90 1.00
+	size    240
+	offset  0 64 0
+}
+
+pointlight TPF_TECHLAMP_SHORT
+{
+	color   0.85 0.90 1.00
+	size    200
+	offset  0 44 0
+}
+
+pointlight TPF_TECHPILLAR
+{
+	color   0.80 0.88 1.00
+	size    170
+	offset  0 96 0
+}
+
+// ---- candles / evil eye ----
+
+flickerlight TPF_CANDLE
+{
+	color   1.00 0.82 0.52
+	size    90
+	secondarySize 104
+	chance  0.4
+	offset  0 10 0
+}
+
+flickerlight TPF_CANDELABRA
+{
+	color   1.00 0.82 0.52
+	size    120
+	secondarySize 138
+	chance  0.4
+	offset  0 44 0
+}
+
+flickerlight TPF_EVILEYE
+{
+	color   0.55 0.95 0.45
+	size    120
+	secondarySize 140
+	chance  0.5
+	offset  0 40 0
+}
+
+// ---- attach the lights to the decoration sprite frames ----
+// (class names are cosmetic; matching is by the sprite + frame inside)
+
+object RedTorch          { frame TRED { light TPF_REDTORCH } }
+object RedTorchShort      { frame SMRT { light TPF_REDTORCH_SHORT } }
+object GreenTorch         { frame TGRN { light TPF_GREENTORCH } }
+object GreenTorchShort    { frame SMGT { light TPF_GREENTORCH_SHORT } }
+object BlueTorch          { frame TBLU { light TPF_BLUETORCH } }
+object BlueTorchShort     { frame SMBT { light TPF_BLUETORCH_SHORT } }
+object TorchTree          { frame TRE1 { light TPF_TORCHTREE } }
+object BurningBarrel      { frame FCAN { light TPF_BURNINGBARREL } }
+object TallTechLamp       { frame TLMP { light TPF_TECHLAMP_TALL } }
+object ShortTechLamp      { frame TLP2 { light TPF_TECHLAMP_SHORT } }
+object TechPillar         { frame ELEC { light TPF_TECHPILLAR } }
+object Candlestick        { frame CAND { light TPF_CANDLE } }
+object Candelabra         { frame CBRA { light TPF_CANDELABRA } }
+object EvilEye            { frame CEYE { light TPF_EVILEYE } }

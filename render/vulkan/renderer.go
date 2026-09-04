@@ -19,19 +19,42 @@ import (
 	"twopointfive/window"
 )
 
-// maxFramesInFlight is 1, not the usual double-buffered 2: the renderer's
-// staging buffer and descriptor set are single, shared resources (there's
-// exactly one small CPU-rendered frame to present, not a pool of vertex
-// buffers), so keeping only one frame in flight is what makes "wait for
-// this slot's fence, then safely overwrite the staging buffer" correct
-// without extra bookkeeping. The CPU-side software rasterizer, not this
-// serialization, is Phase 2's actual performance ceiling.
-const maxFramesInFlight = 1
+// maxFramesInFlight is 2: the CPU builds and uploads frame N+1 while the
+// GPU is still copying/blitting/presenting frame N, instead of the whole
+// pipeline running strictly one frame at a time. Making that safe needs
+// one host-visible staging buffer per in-flight slot (see
+// createStagingBuffer) so the CPU's memcpy for the next frame never lands
+// on a buffer the GPU is still reading; the frame texture stays single,
+// with the record-time barrier ordering the next copy after the previous
+// blit's sampling (see recordCommandBuffer). imageAvailable/inFlight are
+// per-slot; renderFinished is per swapchain image (see createSyncObjects).
+const maxFramesInFlight = 2
 
 // Renderer is the Vulkan backend. It satisfies render.Renderer.
 type Renderer struct {
 	win   *window.Window
 	debug bool
+	vsync bool // prefer FIFO (tear-free) over mailbox when choosing a present mode
+
+	// lit selects the pipeline built by New: false = the vanilla blit (the
+	// CPU already shaded the frame, we just upscale/present it); true = the
+	// enhanced deferred-lighting path in lit.go (G-buffer -> GPU lighting ->
+	// bloom -> tonemap). The two are mutually exclusive — DrawFrame errors
+	// in lit mode and DrawFrameLit errors otherwise — since the engine
+	// knows at startup which one config asked for.
+	lit    bool
+	litRes *litResources
+
+	// hw selects the hardware (GPU-geometry) path — the triangle list
+	// render/worldgeo builds from the BSP walk, rasterised on the GPU (see
+	// world.go). Built by NewWorld instead of New; mutually exclusive with
+	// lit / vanilla. DrawWorld errors unless this is set, and DrawFrame /
+	// DrawFrameLit error when it is.
+	hw    bool
+	wr    *worldResources
+	// maxAnisotropy is the device's advertised MaxSamplerAnisotropy when the
+	// samplerAnisotropy feature was enabled (hw path), else 0.
+	maxAnisotropy float32
 
 	// DeviceName/DeviceTypeName identify the physical GPU New selected
 	// (set by pickPhysicalDevice) — read these after New returns to
@@ -71,7 +94,20 @@ type Renderer struct {
 	imageAvailable []vk.Semaphore
 	renderFinished []vk.Semaphore
 	inFlight       []vk.Fence
+	// imagesInFlight[i] is the per-slot inFlight fence of the frame that
+	// last submitted work for swapchain image i (nil if none yet). With
+	// more than one frame in flight, acquiring image i doesn't imply the
+	// slot that last used it has retired, so DrawFrame waits on this fence
+	// before reusing image i's command buffer. Rebuilt with the per-image
+	// semaphores on swapchain (re)creation.
+	imagesInFlight []vk.Fence
 	currentFrame   int
+
+	// needRecreate is set when acquire/present reports the swapchain is out
+	// of date or suboptimal (a window resize, a monitor change); DrawFrame
+	// rebuilds the swapchain at the start of the next call rather than
+	// mid-frame. See recreateSwapchain.
+	needRecreate bool
 
 	// The uploaded-frame texture the blit pipeline samples.
 	srcWidth, srcHeight int
@@ -81,10 +117,12 @@ type Renderer struct {
 	textureSampler      vk.Sampler
 	textureLayout       vk.ImageLayout
 
-	stagingBuffer vk.Buffer
-	stagingMemory vk.DeviceMemory
-	stagingMapped unsafe.Pointer
-	stagingSize   int
+	// One staging buffer per frame-in-flight slot (indexed by currentFrame),
+	// each mapped for the renderer's lifetime.
+	stagingBuffers []vk.Buffer
+	stagingMemory  []vk.DeviceMemory
+	stagingMapped  []unsafe.Pointer
+	stagingSize    int
 
 	descriptorSetLayout vk.DescriptorSetLayout
 	descriptorPool      vk.DescriptorPool
@@ -97,11 +135,12 @@ type Renderer struct {
 // New stands up the full Vulkan pipeline targeting win: instance, surface,
 // physical/logical device, swapchain, render pass, framebuffers, command
 // pool/buffers, sync objects, the frame-upload texture, and the blit
-// pipeline that presents it. srcW/srcH must match the RGBA frames DrawFrame
-// will be given (raster.InternalWidth/InternalHeight). debug enables
+// pipeline that presents it. srcW/srcH is the size of the RGBA frames
+// DrawFrame will be given (the CPU render resolution). vsync prefers the
+// tear-free FIFO present mode over mailbox. debug enables
 // VK_LAYER_KHRONOS_validation when it's present on the system.
-func New(win *window.Window, srcW, srcH int, debug bool) (*Renderer, error) {
-	r := &Renderer{win: win, debug: debug}
+func New(win *window.Window, srcW, srcH int, vsync, debug, lit bool) (*Renderer, error) {
+	r := &Renderer{win: win, vsync: vsync, debug: debug, lit: lit}
 
 	steps := []func() error{
 		r.createInstance,
@@ -115,9 +154,19 @@ func New(win *window.Window, srcW, srcH int, debug bool) (*Renderer, error) {
 		r.createCommandPool,
 		r.createCommandBuffers,
 		r.createSyncObjects,
-		func() error { return r.createTextureResources(srcW, srcH) },
-		r.createDescriptors,
-		r.createPipeline,
+	}
+	if lit {
+		// The enhanced path: a G-buffer upload set, offscreen HDR + bloom
+		// targets, and the lighting/bright/blur/composite pipelines. The
+		// composite pass reuses r.renderPass / r.framebuffers (it also
+		// targets the swapchain), so those steps above still run.
+		steps = append(steps, func() error { return r.createLitResources(srcW, srcH) })
+	} else {
+		steps = append(steps,
+			func() error { return r.createTextureResources(srcW, srcH) },
+			r.createDescriptors,
+			r.createPipeline,
+		)
 	}
 	for _, step := range steps {
 		if err := step(); err != nil {
@@ -129,8 +178,9 @@ func New(win *window.Window, srcW, srcH int, debug bool) (*Renderer, error) {
 	return r, nil
 }
 
-// WaitIdle blocks until the GPU has finished all outstanding work.
-func (r *Renderer) WaitIdle() {
+// waitIdle blocks until the GPU has finished all outstanding work — done
+// before teardown so no resource is freed while a frame still references it.
+func (r *Renderer) waitIdle() {
 	if r.device != nil {
 		vk.DeviceWaitIdle(r.device)
 	}
@@ -140,29 +190,36 @@ func (r *Renderer) WaitIdle() {
 // owns, in reverse creation order. Safe to call on a partially-initialized
 // Renderer (e.g. if New failed partway through).
 func (r *Renderer) Destroy() {
-	r.WaitIdle()
+	r.waitIdle()
 
+	r.destroyWorldResources()
+	r.destroyLitResources()
 	r.destroyPipeline()
 	r.destroyDescriptors()
 	r.destroyTextureResources()
 
-	for _, s := range r.imageAvailable {
-		vk.DestroySemaphore(r.device, s, nil)
+	// Command buffers, per-image (renderFinished) semaphores, framebuffers,
+	// image views, and the swapchain itself — everything sized to the
+	// swapchain, shared with recreateSwapchain's teardown.
+	r.destroyResizableResources()
+
+	if r.renderPass != nil {
+		vk.DestroyRenderPass(r.device, r.renderPass, nil)
+		r.renderPass = nil
 	}
-	for _, s := range r.renderFinished {
+
+	for _, s := range r.imageAvailable {
 		vk.DestroySemaphore(r.device, s, nil)
 	}
 	for _, f := range r.inFlight {
 		vk.DestroyFence(r.device, f, nil)
 	}
-	r.imageAvailable, r.renderFinished, r.inFlight = nil, nil, nil
+	r.imageAvailable, r.inFlight = nil, nil
 
 	if r.commandPool != nil {
 		vk.DestroyCommandPool(r.device, r.commandPool, nil)
 		r.commandPool = nil
 	}
-
-	r.destroySwapchain()
 
 	if r.device != nil {
 		vk.DestroyDevice(r.device, nil)

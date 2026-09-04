@@ -1,6 +1,7 @@
 package vulkan
 
 import (
+	"errors"
 	"fmt"
 
 	vk "github.com/goki/vulkan"
@@ -21,7 +22,7 @@ func (r *Renderer) createSwapchain() error {
 		return err
 	}
 	presentMode := r.choosePresentMode()
-	extent := chooseExtent(caps)
+	extent := r.chooseExtent(caps)
 
 	imageCount := caps.MinImageCount + 1
 	if caps.MaxImageCount > 0 && imageCount > caps.MaxImageCount {
@@ -87,6 +88,11 @@ func (r *Renderer) chooseSurfaceFormat() (vk.SurfaceFormat, error) {
 }
 
 func (r *Renderer) choosePresentMode() vk.PresentMode {
+	// FIFO (classic vsync) is the only mode every Vulkan implementation must
+	// support, and it's what the vsync setting asks for.
+	if r.vsync {
+		return vk.PresentModeFifo
+	}
 	var count uint32
 	vk.GetPhysicalDeviceSurfacePresentModes(r.physicalDevice, r.surface, &count, nil)
 	if count == 0 {
@@ -100,7 +106,6 @@ func (r *Renderer) choosePresentMode() vk.PresentMode {
 			return m
 		}
 	}
-	// FIFO (classic vsync) is the only mode every Vulkan implementation must support.
 	return vk.PresentModeFifo
 }
 
@@ -114,16 +119,17 @@ func clampU32(v, lo, hi uint32) uint32 {
 	return v
 }
 
-func chooseExtent(caps vk.SurfaceCapabilities) vk.Extent2D {
+func (r *Renderer) chooseExtent(caps vk.SurfaceCapabilities) vk.Extent2D {
 	if caps.CurrentExtent.Width != vk.MaxUint32 {
 		return caps.CurrentExtent
 	}
-	// vk.MaxUint32 in CurrentExtent.Width signals "pick anything within
-	// bounds"; Phase 1 has no live framebuffer-size callback yet, so fall
-	// back to the minimum supported extent.
+	// vk.MaxUint32 in CurrentExtent.Width signals "the surface takes
+	// whatever the swapchain asks for" — use the window's current
+	// framebuffer size, clamped to what the surface actually supports.
+	w, h := r.win.FramebufferSize()
 	return vk.Extent2D{
-		Width:  clampU32(caps.MinImageExtent.Width, caps.MinImageExtent.Width, caps.MaxImageExtent.Width),
-		Height: clampU32(caps.MinImageExtent.Height, caps.MinImageExtent.Height, caps.MaxImageExtent.Height),
+		Width:  clampU32(uint32(w), caps.MinImageExtent.Width, caps.MaxImageExtent.Width),
+		Height: clampU32(uint32(h), caps.MinImageExtent.Height, caps.MaxImageExtent.Height),
 	}
 }
 
@@ -158,20 +164,28 @@ func (r *Renderer) createImageViews() error {
 	return nil
 }
 
-// destroySwapchain releases the swapchain and everything that depends on its
-// image count/extent (image views, framebuffers) — but not the render pass
-// or command pool, which don't need to change. Used by Destroy, and will be
-// reused by a future recreateSwapchain on window resize / ErrorOutOfDate.
-func (r *Renderer) destroySwapchain() {
+// destroyResizableResources releases the swapchain and everything sized to
+// its image count/extent: image views, framebuffers, the per-image command
+// buffers, and the per-image renderFinished semaphores. It deliberately
+// leaves the render pass and command pool alone — the render pass's only
+// input, the surface format, is stable across a resize, and a render pass
+// with an unchanged attachment layout stays compatible with the existing
+// pipeline. Shared by Destroy and recreateSwapchain.
+func (r *Renderer) destroyResizableResources() {
+	for _, s := range r.renderFinished {
+		vk.DestroySemaphore(r.device, s, nil)
+	}
+	r.renderFinished = nil
+
+	if len(r.commandBuffers) > 0 {
+		vk.FreeCommandBuffers(r.device, r.commandPool, uint32(len(r.commandBuffers)), r.commandBuffers)
+		r.commandBuffers = nil
+	}
+
 	for _, fb := range r.framebuffers {
 		vk.DestroyFramebuffer(r.device, fb, nil)
 	}
 	r.framebuffers = nil
-
-	if r.renderPass != nil {
-		vk.DestroyRenderPass(r.device, r.renderPass, nil)
-		r.renderPass = nil
-	}
 
 	for _, v := range r.swapchainImageViews {
 		vk.DestroyImageView(r.device, v, nil)
@@ -183,4 +197,57 @@ func (r *Renderer) destroySwapchain() {
 		vk.DestroySwapchain(r.device, r.swapchain, nil)
 		r.swapchain = nil
 	}
+}
+
+// errSwapchainZeroExtent is returned by recreateSwapchain while the window
+// is minimized (0x0 client area): swapchain creation can't succeed against
+// a zero extent, so DrawFrame just skips frames until the window is
+// restored and a real size is available again.
+var errSwapchainZeroExtent = errors.New("vulkan: swapchain extent is zero (window minimized)")
+
+// recreateSwapchain rebuilds the swapchain and everything sized to it after
+// a window resize / monitor change makes the surface out of date (see
+// DrawFrame, which calls this when acquire or present reports
+// ErrorOutOfDate/Suboptimal). The caller must not have a frame in flight;
+// this waits for the device to go idle first.
+func (r *Renderer) recreateSwapchain() error {
+	if w, h := r.win.FramebufferSize(); w == 0 || h == 0 {
+		return errSwapchainZeroExtent
+	}
+
+	vk.DeviceWaitIdle(r.device)
+	r.destroyResizableResources()
+
+	steps := []func() error{
+		r.createSwapchain,
+		r.createImageViews,
+		r.createFramebuffers,
+		r.createCommandBuffers,
+		r.createPerImageSemaphores,
+	}
+	for _, step := range steps {
+		if err := step(); err != nil {
+			return err
+		}
+	}
+	r.currentFrame = 0
+	return nil
+}
+
+// createPerImageSemaphores allocates the renderFinished semaphores — one
+// per swapchain image, not per frame-in-flight slot (see createSyncObjects
+// for why). Split out so recreateSwapchain can rebuild exactly these if the
+// swapchain's image count changes.
+func (r *Renderer) createPerImageSemaphores() error {
+	semInfo := vk.SemaphoreCreateInfo{SType: vk.StructureTypeSemaphoreCreateInfo}
+	r.renderFinished = make([]vk.Semaphore, len(r.swapchainImages))
+	for i := range r.renderFinished {
+		if res := vk.CreateSemaphore(r.device, &semInfo, nil, &r.renderFinished[i]); res != vk.Success {
+			return fmt.Errorf("vulkan: create render-finished semaphore: %s", vk.Error(res))
+		}
+	}
+	// Per-image "last frame that used this image" fence tracking — starts
+	// empty; DrawFrame fills it as images are first used.
+	r.imagesInFlight = make([]vk.Fence, len(r.swapchainImages))
+	return nil
 }

@@ -24,8 +24,6 @@ type Header struct {
 	// overrides/extends lumps from an IWAD loaded alongside it).
 	Magic    string
 	NumLumps int32
-	// DirOfs is the byte offset of the lump directory within the file.
-	DirOfs int32
 }
 
 // DirEntry is one 16-byte record of the lump directory: where a lump's
@@ -105,11 +103,52 @@ func Parse(data []byte) (*WAD, error) {
 	}
 
 	return &WAD{
-		Header:  Header{Magic: magic, NumLumps: numLumps, DirOfs: dirOfs},
+		Header:  Header{Magic: magic, NumLumps: numLumps},
 		Entries: entries,
 		data:    data,
 		index:   index,
 	}, nil
+}
+
+// Merge combines several WADs into one in load order — wads[0] is the base
+// (an IWAD), each later WAD overrides and extends it (a PWAD), exactly like
+// Doom's own `-file`. Find / IndexOf then return a later WAD's lump in
+// preference to an earlier one's with the same name. The result owns a
+// fresh backing buffer; the inputs are left untouched. A single WAD is
+// returned as-is; no WADs returns nil.
+func Merge(wads ...*WAD) *WAD {
+	switch len(wads) {
+	case 0:
+		return nil
+	case 1:
+		return wads[0]
+	}
+	totalData, totalLumps := 0, 0
+	for _, w := range wads {
+		totalData += len(w.data)
+		totalLumps += len(w.Entries)
+	}
+	data := make([]byte, 0, totalData)
+	entries := make([]DirEntry, 0, totalLumps)
+	index := make(map[string][]int, totalLumps)
+	for _, w := range wads {
+		base := int32(len(data))
+		data = append(data, w.data...)
+		for _, e := range w.Entries {
+			ne := e
+			if ne.Size > 0 {
+				ne.FilePos += base
+			}
+			index[ne.Name] = append(index[ne.Name], len(entries))
+			entries = append(entries, ne)
+		}
+	}
+	return &WAD{
+		Header:  Header{Magic: "IWAD", NumLumps: int32(len(entries))},
+		Entries: entries,
+		data:    data,
+		index:   index,
+	}
 }
 
 // cleanName upper-cases an 8-byte, zero-padded lump name field into a plain
@@ -151,12 +190,16 @@ func (w *WAD) Find(name string) ([]byte, bool) {
 
 var mapMarkerPattern = regexp.MustCompile(`^(E[1-9]M[1-9]|MAP[0-9]{2})$`)
 
-// ListMaps returns every map marker lump name found in the WAD (e.g. "E1M1"
-// for Doom/Ultimate Doom, "MAP01" for Doom II and most PWADs), in directory order.
+// ListMaps returns every distinct map marker lump name found in the WAD
+// (e.g. "E1M1" for Doom/Ultimate Doom, "MAP01" for Doom II and most PWADs),
+// in directory order. Duplicates — a PWAD that replaces an IWAD map after a
+// Merge — are collapsed to one entry.
 func (w *WAD) ListMaps() []string {
 	var maps []string
+	seen := make(map[string]bool)
 	for _, e := range w.Entries {
-		if mapMarkerPattern.MatchString(e.Name) {
+		if mapMarkerPattern.MatchString(e.Name) && !seen[e.Name] {
+			seen[e.Name] = true
 			maps = append(maps, e.Name)
 		}
 	}

@@ -14,12 +14,14 @@ const NoSidedef = 0xFFFF
 // exact bit Doom's own renderer used to tell BSP nodes and leaves apart.
 const SubsectorBit = 0x8000
 
-// Linedef.Flags bits relevant to rendering, from the original Doom Specs
-// (unchanged since 1993). UpperUnpegged/LowerUnpegged control texture
-// alignment — see raster.Renderer.drawWallSpan, ported from PrBoom's r_segs.c.
+// Linedef.Flags bits, from the original Doom Specs (unchanged since 1993).
+// UpperUnpegged/LowerUnpegged control texture alignment — see
+// raster.Renderer.drawWallSpan, ported from PrBoom's r_segs.c. BlockSound
+// (ML_SOUNDBLOCK) caps the P_NoiseAlert flood — see engine/noise.go.
 const (
 	LinedefUpperUnpegged = 0x0008
 	LinedefLowerUnpegged = 0x0010
+	LinedefBlockSound    = 0x0040
 )
 
 // Vertex is one entry of the VERTEXES lump (4 bytes): a 2D map-space point.
@@ -69,10 +71,11 @@ type Thing struct {
 // Subsector's boundary, referencing the Linedef it runs along.
 type Seg struct {
 	StartVertex, EndVertex uint16
-	Angle                  int16 // binary angle measure (BAM): 0..65535 covers 0..360°
 	Linedef                uint16
 	Direction              int16 // 0 = same direction as the linedef, 1 = opposite
 	Offset                 int16
+	// The on-disk entry also carries a BAM angle at offset 4; the renderer
+	// derives seg orientation from the vertices instead, so it isn't kept.
 }
 
 // Subsector is one entry of the SSECTORS lump (4 bytes): a convex leaf of
@@ -83,12 +86,13 @@ type Subsector struct {
 }
 
 // Node is one entry of the NODES lump (28 bytes): a single split of the
-// precomputed BSP tree — a partition line, the bounding boxes of both
-// children, and the two child indices themselves (see SubsectorBit).
+// precomputed BSP tree — a partition line and the two child indices (see
+// SubsectorBit). The on-disk entry also holds a bounding box per child at
+// offsets 8..24; bsp.Traverse walks front-to-back without a bbox reject, so
+// they aren't kept.
 type Node struct {
-	X, Y                  int16    // partition line start point
-	DX, DY                int16    // partition line direction vector
-	RightBBox, LeftBBox   [4]int16 // each: top, bottom, left, right
+	X, Y                  int16 // partition line start point
+	DX, DY                int16 // partition line direction vector
 	RightChild, LeftChild uint16
 }
 
@@ -107,9 +111,10 @@ type Level struct {
 	Subsectors []Subsector
 	Nodes      []Node
 	Sectors    []Sector
-
-	Reject   []byte // sector-pair visibility bit table, used by AI/sound
-	Blockmap []byte // spatial hash grid, used for collision
+	// The REJECT (sector-pair visibility bits) and BLOCKMAP (spatial hash)
+	// lumps are not kept: sight traces run the geometry directly and
+	// collision uses the engine's own grid (see game_design.txt sections
+	// 5, 14).
 }
 
 // LoadLevel assembles the Level for the map marked by mapName (e.g. "E1M1"
@@ -142,10 +147,8 @@ func (w *WAD) LoadLevel(mapName string) (*Level, error) {
 			lvl.Nodes = decodeNodes(w.Lump(i))
 		case "SECTORS":
 			lvl.Sectors = decodeSectors(w.Lump(i))
-		case "REJECT":
-			lvl.Reject = w.Lump(i)
-		case "BLOCKMAP":
-			lvl.Blockmap = w.Lump(i)
+		case "REJECT", "BLOCKMAP":
+			// Part of the level block but not used (see the Level type).
 		default:
 			// Reached a lump that isn't part of the fixed level block (most
 			// often the next map's own marker) — this level is complete.
@@ -255,10 +258,10 @@ func decodeSegs(b []byte) []Seg {
 		out[i] = Seg{
 			StartVertex: binary.LittleEndian.Uint16(b[o : o+2]),
 			EndVertex:   binary.LittleEndian.Uint16(b[o+2 : o+4]),
-			Angle:       int16(binary.LittleEndian.Uint16(b[o+4 : o+6])),
-			Linedef:     binary.LittleEndian.Uint16(b[o+6 : o+8]),
-			Direction:   int16(binary.LittleEndian.Uint16(b[o+8 : o+10])),
-			Offset:      int16(binary.LittleEndian.Uint16(b[o+10 : o+12])),
+			// b[o+4:o+6] is the BAM angle — not used (see the Seg type).
+			Linedef:   binary.LittleEndian.Uint16(b[o+6 : o+8]),
+			Direction: int16(binary.LittleEndian.Uint16(b[o+8 : o+10])),
+			Offset:    int16(binary.LittleEndian.Uint16(b[o+10 : o+12])),
 		}
 	}
 	return out
@@ -284,12 +287,11 @@ func decodeNodes(b []byte) []Node {
 		o := i * 28
 		rd16 := func(k int) int16 { return int16(binary.LittleEndian.Uint16(b[o+k : o+k+2])) }
 		out[i] = Node{
-			X:          rd16(0),
-			Y:          rd16(2),
-			DX:         rd16(4),
-			DY:         rd16(6),
-			RightBBox:  [4]int16{rd16(8), rd16(10), rd16(12), rd16(14)},
-			LeftBBox:   [4]int16{rd16(16), rd16(18), rd16(20), rd16(22)},
+			X:  rd16(0),
+			Y:  rd16(2),
+			DX: rd16(4),
+			DY: rd16(6),
+			// b[o+8 : o+24] are the two child bounding boxes — not used.
 			RightChild: binary.LittleEndian.Uint16(b[o+24 : o+26]),
 			LeftChild:  binary.LittleEndian.Uint16(b[o+26 : o+28]),
 		}

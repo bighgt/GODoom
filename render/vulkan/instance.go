@@ -22,7 +22,22 @@ func (r *Renderer) createInstance() error {
 		return fmt.Errorf("vulkan: init: %w", err)
 	}
 
-	extensions := nzAll(r.win.RequiredInstanceExtensions())
+	extNames := r.win.RequiredInstanceExtensions()
+
+	// On a portability Vulkan implementation (MoltenVK on macOS, some
+	// layered drivers) the loader hides its physical devices unless the
+	// instance opts in with VK_KHR_portability_enumeration + the matching
+	// create flag. Where the extension isn't advertised — every native
+	// Windows / Linux driver — this whole block is inert.
+	var instanceFlags vk.InstanceCreateFlags
+	if hasInstanceExtension(vk.KhrPortabilityEnumerationExtensionName) {
+		extNames = append(extNames,
+			vk.KhrPortabilityEnumerationExtensionName,
+			vk.KhrGetPhysicalDeviceProperties2ExtensionName)
+		instanceFlags = vk.InstanceCreateFlags(vk.InstanceCreateEnumeratePortabilityBit)
+	}
+
+	extensions := nzAll(extNames)
 	if len(extensions) == 0 {
 		return fmt.Errorf("vulkan: GLFW returned no required instance extensions for surface creation")
 	}
@@ -43,6 +58,7 @@ func (r *Renderer) createInstance() error {
 
 	createInfo := vk.InstanceCreateInfo{
 		SType:                   vk.StructureTypeInstanceCreateInfo,
+		Flags:                   instanceFlags,
 		PApplicationInfo:        &appInfo,
 		EnabledExtensionCount:   uint32(len(extensions)),
 		PpEnabledExtensionNames: extensions,
@@ -73,6 +89,23 @@ func hasInstanceLayer(name string) bool {
 	for i := range props {
 		props[i].Deref()
 		if vk.ToString(props[i].LayerName[:]) == name {
+			return true
+		}
+	}
+	return false
+}
+
+func hasInstanceExtension(name string) bool {
+	var count uint32
+	vk.EnumerateInstanceExtensionProperties("", &count, nil)
+	if count == 0 {
+		return false
+	}
+	props := make([]vk.ExtensionProperties, count)
+	vk.EnumerateInstanceExtensionProperties("", &count, props)
+	for i := range props {
+		props[i].Deref()
+		if vk.ToString(props[i].ExtensionName[:]) == name {
 			return true
 		}
 	}

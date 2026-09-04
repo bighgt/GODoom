@@ -1,0 +1,53 @@
+// TEXTURES.example — rename to "TEXTURES" (no extension) to activate.
+//
+// ZDoom-format text-defined composite textures for TwoPointFive. The
+// clean-room parser (engine/texturedefs) understands Texture / WallTexture
+// / Flat / Sprite / Graphic blocks with XScale / YScale / Offset /
+// WorldPanning / NullTexture, and Patch sub-blocks with FlipX / FlipY /
+// Rotate 90|180|270 / Alpha / Style / Blend. A registered name fully
+// shadows the WAD's own TEXTURE1/TEXTURE2 entry (or the raw flat/sprite
+// lump), and XScale becomes the bitmap's sampling density — so this is how
+// you drop in a higher-resolution wall without the engine guessing the
+// scale from a width ratio.
+//
+// `Translation`, and the exotic render styles (Modulate, Subtract, ...),
+// are parsed but approximated / skipped with a logged note.
+
+// --- redefine a stock wall at 2x resolution ---------------------------
+// The patch BRIK1HI would be a 128x128 lump you ship in the same mod;
+// XScale 2 tells both renderers it covers the same 64-unit wall span.
+WallTexture "BRICK7", 128, 128
+{
+    XScale 2.0
+    YScale 2.0
+    Patch "BRIK1HI", 0, 0
+}
+
+// --- build a texture from several stock patches -----------------------
+Texture "COMPUTER", 128, 64
+{
+    Patch "COMP01", 0, 0
+    Patch "COMP02", 64, 0  { FlipX }
+    Patch "SW1COMP", 48, 20 { Style Translucent Alpha 0.85 }
+}
+
+// --- a see-through grate (transparent where no patch covers) ----------
+Texture "MIDGRATE", 64, 128
+{
+    NoDecals
+    Patch "MIDBARS3", 0, 0
+}
+
+// --- flat re-authored from a patch, tinted --------------------------
+Flat "HOTFLOOR", 64, 64
+{
+    Patch "RROCK09", 0, 0 { Blend "FF6020", 0.35 }
+}
+
+// --- a sprite frame with an explicit hotspot ------------------------
+Sprite "CUSTA1", 48, 56
+{
+    Offset 24, 54
+    Patch "CUSTBODY", 0, 0
+    Patch "CUSTGLOW", 6, 2 { Style Add Alpha 0.7 }
+}

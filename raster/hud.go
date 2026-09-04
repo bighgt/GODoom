@@ -11,19 +11,16 @@ import (
 
 // hudFace is a small, fixed bitmap font (7x13 pixels/glyph) from the Go
 // standard extended library — no font file to ship, no license to track.
-// Its glyphs are drawn sharp/unantialiased; smoothing comes entirely from
-// the GPU sampler that later upscales this whole internal frame to the
-// window's real size (see render/vulkan/texture.go), the same "hardware
-// text smoothing" applied to the 3D view itself. Drawing the HUD directly
-// into the low-resolution raster.Renderer.Pix buffer, rather than as a
-// separate high-resolution overlay, is what makes one sampler enough for
-// both — see game_design.txt section 7.
+// Its glyphs are drawn sharp/unantialiased into the 320x200 overlay buffer;
+// CompositeOverlay then scales that up onto the frame with nearest
+// sampling, so the debug text stays crisp and chunky at any render
+// resolution (matching the 3D view's deliberate pixel look).
 var hudFace = basicfont.Face7x13
 
-// DrawHUD renders each of lines into the top-left corner of r.Pix, one per
-// row, skipping empty strings (a convenient way for a caller to omit a
-// line some frames without renumbering the rest). Call after Render so the
-// text draws on top of the 3D view.
+// DrawHUD renders each of lines into the top-left corner of the overlay
+// buffer, one per row, skipping empty strings (a convenient way for a
+// caller to omit a line some frames without renumbering the rest). Call
+// after Render so the text draws on top of the 3D view.
 func (r *Renderer) DrawHUD(lines []string) {
 	const marginX, marginY = 4, 4
 	lineHeight := hudFace.Metrics().Height.Ceil() + 2
@@ -41,8 +38,12 @@ func (r *Renderer) DrawHUD(lines []string) {
 
 // drawHUDLine rasterizes one line of text into a just-large-enough
 // temporary image (via golang.org/x/image/font's glyph-by-glyph drawer)
-// and blits its opaque pixels onto r.Pix at (x, baselineY).
-func (r *Renderer) drawHUDLine(line string, x, baselineY int) {
+// then nearest-scales its opaque pixels into the overlay buffer. It maps
+// (logicalX, logicalBaselineY) from the HUD's 320x200 space to render
+// pixels at r.hudScale (so the debug overlay halves above 720p with the
+// rest of the HUD) but anchors to the framebuffer's own top-left corner,
+// not the bottom-anchored / centered plane the status bar and weapon use.
+func (r *Renderer) drawHUDLine(line string, logicalX, logicalBaselineY int) {
 	width := font.MeasureString(hudFace, line).Ceil()
 	height := hudFace.Metrics().Height.Ceil()
 	if width <= 0 || height <= 0 {
@@ -59,24 +60,33 @@ func (r *Renderer) drawHUDLine(line string, x, baselineY int) {
 	}
 	d.DrawString(line)
 
-	oy := baselineY - ascent
-	b := img.Bounds()
-	for sy := b.Min.Y; sy < b.Max.Y; sy++ {
-		dy := oy + sy
-		if dy < 0 || dy >= r.Height {
+	s := r.hudScale
+	dx0 := int(float64(logicalX)*s + 0.5)
+	dy0 := int(float64(logicalBaselineY-ascent)*s + 0.5)
+	dw := int(float64(width)*s + 0.5)
+	dh := int(float64(height)*s + 0.5)
+	if dw < 1 || dh < 1 {
+		return
+	}
+	r.markOverlay(dy0, dy0+dh)
+	for dy := 0; dy < dh; dy++ {
+		py := dy0 + dy
+		if py < 0 || py >= r.Height {
 			continue
 		}
-		for sx := b.Min.X; sx < b.Max.X; sx++ {
-			c := img.RGBAAt(sx, sy)
-			if c.A == 0 {
-				continue // transparent background pixel: leave the 3D view showing
-			}
-			dx := x + sx
-			if dx < 0 || dx >= r.Width {
+		sy := dy * height / dh
+		dstRow := py * r.Width * 4
+		for dx := 0; dx < dw; dx++ {
+			px := dx0 + dx
+			if px < 0 || px >= r.Width {
 				continue
 			}
-			i := (dy*r.Width + dx) * 4
-			r.Pix[i], r.Pix[i+1], r.Pix[i+2], r.Pix[i+3] = c.R, c.G, c.B, c.A
+			c := img.RGBAAt(dx*width/dw, sy)
+			if c.A == 0 {
+				continue // transparent background pixel: leave the view showing
+			}
+			i := dstRow + px*4
+			r.overlay[i], r.overlay[i+1], r.overlay[i+2], r.overlay[i+3] = c.R, c.G, c.B, c.A
 		}
 	}
 }

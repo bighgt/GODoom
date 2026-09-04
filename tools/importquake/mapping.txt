@@ -1,0 +1,484 @@
+# Doom texture / flat  ->  Quake 1 texture pack file (assets/import/Quake1_Textures.pk3)
+#
+# One entry per line:   <DOOM_LUMP>  <quake-file-stem>  <wall|flat>
+#   - DOOM_LUMP        the name a Doom level references (TEXTURE1 name or flat lump)
+#   - quake-file-stem  a .tga in the pk3's textures/ folder, without path or extension
+#   - wall|flat        which output folder it lands in (assets/textures/quake1/walls|flats)
+#
+# Blank lines and lines starting with '#' are ignored. tools/importquake reads
+# this, converts each referenced .tga to PNG, and writes it as <DOOM_LUMP>.png.
+# It is a curated, subjective pairing: Doom and Quake share no texture names, so
+# every row here is a judgement call about which Quake surface best stands in for
+# a Doom one. Names not listed simply keep whatever they resolve to today (the
+# assets/textures/walls|flats hi-res PNG, else the WAD). Edit freely and re-run.
+#
+# The pk3 used here is the Quake 1 "map source" community texture set (ikbase /
+# Rubicon / Zerstorer-era art). It leans tech-base and medieval-stone, so Doom's
+# UAC / brown-brick / hell themes map onto it more naturally than its skin/flesh
+# textures do.
+
+# ---------------------------------------------------------------------------
+# UAC tech / grey computer bases  (STARTAN, COMPUTE, TEKWALL, SILVER, METAL...)
+# ---------------------------------------------------------------------------
+STARTAN1   ikbwall02      wall
+STARTAN2   ikbwall04      wall
+STARTAN3   ikbbrik32a     wall
+STARGR1    ikbwall02      wall
+STARGR2    ikbwall04      wall
+STARG1     ikblarch02     wall
+STARG2     ikblarch03     wall
+STARG3     ikblarch05     wall
+STARBR2    ikbbrik16b     wall
+COMPUTE1   mtex483        wall
+COMPUTE2   rtex0321       wall
+COMPUTE3   rtex385        wall
+COMPSPAN   mtex483        wall
+COMPWERD   rtex0321       wall
+COMPTALL   ikblarch03     wall
+COMPTILE   rtex0321       wall
+TEKWALL1   rtex385        wall
+TEKWALL4   mtex483        wall
+TEKWALL5   rtex0321       wall
+TEKWALL6   rtex385        wall
+TEKGREN1   ikgrlit2       wall
+TEKGREN2   ikgrlit2       wall
+TEKGREN3   ikgrlit2       wall
+TEKGREN4   ikgrlit2       wall
+TEKLITE    ikgrlit2       wall
+TEKLITE2   ikgrlit2       wall
+SILVER1    metal1         wall
+SILVER2    metal1t        wall
+SILVER3    metal1bedge    wall
+METAL      metal1         wall
+METAL1     metal1t        wall
+METAL2     metal1bedge    wall
+METAL3     than_cop1_11   wall
+METAL4     copper1        wall
+METAL5     metal1         wall
+METAL6     metal1t        wall
+METAL7     than_cop1_11   wall
+SHAWN1     copper1        wall
+SHAWN2     gold           wall
+SHAWN3     metal1bedge    wall
+SUPPORT2   ikbord01       wall
+SUPPORT3   ikbord04       wall
+DOORSTOP   ikbord01       wall
+DOORTRAK   const12        wall
+SPCDOOR1   ikdoortop1     wall
+SPCDOOR2   ikdoortop1     wall
+SPCDOOR3   ikdoortop1     wall
+SPCDOOR4   ikdoortop1     wall
+PIPE1      metal1bedge    wall
+PIPE2      metal1t        wall
+PIPE4      metal1bedge    wall
+PIPE6      metal1t        wall
+PIPES      metal1bedge    wall
+PIPEWAL1   metal1t        wall
+PIPEWAL2   metal1bedge    wall
+SPACEW3    ikbwall04      wall
+
+# ---------------------------------------------------------------------------
+# Brown brick / stone / grey  (BROWN, BRICK, STONE, GRAY, CEMENT, PANEL...)
+# ---------------------------------------------------------------------------
+BROWN1     bbrik1_1       wall
+BROWN96    sbrik1_1       wall
+BROWN144   brick3_1       wall
+BROWNGRN   bbrikb32a      wall
+BROWNHUG   bbrik1_1       wall
+BROWNPIP   sbrik1_1       wall
+BROVINE2   bbrikb32a      wall
+BRNSMAL1   brick3_1       wall
+BRNSMAL2   sbrik1_1       wall
+BRNSMALC   sbrik1_1       wall
+BRNSMALL   bbrikb32a      wall
+BRNSMALR   brick3_1       wall
+BRNBIGC    bbrik1_1       wall
+BRNBIGL    bbrikb32a      wall
+BRNBIGR    brick3_1       wall
+BRNPOIS    bbrikb32a      wall
+BRICK1     bbrik1_1       wall
+BRICK2     sbrik1_1       wall
+BRICK3     brick3_1       wall
+BRICK4     bbrikb32a      wall
+BRICK5     ikbbrik8a      wall
+BRICK6     ikbbrik16b     wall
+BRICK7     ikbbrik32a     wall
+BRICK8     bbrik1_1       wall
+BRICK9     sbrik1_1       wall
+BRICK10    brick3_1       wall
+BRICK11    bbrikb32a      wall
+BRICK12    ikbbrik8a      wall
+BRICKLIT   ikgrlit2       wall
+BIGBRIK1   ikbbrik32a     wall
+BIGBRIK2   ikbbrik16b     wall
+BIGBRIK3   ikbbrik8a      wall
+STONE      hstn0          wall
+STONE2     fstnw_2sum     wall
+STONE3     hstn0          wall
+STONE4     fstnw_2sum     wall
+STONE5     hstn0          wall
+STONE6     fstnw_2sum     wall
+STONE7     hstn0          wall
+GRAY1      greypillar     wall
+GRAY2      col1_1         wall
+GRAY4      col1_2         wall
+GRAY5      greypillar     wall
+GRAY7      col1_1         wall
+GRAYBIG    ikblarch02     wall
+GRAYTALL   ikblarch03     wall
+GRAYVINE   col1_2         wall
+GRAYPOIS   greypillar     wall
+GSTONE1    smarch1_1      wall
+GSTONE2    smarch1_2      wall
+CEMENT1    mdarch1_1      wall
+CEMENT2    mdarch1_2      wall
+CEMENT3    smarch1_1      wall
+CEMENT4    smarch1_2      wall
+CEMENT5    hstn0          wall
+CEMENT6    fstnw_2sum     wall
+CEMENT7    mdarch1_1      wall
+CEMENT8    mdarch1_2      wall
+CEMENT9    smarch1_1      wall
+STUCCO     iksans01       wall
+STUCCO1    iksans03       wall
+STUCCO2    iksans04       wall
+STUCCO3    iksans01       wall
+PANEL1     bbkpan1_1      wall
+PANEL2     bbkpan1_2      wall
+PANEL3     bbkpan2_1      wall
+PANEL4     sbkpan2_1      wall
+PANEL5     bbkpan1_1      wall
+PANEL6     bbkpan1_2      wall
+PANEL7     bbkpan2_1      wall
+PANEL8     sbkpan2_1      wall
+PANEL9     bbkpan1_1      wall
+ROCKRED1   lavarock       wall
+ROCKRED2   lavarock       wall
+ROCKRED3   lavarock       wall
+ZIMMER1    iksans01       wall
+ZIMMER2    iksans03       wall
+ZIMMER3    iksans04       wall
+ZIMMER4    iksans01       wall
+ZIMMER5    iksans03       wall
+ZIMMER7    iksans04       wall
+ZIMMER8    iksans01       wall
+ZZWOLF1    ikbbrik16b     wall
+ZZWOLF9    ikbbrik32a     wall
+
+# ---------------------------------------------------------------------------
+# Marble / hell / skin  (MARBLE, GSTONE, SKIN, SP_, FIRE, SLAD...)
+# ---------------------------------------------------------------------------
+MARBLE1    smarch1_1      wall
+MARBLE2    smarch1_2      wall
+MARBLE3    mdarch1_1      wall
+MARBFACE   sqr_runes      wall
+MARBFAC2   ikrunes_b      wall
+MARBFAC3   ikrunes_g      wall
+MARBFAC4   sqr_runes      wall
+MARBGRAY   mdarch1_2      wall
+SKINMET1   ikrunes_b      wall
+SKINMET2   ikrunes_g      wall
+SKINCUT    sqr_runes      wall
+SKINEDGE   ikrunes_b      wall
+SKINFACE   sqr_runes      wall
+SKINLOW    ikrunes_g      wall
+SKINSYMB   ikrunes_b      wall
+SKSNAKE1   sqr_runes      wall
+SKSNAKE2   ikrunes_g      wall
+SKSPINE1   ikrunes_b      wall
+SKSPINE2   ikrunes_g      wall
+SP_HOT1    f3re           wall
+SP_FACE1   sqr_runes      wall
+SP_FACE2   ikrunes_b      wall
+SP_DUDE1   ikrunes_b      wall
+SP_DUDE2   ikrunes_g      wall
+SP_DUDE4   sqr_runes      wall
+SP_DUDE5   ikrunes_b      wall
+SP_DUDE7   ikrunes_g      wall
+SP_DUDE8   sqr_runes      wall
+SP_ROCK1   sockrock2      wall
+FIREBLU1   f3re2          wall
+FIREBLU2   f3re5          wall
+FIRELAVA   f3re           wall
+FIRELAV2   f3re2          wall
+FIRELAV3   f3re5          wall
+FIREMAG1   f3re           wall
+FIREMAG2   f3re2          wall
+FIREMAG3   f3re5          wall
+FIREWALL   f3re           wall
+GSTFONT1   smarch1_1      wall
+GSTFONT2   smarch1_2      wall
+GSTFONT3   mdarch1_1      wall
+GSTGARG    sqr_runes      wall
+GSTLION    ikrunes_b      wall
+GSTSATYR   ikrunes_g      wall
+GSTVINE1   col1_2         wall
+GSTVINE2   col1_1         wall
+SLADWALL   hstn0          wall
+SLADPOIS   fstnw_2sum     wall
+SLADRIP1   hstn0          wall
+SLADRIP2   hstn0          wall
+SLADRIP3   hstn0          wall
+SLADSKUL   sqr_runes      wall
+
+# ---------------------------------------------------------------------------
+# Wood  (WOOD, LWALL, WOODMET, big wooden doors...)
+# ---------------------------------------------------------------------------
+WOOD1      wizwood1a      wall
+WOOD3      wizwood1b      wall
+WOOD4      wizwood1a      wall
+WOOD5      wizwood1b      wall
+WOOD6      wizwood1a      wall
+WOOD8      wizwood1b      wall
+WOOD9      wizwood1a      wall
+WOOD10     wizwood1b      wall
+WOOD12     wizwood1a      wall
+WOODGARG   wizwood1b      wall
+WOODMET1   wizwood1a      wall
+WOODMET2   wizwood1b      wall
+WOODMET3   wizwood1a      wall
+WOODMET4   wizwood1b      wall
+WOODVERT   wizwood1a      wall
+
+# ---------------------------------------------------------------------------
+# Doors  (DOOR, BIGDOOR, coloured key doors, EXIT...)
+# ---------------------------------------------------------------------------
+DOOR1      entrancedoor   wall
+DOOR3      swdr1          wall
+BIGDOOR1   wooddoor1      wall
+BIGDOOR2   wdoor_61       wall
+BIGDOOR3   ikirisdoor     wall
+BIGDOOR4   wooddoor1      wall
+BIGDOOR5   wdoor_61       wall
+BIGDOOR6   ikdoortop1     wall
+BIGDOOR7   ikirisdoor     wall
+DOORBLU    keeptrim3      wall
+DOORBLU2   keeptrim3      wall
+DOORRED    keeptrim4      wall
+DOORRED2   keeptrim4      wall
+DOORYEL    kmetrim1       wall
+DOORYEL2   kmetrim1       wall
+EXITDOOR   ikdoortop1     wall
+EXITSIGN   ikgrlit2       wall
+EXITSTON   smarch1_1      wall
+
+# ---------------------------------------------------------------------------
+# Switches  (SW1 = off, SW2 = on; the engine swaps by name)
+# ---------------------------------------------------------------------------
+SW1BRN1    +0button6      wall
+SW2BRN1    +0shoot6       wall
+SW1BRN2    +1button6      wall
+SW2BRN2    +1shoot6       wall
+SW1COMP    +0button6      wall
+SW2COMP    +0shoot6       wall
+SW1METAL   +2button6      wall
+SW2METAL   +2shoot6       wall
+SW1STON1   +3button6      wall
+SW2STON1   +3shoot6       wall
+SW1STON2   +1button6      wall
+SW2STON2   +1shoot6       wall
+SW1STRTN   +0button6      wall
+SW2STRTN   +0shoot6       wall
+
+# ---------------------------------------------------------------------------
+# Crates / grating / steps / lights
+# ---------------------------------------------------------------------------
+CRATE1     crate1         wall
+CRATE2     crate4_sideb   wall
+CRATE3     crate6_sideb   wall
+CRATELIT   crate6_sideb   wall
+CRATINY    crate1         wall
+CRATWIDE   crate4_sideb   wall
+MIDGRATE   lattice1       wall
+MIDBARS1   lattice1       wall
+MIDBARS3   lattice1       wall
+MIDBRN1    bbrik1_1       wall
+STEP1      plat_stem1     wall
+STEP2      plat_stem7     wall
+STEP3      riser1b        wall
+STEP4      riser1c        wall
+STEP5      plat_stem1     wall
+STEP6      plat_stem7     wall
+STEPLAD1   plat_stem1     wall
+STEPTOP    plat_stem7     wall
+LITE3      ikgrlit2       wall
+LITE5      ikgrlit2       wall
+LITEBLU1   ikgrlit2       wall
+LITEBLU4   ikgrlit2       wall
+NUKE24     ikgrlit2       wall
+NUKEDGE1   ikgrlit2       wall
+NUKESLAD   const12        wall
+NUKEPOIS   const4         wall
+
+# ---------------------------------------------------------------------------
+# Rock / ash exteriors  (ASHWALL, ROCK, TANROCK, falls...)
+# ---------------------------------------------------------------------------
+ASHWALL    sockrock2      wall
+ASHWALL2   lavarock       wall
+ASHWALL3   sockrock2      wall
+ASHWALL4   lavarock       wall
+ASHWALL6   sockrock2      wall
+ASHWALL7   lavarock       wall
+ROCK1      sockrock2      wall
+ROCK2      lavarock       wall
+ROCK3      sockrock2      wall
+ROCK4      lavarock       wall
+ROCK5      sockrock2      wall
+TANROCK2   iksans01       wall
+TANROCK3   iksans03       wall
+TANROCK4   iksans04       wall
+TANROCK5   iksans01       wall
+TANROCK7   iksans03       wall
+TANROCK8   iksans04       wall
+BFALL1     +0lvfall       wall
+BFALL2     +1lvfall       wall
+BFALL3     +2lvfall       wall
+BFALL4     +3lvfall       wall
+SFALL1     +0lvfall       wall
+SFALL2     +1lvfall       wall
+SFALL3     +2lvfall       wall
+SFALL4     +3lvfall       wall
+BLODRIP1   f3re           wall
+BLODRIP2   f3re2          wall
+BLODRIP3   f3re5          wall
+BLODRIP4   f3re           wall
+
+# ---------------------------------------------------------------------------
+# Startech / ICKWALL (Doom II)
+# ---------------------------------------------------------------------------
+ICKWALL1   ikbwall02      wall
+ICKWALL2   ikbwall04      wall
+ICKWALL3   ikbbrik8a      wall
+ICKWALL4   ikbbrik16b     wall
+ICKWALL5   ikbwall02      wall
+ICKWALL7   ikbbrik32a     wall
+
+# ---------------------------------------------------------------------------
+# Flats — floors & ceilings
+# ---------------------------------------------------------------------------
+FLOOR0_1   ikbflr01       flat
+FLOOR0_2   ikbflr02       flat
+FLOOR0_3   floor3         flat
+FLOOR0_5   floor6         flat
+FLOOR0_6   floor23        flat
+FLOOR0_7   floor28        flat
+FLOOR1_1   floor37        flat
+FLOOR1_6   floor39        flat
+FLOOR1_7   ikbflr01       flat
+FLOOR3_3   sockrockfloor1 flat
+FLOOR4_1   ikbflr02       flat
+FLOOR4_5   floor3         flat
+FLOOR4_6   floor6         flat
+FLOOR4_8   floor23        flat
+FLOOR5_1   floor28        flat
+FLOOR5_2   floor37        flat
+FLOOR5_3   floor39        flat
+FLOOR5_4   ikbflr01       flat
+FLOOR6_1   floor3         flat
+FLOOR6_2   floor6         flat
+FLOOR7_1   sockrockfloor1 flat
+FLOOR7_2   floor23        flat
+CEIL1_1    ikbflr02       flat
+CEIL1_2    floor28        flat
+CEIL1_3    floor37        flat
+CEIL3_1    ikbflr01       flat
+CEIL3_2    floor39        flat
+CEIL3_3    floor3         flat
+CEIL3_4    floor6         flat
+CEIL3_5    floor23        flat
+CEIL3_6    floor28        flat
+CEIL4_1    ikbflr02       flat
+CEIL4_2    floor37        flat
+CEIL4_3    floor39        flat
+CEIL5_1    ikbflr01       flat
+CEIL5_2    floor3         flat
+FLAT1      floor23        flat
+FLAT2      floor28        flat
+FLAT3      floor37        flat
+FLAT4      floor39        flat
+FLAT5      sockrockfloor1 flat
+FLAT8      floor3         flat
+FLAT9      floor6         flat
+FLAT10     floor23        flat
+FLAT14     floor28        flat
+FLAT17     floor37        flat
+FLAT18     floor39        flat
+FLAT19     ikbflr01       flat
+FLAT20     ikbflr02       flat
+FLAT22     floor3         flat
+FLAT23     floor6         flat
+FLAT5_1    floor23        flat
+FLAT5_2    floor28        flat
+FLAT5_3    floor37        flat
+FLAT5_4    floor39        flat
+FLAT5_5    ikbflr01       flat
+FLAT5_6    ikbflr02       flat
+FLAT5_7    floor3         flat
+FLAT5_8    floor6         flat
+MFLR8_1    floor3         flat
+MFLR8_2    floor6         flat
+MFLR8_3    floor23        flat
+MFLR8_4    floor28        flat
+DEM1_1     ikbflr01       flat
+DEM1_2     ikbflr02       flat
+DEM1_5     ikbflr01       flat
+DEM1_6     ikbflr02       flat
+CRATOP1    crt1f          flat
+CRATOP2    crt1f          flat
+COMP01     ikgrlit2       flat
+CONS1_1    const4         flat
+CONS1_5    const6         flat
+CONS1_7    const8         flat
+GRNROCK    sockrockfloor1 flat
+GRASS1     sockrockfloor1 flat
+GRASS2     sockrockfloor1 flat
+RROCK01    lavarock       flat
+RROCK02    lavasand       flat
+RROCK03    sockrockfloor1 flat
+RROCK04    lavarock       flat
+RROCK05    lavasand       flat
+RROCK09    sockrockfloor1 flat
+RROCK10    lavarock       flat
+RROCK11    lavasand       flat
+RROCK12    sockrockfloor1 flat
+RROCK13    lavarock       flat
+RROCK14    lavasand       flat
+RROCK16    sockrockfloor1 flat
+RROCK17    lavarock       flat
+RROCK18    lavasand       flat
+RROCK19    sockrockfloor1 flat
+RROCK20    lavarock       flat
+NUKAGE1    lavasand       flat
+NUKAGE2    lavasand       flat
+NUKAGE3    lavasand       flat
+SLIME01    lavasand       flat
+SLIME02    lavasand       flat
+SLIME03    lavasand       flat
+SLIME04    lavasand       flat
+SLIME05    lavarock       flat
+SLIME06    lavarock       flat
+SLIME07    lavarock       flat
+SLIME08    lavarock       flat
+SLIME09    lavarock       flat
+SLIME13    lavarock       flat
+LAVA1      lavarock       flat
+LAVA2      lavarock       flat
+LAVA3      lavarock       flat
+LAVA4      lavarock       flat
+BLOOD1     lavarock       flat
+BLOOD2     lavarock       flat
+BLOOD3     lavarock       flat
+FWATER1    ice23          flat
+FWATER2    ice23          flat
+FWATER3    ice23          flat
+FWATER4    ice23          flat
+STEP1      plat_stem1     flat
+STEP2      plat_stem7     flat
+TLITE6_1   ikgrlit2       flat
+TLITE6_4   ikgrlit2       flat
+TLITE6_5   ikgrlit2       flat
+TLITE6_6   ikgrlit2       flat
+GATE1      ikbflr02       flat
+GATE2      ikbflr02       flat
+GATE3      ikbflr01       flat
+GATE4      ikbflr01       flat

@@ -17,10 +17,15 @@ func Build(lvl *wad.Level) (Node, error) {
 		return nil, fmt.Errorf("bsp: level %q has no NODES lump", lvl.Name)
 	}
 	root := uint16(len(lvl.Nodes) - 1)
-	return buildNode(lvl, root)
+	// seen guards against a malformed NODES lump (the file picker accepts
+	// any user-supplied WAD) whose child pointers form a cycle or a DAG:
+	// a vanilla tree visits every inner node exactly once, so a repeat
+	// visit means the data isn't a tree and would otherwise recurse
+	// forever / blow the stack rather than fail cleanly.
+	return buildNode(lvl, root, make([]bool, len(lvl.Nodes)))
 }
 
-func buildNode(lvl *wad.Level, index uint16) (Node, error) {
+func buildNode(lvl *wad.Level, index uint16, seen []bool) (Node, error) {
 	if index&wad.SubsectorBit != 0 {
 		ssIdx := int(index &^ wad.SubsectorBit)
 		if ssIdx >= len(lvl.Subsectors) {
@@ -32,13 +37,17 @@ func buildNode(lvl *wad.Level, index uint16) (Node, error) {
 	if int(index) >= len(lvl.Nodes) {
 		return nil, fmt.Errorf("bsp: node index %d out of range (level has %d)", index, len(lvl.Nodes))
 	}
+	if seen[index] {
+		return nil, fmt.Errorf("bsp: NODES lump is not a tree — node %d reached more than once", index)
+	}
+	seen[index] = true
 	raw := lvl.Nodes[index]
 
-	right, err := buildNode(lvl, raw.RightChild)
+	right, err := buildNode(lvl, raw.RightChild, seen)
 	if err != nil {
 		return nil, err
 	}
-	left, err := buildNode(lvl, raw.LeftChild)
+	left, err := buildNode(lvl, raw.LeftChild, seen)
 	if err != nil {
 		return nil, err
 	}

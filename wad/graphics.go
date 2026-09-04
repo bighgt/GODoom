@@ -34,23 +34,6 @@ func LoadPlaypal(b []byte) ([]Palette, error) {
 	return palettes, nil
 }
 
-// Colormap is one of the 34 light/effect shading tables in the COLORMAP
-// lump: 256 palette-index -> palette-index remaps, one per light level.
-type Colormap [256]byte
-
-// LoadColormap decodes the COLORMAP lump.
-func LoadColormap(b []byte) ([]Colormap, error) {
-	if len(b) == 0 || len(b)%256 != 0 {
-		return nil, fmt.Errorf("wad: COLORMAP size %d is not a multiple of 256 bytes", len(b))
-	}
-	n := len(b) / 256
-	maps := make([]Colormap, n)
-	for i := 0; i < n; i++ {
-		copy(maps[i][:], b[i*256:i*256+256])
-	}
-	return maps, nil
-}
-
 // Patch is a decoded Doom "picture" — the column-major, run-length-encoded
 // graphic format used for wall textures, sprites, and UI elements. Pixels
 // hold palette indices; -1 marks a transparent (unset) pixel.
