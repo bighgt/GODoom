@@ -41,7 +41,6 @@ const (
 	NSColormaps
 	NSVoxels
 	NSModels
-	NSOther
 )
 
 func (n Namespace) String() string {

@@ -166,8 +166,6 @@ const (
 	SPR_POB2
 	SPR_BRS1
 	SPR_FCAN
-
-	SPR_NumSprites
 )
 
 // spriteNames is the WAD 4-letter prefix for each spriteNum, aligned with
