@@ -58,3 +58,7 @@
 # Personal working notes on porting GZDoom/UZDoom features — local scratch
 # log, not meant for the public repo.
 /uzdoom-recommendations.md
+
+# Claude Code project settings (permission allowlists with local machine
+# paths) — local dev tooling config, not meant for the public repo.
+/.claude/
