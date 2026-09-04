@@ -279,12 +279,14 @@ type Game struct {
 	// etc. must not trigger a rebuild.
 	geomHeights []int16
 	dbgHWFrames int // rate-limits the hardware-path dynamic-light diagnostic
-	// lightScale / exposure are config lightScale / exposure, forwarded into
-	// every render.Frame (buildFrame) for the enhanced pipeline. lightScale
-	// is also handed to the vanilla path via raster.SetLightScale in
-	// cmd/engine, so this copy is only read on the enhanced path.
-	lightScale float32
-	exposure   float32
+	// lightScale / ambientLight / exposure are config lightScale /
+	// ambientLight / exposure, forwarded into every render.Frame (buildFrame)
+	// for the enhanced pipeline. lightScale and ambientLight are also handed
+	// to the hardware path via raster.SetLightScale / raster.SetAmbientLight
+	// in cmd/engine, so these copies are only read on the enhanced path.
+	lightScale   float32
+	ambientLight float32
+	exposure     float32
 	// Distance fog (config fogColor / fogDensity), 0..1 colour + density.
 	// Fed to every render path: buildFrame -> render.Frame (enhanced),
 	// worldgeo.Camera (hardware), raster.SetFog (vanilla, via cmd/engine).
@@ -504,6 +506,7 @@ func NewGame(win *window.Window, renderer render.Renderer, ras *raster.Renderer,
 		MaxFPS:               cfg.MaxFPS,
 		LitMode:              cfg.LightingMode == config.LightingEnhanced,
 		lightScale:           float32(cfg.LightScale),
+		ambientLight:         float32(cfg.AmbientLight),
 		exposure:             float32(cfg.Exposure),
 		shadows:              cfg.Shadows,
 		groundShadows:        cfg.GroundShadows,

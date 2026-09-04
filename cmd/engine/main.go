@@ -171,6 +171,7 @@ func run() error {
 
 	ras := raster.New(textures, renderW, renderH)
 	raster.SetLightScale(cfg.LightScale)
+	raster.SetAmbientLight(cfg.AmbientLight)
 	ras.SetHUDScale(cfg.HUDScale)
 	ras.SetWeaponScale(cfg.WeaponScale)
 	ras.SetTextureQuality(cfg.TextureQuality)

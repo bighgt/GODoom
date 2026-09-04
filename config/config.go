@@ -203,6 +203,16 @@ type Config struct {
 	// darker (0.75, the default, is a deliberately moodier baseline than
 	// vanilla Doom), higher washes the map out. Clamped to [0.1, 2.0].
 	LightScale float64 `json:"lightScale"`
+	// AmbientLight is a minimum brightness floor applied after LightScale
+	// and every dynamic light are summed, in the enhanced and hardware
+	// pipelines: a fully-shadowed surface never reads darker than this
+	// fraction of its real texture colour, so a pitch-black sector stays
+	// legible even with no torches nearby and the flashlight off. 0 (off)
+	// reproduces the old crush-to-near-black behaviour; higher values trade
+	// moodiness for visibility. Default 0.2, clamped to [0, 1]. Ignored by
+	// the vanilla pipeline (which has no dynamic lights and its own,
+	// non-configurable colormap floor).
+	AmbientLight float64 `json:"ambientLight"`
 	// Exposure is a final multiply on the enhanced pipeline's HDR colour
 	// just before the tonemap — the knob to pull the whole image up or down
 	// after LightScale and the emitters have been summed. 1.0 default,
@@ -298,10 +308,12 @@ const (
 
 // Lighting bounds.
 const (
-	MinLightScale = 0.1
-	MaxLightScale = 2.0
-	MinExposure   = 0.1
-	MaxExposure   = 4.0
+	MinLightScale   = 0.1
+	MaxLightScale   = 2.0
+	MinExposure     = 0.1
+	MaxExposure     = 4.0
+	MinAmbientLight = 0.0
+	MaxAmbientLight = 1.0
 )
 
 // WeaponVolume bounds (a linear multiplier on weapon sound loudness).
@@ -364,6 +376,7 @@ func Default() Config {
 		LightingMode:         LightingEnhanced,
 		Renderer:             RendererSoftware,
 		LightScale:           0.75,
+		AmbientLight:         0.2,
 		Exposure:             1.0,
 		Shadows:              true,
 		GroundShadows:        false,
@@ -682,6 +695,16 @@ func (c Config) repaired() Config {
 		log.Printf("config: lightScale %.2f out of [%.2f, %.2f], using %.2f",
 			c.LightScale, MinLightScale, MaxLightScale, d.LightScale)
 		c.LightScale = d.LightScale
+	}
+
+	if c.AmbientLight < MinAmbientLight || c.AmbientLight > MaxAmbientLight {
+		log.Printf("config: ambientLight %.2f out of [%.2f, %.2f], clamping",
+			c.AmbientLight, MinAmbientLight, MaxAmbientLight)
+		if c.AmbientLight < MinAmbientLight {
+			c.AmbientLight = MinAmbientLight
+		} else {
+			c.AmbientLight = MaxAmbientLight
+		}
 	}
 
 	if c.Exposure == 0 {

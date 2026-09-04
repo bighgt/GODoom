@@ -238,3 +238,21 @@ const LightScaleRef = wallScaleRef
 // LightScaleValue reports lightScale (config lightScale) so a hardware
 // renderer can pass it to its shader as a uniform.
 func LightScaleValue() float64 { return lightScale }
+
+// ambientLight is config ambientLight (section 17): a minimum brightness
+// floor the enhanced/hardware pipelines apply after the sector fade and
+// every dynamic light are summed. The vanilla colormap path ignores it —
+// see Config.AmbientLight's doc for why.
+var ambientLight = 0.0
+
+// SetAmbientLight sets the global ambient-light floor. Config already
+// clamps to [0, 1]; negative values are ignored defensively.
+func SetAmbientLight(v float64) {
+	if v >= 0 {
+		ambientLight = v
+	}
+}
+
+// AmbientLightValue reports ambientLight (config ambientLight) so a
+// hardware renderer can pass it to its shader as a uniform.
+func AmbientLightValue() float64 { return ambientLight }

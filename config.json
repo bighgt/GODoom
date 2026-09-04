@@ -30,6 +30,8 @@
   "lightingMode": "enhanced",
   "//lightScale": "0.1 .. 2.0  —  multiplies every sector's authored light before shading; lower = darker (default 0.75)",
   "lightScale": 0.50,
+  "//ambientLight": "0.0 .. 1.0  —  minimum brightness floor applied after lightScale and every dynamic light are summed (enhanced/hardware only): a fully-shadowed surface never reads darker than this fraction of its real texture colour, so dark rooms stay legible even with no torches nearby and the flashlight off. 0 = old crush-to-near-black behaviour (default 0.2)",
+  "ambientLight": 0.30,
   "//exposure": "0.1 .. 4.0  —  final multiply on the enhanced pipeline's HDR colour before the tonemap; ignored by vanilla mode (default 1.0)",
   "exposure": 1.0,
   "//shadows": "true | false  —  enhanced pipeline's screen-space shadows for the nearest dynamic lights; no effect in vanilla mode (default true)",

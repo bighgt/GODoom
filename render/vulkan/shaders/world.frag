@@ -32,7 +32,7 @@ const int SHADOW_MAX = 24; // keep == vulkan.shadowCasterMax and engine.hwGround
 layout(set = 1, binding = 2) uniform World {
     vec4 cam;      // sinA, cosA, focal, camX
     vec4 screen;   // width, height, skyPixPerTurn, pitchShear
-    vec4 light;    // lightScale, extraLight, scaleRef, lutLevels
+    vec4 light;    // lightScale, extraLight, scaleRef, ambientLight
     vec4 nLights;  // x = active dynamic light count, y = water clock, zw = camY,camZ
     vec4 fog;      // rgb fog colour, w = density (0 = off)
     vec4 amb;      // rgb = sky-averaged hemisphere ambient, w = strength (0 = flat fallback)
@@ -405,7 +405,12 @@ void main() {
     // light.frag's model.
     float bmask = dot(texture(uBright, vUV).rgb, vec3(0.299, 0.587, 0.114));
     float litAmt = max(base, bmask);
-    // Ambient floor: a deep shadow settles toward a faint sky-tinted fill
+    // Ambient floor (config ambientLight, W.light.w): a fully-shadowed
+    // surface never reads darker than this fraction of its real texture
+    // colour — the actual visibility fix, distinct from the tint below.
+    // 0 reproduces the old behaviour.
+    litAmt = max(litAmt, W.light.w);
+    // Hemisphere tint: a deep shadow settles toward a faint sky-tinted fill
     // instead of crushing to pure black, so unlit corners read as "in
     // shadow" with some environment bounce rather than as void. Fades out
     // as the pixel lights up.

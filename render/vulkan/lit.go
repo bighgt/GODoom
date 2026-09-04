@@ -904,7 +904,9 @@ func (lr *litResources) upload(f *render.Frame, slot int) error {
 	scene[20], scene[21], scene[22], scene[23] = f.SpotX, f.SpotY, f.SpotZ, 1.0/(spotRad*spotRad)
 	scene[24], scene[25], scene[26], scene[27] = f.SpotDX, f.SpotDY, f.SpotDZ, f.SpotCosOuter
 	scene[28], scene[29], scene[30], scene[31] = f.SpotR, f.SpotG, f.SpotB, f.SpotIntensity
-	scene[32], scene[33], scene[34], scene[35] = f.SpotCosInner, 0, 0, 0
+	// spotCosInner.y carries AmbientLight (config ambientLight) — light.frag
+	// floors litAmt with it. z/w stay unused padding.
+	scene[32], scene[33], scene[34], scene[35] = f.SpotCosInner, f.AmbientLight, 0, 0
 
 	for i := 0; i < n; i++ {
 		b := litSceneHead + i*8

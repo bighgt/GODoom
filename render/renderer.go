@@ -95,14 +95,17 @@ type Frame struct {
 	// LightScale multiplies the per-pixel sector light level in the base
 	// ambient term (config lightScale); Exposure is a final multiply on the
 	// HDR colour before the tonemap (config exposure). Both default to 1.
-	// ShadowStrength (0..1, config shadows -> 0 or 1) blends in the
-	// screen-space occlusion march; ShadowLights is how many of the LEADING
-	// Lights entries actually get that march — the engine puts the few
-	// gameplay-critical dynamic lights (muzzle flash, in-flight shots)
+	// AmbientLight is a minimum brightness floor applied after LightScale and
+	// every dynamic light are summed (config ambientLight, default 0.2, 0 =
+	// old behaviour). ShadowStrength (0..1, config shadows -> 0 or 1) blends
+	// in the screen-space occlusion march; ShadowLights is how many of the
+	// LEADING Lights entries actually get that march — the engine puts the
+	// few gameplay-critical dynamic lights (muzzle flash, in-flight shots)
 	// first, so a normal frame with none firing marches nothing. The
 	// per-pixel-per-light-per-step cost of the march is why the static map
 	// emitters are excluded from it.
 	LightScale     float32
+	AmbientLight   float32
 	Exposure       float32
 	ShadowStrength float32
 	ShadowLights   int

@@ -38,7 +38,7 @@ layout(binding = 4) uniform Scene {
     vec4 spotPosRadius;      // xyz world pos, w = 1/radius^2
     vec4 spotDirCosOuter;    // xyz normalized direction, w = cos(outer half-angle)
     vec4 spotColorIntensity; // rgb colour, a intensity
-    vec4 spotCosInner;       // x = cos(inner half-angle), yzw unused
+    vec4 spotCosInner;       // x = cos(inner half-angle), y = ambientLight floor, zw unused
     GPULight lights[64];
 } S;
 
@@ -317,6 +317,11 @@ void main() {
     // small bloom kicker — not an unbounded add, which blew highlights out.
     float bright = texelFetch(uLightParam, ip, 0).g;
     float litAmt = max(baseFade, bright);
+
+    // Ambient floor (config ambientLight, S.spotCosInner.y): a fully-shadowed
+    // surface never reads darker than this fraction of its real texture
+    // colour — the actual visibility fix. 0 reproduces the old behaviour.
+    litAmt = max(litAmt, S.spotCosInner.y);
 
     // Cool ambient floor: a deep shadow settles toward a faint blue rather
     // than crushing to pure black — matches world.frag. Fades out as the

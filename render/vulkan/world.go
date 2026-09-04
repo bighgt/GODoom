@@ -86,8 +86,8 @@ type worldUBO struct {
 	SinA, CosA, Focal, CamX float32
 	// screen: width, height, skyPixPerTurn, pitchShear
 	Width, Height, SkyPixPerTurn, PitchShear float32
-	// light: lightScale, extraLight, scaleRef, lutLevels
-	LightScale, ExtraLight, ScaleRef, LUTLevels float32
+	// light: lightScale, extraLight, scaleRef, ambientLight
+	LightScale, ExtraLight, ScaleRef, AmbientLight float32
 	// nLights: x = active dynamic light count, y = water clock, z = camY, w = camZ
 	NLights, WaterClock, CamY, CamZ float32
 	// fog: rgb colour, w = density (0 = off)
@@ -101,21 +101,21 @@ type worldUBO struct {
 	// from lightPos/lightColor (isotropic point lights) because a beam
 	// needs a direction and cone angle neither carries. SpotIntensity <= 0
 	// means off.
-	SpotX, SpotY, SpotZ           float32
-	SpotInvR2                     float32 // 1/radius^2
-	SpotDX, SpotDY, SpotDZ        float32 // normalized
-	SpotCosOuter                  float32
-	SpotR, SpotG, SpotB           float32
-	SpotIntensity                 float32
-	SpotCosInner                  float32
-	spotPad0, spotPad1, spotPad2  float32
+	SpotX, SpotY, SpotZ          float32
+	SpotInvR2                    float32 // 1/radius^2
+	SpotDX, SpotDY, SpotDZ       float32 // normalized
+	SpotCosOuter                 float32
+	SpotR, SpotG, SpotB          float32
+	SpotIntensity                float32
+	SpotCosInner                 float32
+	spotPad0, spotPad1, spotPad2 float32
 }
 
 func (u worldUBO) floats() [worldUBOHead]float32 {
 	return [worldUBOHead]float32{
 		u.SinA, u.CosA, u.Focal, u.CamX,
 		u.Width, u.Height, u.SkyPixPerTurn, u.PitchShear,
-		u.LightScale, u.ExtraLight, u.ScaleRef, u.LUTLevels,
+		u.LightScale, u.ExtraLight, u.ScaleRef, u.AmbientLight,
 		u.NLights, u.WaterClock, u.CamY, u.CamZ,
 		u.FogR, u.FogG, u.FogB, u.FogDensity,
 		u.AmbR, u.AmbG, u.AmbB, u.AmbStrength,
@@ -215,7 +215,6 @@ type worldResources struct {
 
 	dbgLightLog int // rate-limits the one-off dynamic-light diagnostic
 
-	lutLevels     float32
 	lightScaleRef float32
 
 	// Hemisphere ambient tint, averaged from the level's sky bitmap once and
@@ -233,12 +232,10 @@ func NewWorld(win *window.Window, srcW, srcH int, vsync, debug bool) (*Renderer,
 	r := &Renderer{win: win, vsync: vsync, debug: debug, hw: true}
 	r.srcWidth, r.srcHeight = srcW, srcH // letterboxViewport reads these
 
-	lut := raster.BuildLightLUT()
 	r.wr = &worldResources{
 		w: srcW, h: srcH,
 		texCache:      make(map[*assets.RGBA]*worldTex),
 		voxCache:      make(map[*assets.VoxelModel]*voxelMesh),
-		lutLevels:     float32(lut.Levels),
 		lightScaleRef: float32(raster.LightScaleRef),
 	}
 
@@ -521,24 +518,24 @@ func (r *Renderer) uploadWorldFrame(sl *worldSlot, g *worldgeo.Geometry, cam wor
 		Height:        float32(wr.h),
 		SkyPixPerTurn: skyPPT,
 		// raster.horizonY = h/2 + tan(pitch)*focal — the sky's vertical anchor.
-		PitchShear: float32(math.Tan(cam.Pitch) * focal),
-		LightScale: float32(raster.LightScaleValue()),
-		ExtraLight: float32(raster.ExtraLight),
-		ScaleRef:   wr.lightScaleRef,
-		LUTLevels:  wr.lutLevels,
-		CamX:       float32(cam.X),
-		CamY:       float32(cam.Y),
-		CamZ:       float32(cam.Z),
-		NLights:    float32(n),
-		WaterClock: float32(cam.Time), // world.frag: W.nLights.y — animated-water clock (s)
-		FogR:       cam.FogR,
-		FogG:       cam.FogG,
-		FogB:       cam.FogB,
-		FogDensity: cam.FogDensity,
-		AmbR:       ambR,
-		AmbG:       ambG,
-		AmbB:       ambB,
-		AmbStrength: ambStr,
+		PitchShear:   float32(math.Tan(cam.Pitch) * focal),
+		LightScale:   float32(raster.LightScaleValue()),
+		ExtraLight:   float32(raster.ExtraLight),
+		ScaleRef:     wr.lightScaleRef,
+		AmbientLight: float32(raster.AmbientLightValue()),
+		CamX:         float32(cam.X),
+		CamY:         float32(cam.Y),
+		CamZ:         float32(cam.Z),
+		NLights:      float32(n),
+		WaterClock:   float32(cam.Time), // world.frag: W.nLights.y — animated-water clock (s)
+		FogR:         cam.FogR,
+		FogG:         cam.FogG,
+		FogB:         cam.FogB,
+		FogDensity:   cam.FogDensity,
+		AmbR:         ambR,
+		AmbG:         ambG,
+		AmbB:         ambB,
+		AmbStrength:  ambStr,
 	}
 	if cam.SpotIntensity > 0 {
 		rad := cam.SpotRadius
@@ -734,13 +731,13 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 	// toward +X/+Y) so god rays streak from a bright sky opening the player
 	// is roughly facing.
 	const (
-		ssrStrength     = 0.9
-		aoStrength      = 0.40 // deepest crease darkens ~40%; AO multiplies final light
-		aoRadius        = 48.0
-		aoBias          = 1.5
-		godrayStrength  = 0.35
-		sharpenStrength = 0.35 // CAS 0..1
-		ditherStrength  = 1.0  // +/- 1 LSB triangular-PDF, kills 8-bit banding
+		ssrStrength      = 0.9
+		aoStrength       = 0.40 // deepest crease darkens ~40%; AO multiplies final light
+		aoRadius         = 48.0
+		aoBias           = 1.5
+		godrayStrength   = 0.35
+		sharpenStrength  = 0.35              // CAS 0..1
+		ditherStrength   = 1.0               // +/- 1 LSB triangular-PDF, kills 8-bit banding
 		sunX, sunY, sunZ = 0.40, 0.30, 0.866 // |sun| == 1, ~60 deg elevation
 		// Screen-space dynamic-light shadows (worldblit.frag dynShadow):
 		// strength 0 disables. march = how far along the ray-to-light to

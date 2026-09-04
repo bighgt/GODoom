@@ -264,6 +264,7 @@ func (g *Game) buildFrame() *render.Frame {
 		OverlayH:       d.OverlayH,
 		ExtraLight:     0,
 		LightScale:     g.lightScale,
+		AmbientLight:   g.ambientLight,
 		Exposure:       g.exposure,
 		FogR:           g.fogR,
 		FogG:           g.fogG,
