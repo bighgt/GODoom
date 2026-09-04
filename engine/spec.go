@@ -408,6 +408,9 @@ func (g *Game) evTeleport(lineIdx int, mo *Mobj, monsterOnly bool) bool {
 	if mo == nil || (monsterOnly && mo == g.playerMobj) {
 		return false
 	}
+	if mo.TeleportFreeze > 0 {
+		return false
+	}
 	tag := g.Level.Linedefs[lineIdx].SectorTag
 	tags := map[int]bool{}
 	for _, s := range g.findSectorsFromTag(tag) {
@@ -447,6 +450,7 @@ func (g *Game) evTeleport(lineIdx int, mo *Mobj, monsterOnly bool) bool {
 		}
 		g.P_SpawnMobj(dest.X, dest.Y, float64(ds.FloorHeight), MT_TFOG)
 		g.playWorldSound("DSTELEPT")
+		mo.TeleportFreeze = teleportFreezeTics
 		return true
 	}
 	return false

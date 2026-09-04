@@ -49,8 +49,22 @@ type Mobj struct {
 	ReactionTime int
 	Threshold    int
 
+	// TeleportFreeze counts down from teleportFreezeTics after this mobj
+	// lands on a teleporter (evTeleport), ticking to 0 in mobjTick. While
+	// it's positive, evTeleport refuses to teleport it again — some pads
+	// sit hard against another teleport line (or their own, if it's boxed
+	// in on every side), and without this a mobj could get bounced right
+	// back where it came from the instant it lands, with no window to walk
+	// clear; for the player that reads as "stuck".
+	TeleportFreeze int
+
 	removed bool
 }
+
+// teleportFreezeTics is how long a just-landed mobj is immune to being
+// teleported again — long enough to walk off a cramped landing pad, short
+// enough not to block a map's deliberate back-to-back teleporter chain.
+const teleportFreezeTics = 18 // 1/2 second at 35 tics/sec
 
 // Z-spawn sentinels (id's ONFLOORZ / ONCEILINGZ).
 const (
@@ -154,6 +168,10 @@ func (g *Game) mobjTick(mo *Mobj) {
 	// Snapshot the pre-move state for this tic so the renderer can draw
 	// between it and wherever this tic leaves the mobj (see interp.go).
 	mo.prevX, mo.prevY, mo.prevZ, mo.prevAngle = mo.X, mo.Y, mo.Z, mo.Angle
+
+	if mo.TeleportFreeze > 0 {
+		mo.TeleportFreeze--
+	}
 
 	switch {
 	case mo.Flags&MF_MISSILE != 0:
