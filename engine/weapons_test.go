@@ -33,6 +33,95 @@ func TestWeaponBobXScalesWithSpeedAndStaysBounded(t *testing.T) {
 	}
 }
 
+// TestWeaponBobPhaseSpeedTracksMovement: the sway's own cycle speed (not
+// just its width) scales with how fast the player is moving — frozen at
+// rest, full rate at top speed, roughly double at half speed vs. quarter.
+func TestWeaponBobPhaseSpeedTracksMovement(t *testing.T) {
+	g := &Game{Weapon: WeaponState{Current: wpPistol, phase: weaponReady, pending: -1}}
+
+	// dt kept small enough that even top speed's increment stays well under
+	// the 2*pi wrap — comparing the wrapped bobPhase values directly only
+	// makes sense within one cycle.
+	const dt = 0.1
+
+	g.updateWeapon(dt)
+	if g.Weapon.bobPhase != 0 {
+		t.Errorf("standing still: bobPhase advanced to %.4f, want frozen at 0", g.Weapon.bobPhase)
+	}
+
+	g.VelX, g.VelY = moveTopSpeed/4, 0
+	g.updateWeapon(dt)
+	quarterSpeedPhase := g.Weapon.bobPhase
+	if quarterSpeedPhase <= 0 {
+		t.Fatalf("quarter speed: bobPhase = %.4f, want > 0", quarterSpeedPhase)
+	}
+
+	g2 := &Game{Weapon: WeaponState{Current: wpPistol, phase: weaponReady, pending: -1}}
+	g2.VelX, g2.VelY = moveTopSpeed/2, 0
+	g2.updateWeapon(dt)
+	halfSpeedPhase := g2.Weapon.bobPhase
+
+	if halfSpeedPhase <= quarterSpeedPhase {
+		t.Errorf("half speed advanced the sway phase less than quarter speed: %.4f <= %.4f", halfSpeedPhase, quarterSpeedPhase)
+	}
+	if math.Abs(halfSpeedPhase-2*quarterSpeedPhase) > 1e-9 {
+		t.Errorf("bobPhase should scale linearly with speed: half-speed %.4f, want ~2x quarter-speed %.4f", halfSpeedPhase, quarterSpeedPhase)
+	}
+}
+
+// TestWeaponBobYRisesTwicePerSwayCycleAndNeverDips: the vertical bob is 0
+// standing still, never negative (it only ever rises above rest), and
+// completes two rise-and-settle cycles for every one full horizontal sway
+// (a quarter horizontal sway is a half vertical cycle — its peak).
+func TestWeaponBobYRisesTwicePerSwayCycleAndNeverDips(t *testing.T) {
+	g := &Game{Weapon: WeaponState{bobPhase: 0}}
+	if by := g.weaponBobY(); by != 0 {
+		t.Errorf("phase 0: bobY = %.3f, want 0", by)
+	}
+
+	g.VelX, g.VelY = moveTopSpeed, 0
+
+	for _, phase := range []float64{0, math.Pi / 2, math.Pi, 3 * math.Pi / 2} {
+		g.Weapon.bobPhase = phase
+		if by := g.weaponBobY(); by < 0 {
+			t.Errorf("phase %.2f: bobY = %.3f, want >= 0 (never dips below rest)", phase, by)
+		}
+	}
+
+	// A quarter horizontal cycle (phase = pi/4) is where sin(2*phase) peaks
+	// at 1 — the vertical bob's first rise, at the top of its range.
+	g.Weapon.bobPhase = math.Pi / 4
+	if by := g.weaponBobY(); math.Abs(by-weaponBobMaxY) > 1e-9 {
+		t.Errorf("phase pi/4 (moving at top speed): bobY = %.3f, want peak %.3f", by, weaponBobMaxY)
+	}
+}
+
+// TestWeaponBobScaleClosestAtCentreFarthestAtExtremes: the toward/away-
+// from-camera size swing is neutral (1) at rest, biggest (closest) at
+// phase 0 (dead centre of the sway), and smallest (farthest) at phase
+// pi/2 (the sway's side extreme) — the "half circular" arc: swinging out
+// recedes, swinging back re-centres and grows close again.
+func TestWeaponBobScaleClosestAtCentreFarthestAtExtremes(t *testing.T) {
+	g := &Game{Weapon: WeaponState{bobPhase: 0}}
+	if s := g.weaponBobScale(); s != 1 {
+		t.Errorf("standing still: bobScale = %.4f, want 1 (no size change at rest)", s)
+	}
+
+	g.VelX, g.VelY = moveTopSpeed, 0
+
+	g.Weapon.bobPhase = 0
+	centre := g.weaponBobScale()
+	if math.Abs(centre-(1+weaponBobDepth)) > 1e-9 {
+		t.Errorf("centre of sway: bobScale = %.4f, want peak %.4f (closest)", centre, 1+weaponBobDepth)
+	}
+
+	g.Weapon.bobPhase = math.Pi / 2
+	extreme := g.weaponBobScale()
+	if math.Abs(extreme-(1-weaponBobDepth)) > 1e-9 {
+		t.Errorf("side extreme: bobScale = %.4f, want trough %.4f (farthest)", extreme, 1-weaponBobDepth)
+	}
+}
+
 // TestChainsawIdleAndFiringFrames: the running chainsaw's viewmodel should
 // vibrate on SAWG C/D while idle (id's S_SAW/S_SAWB) and grind on SAWG A/B
 // while firing (S_SAW1/S_SAW2) — not sit on a static 'A'.

@@ -284,28 +284,73 @@ var Weapons = [numWeapons]WeaponDef{
 // 96/6 = 16 tics to fully raise or lower.
 const weaponRaiseSpeed = ticsPerSecond / 16.0
 
-// Weapon bob: a small side-to-side sway of the viewmodel while walking,
-// like a held object swinging slightly with each step. bobCycleHz is the
-// sway's phase rate (constant — a slow walk and a run swing at the same
-// tempo, they just differ in how far); weaponBobMaxX is the sway's full
-// amplitude in HUD pixels (raster/weapon.go's 320x200 space) at top speed,
-// deliberately small ("not dramatic" per the brief this was ported from).
+// Weapon bob: a side-to-side sway, an up-and-down bob, and a slight
+// toward/away-from-camera motion, all of the viewmodel while walking — like
+// a held object swinging on an arc with each step rather than sliding flat
+// left-right. How WIDE/HIGH/CLOSE it gets and how FAST it cycles both track
+// the player's actual speed (0 standing still, full bobCycleHz/
+// weaponBobMaxX/weaponBobMaxY/weaponBobDepth at moveTopSpeed) — a run
+// doesn't just move further than a walk, it cycles quicker too, the way a
+// faster stride actually looks.
+//
+// All three motions share bobPhase (see updateWeapon), just at different
+// multiples of it, which is what turns three independent sine waves into
+// one coherent arc instead of three unrelated wobbles:
+//   - X (weaponBobX):     sin(phase)          — side to side.
+//   - Y (weaponBobY):     abs(sin(2*phase))   — up, twice a cycle, never down.
+//   - scale (weaponBobScale): cos(2*phase)    — closest at dead centre
+//     (moving fastest sideways), farthest at each side's extreme (paused
+//     an instant before swinging back) — so the RETURN half of every swing
+//     reads as the gun coming back toward the camera as it re-centres, the
+//     "half circular" arc this was asked to trace rather than a flat slide.
 const (
-	bobCycleHz    = 3.5
-	weaponBobMaxX = 2.5
+	bobCycleHz     = 0.7  // side-to-side sway cycles/sec at top speed
+	weaponBobMaxX  = 12.0 // sway's full horizontal amplitude in HUD pixels (raster/weapon.go's 320x200 space) at top speed
+	weaponBobMaxY  = 5.0  // bob's full vertical amplitude, same pixel space
+	weaponBobDepth = 0.06 // toward/away-from-camera size swing, +/- a fraction of the gun's normal size
 )
+
+// moveSpeedFrac is the player's current horizontal speed as a 0..1 fraction
+// of moveTopSpeed, clamped so a speed boost (e.g. a ledge-launch) can't
+// push weapon bob past its intended range.
+func (g *Game) moveSpeedFrac() float64 {
+	f := math.Hypot(g.VelX, g.VelY) / moveTopSpeed
+	if f > 1 {
+		f = 1
+	}
+	return f
+}
 
 // weaponBobX is the current horizontal sway offset (HUD pixels,
 // raster/weapon.go's 320x200 space): a sine wave whose amplitude scales
-// with how fast the player is actually moving (0 standing still, full
-// weaponBobMaxX at moveTopSpeed) so the gun sits dead still at rest and
-// sways gently while walking.
+// with moveSpeedFrac, so the gun sits dead still at rest and sways with
+// increasing width up to weaponBobMaxX at a run. The sway's own phase (see
+// updateWeapon) is advanced by that same fraction, so the cycle itself
+// speeds up right along with it — standing still freezes the phase as well
+// as zeroing the amplitude, rather than a silent sine wave ticking away at
+// full speed underneath a 0-width sway.
 func (g *Game) weaponBobX() float64 {
-	speedFrac := math.Hypot(g.VelX, g.VelY) / moveTopSpeed
-	if speedFrac > 1 {
-		speedFrac = 1
-	}
-	return weaponBobMaxX * speedFrac * math.Sin(g.Weapon.bobPhase)
+	return weaponBobMaxX * g.moveSpeedFrac() * math.Sin(g.Weapon.bobPhase)
+}
+
+// weaponBobY is the current vertical bob offset (same HUD pixel space,
+// positive = risen above rest — see raster.DrawWeapon): abs(sin(2*phase))
+// so it rises and settles twice per horizontal sway cycle (once per
+// footfall) and never dips below the weapon's resting position, scaled by
+// the same moveSpeedFrac as weaponBobX.
+func (g *Game) weaponBobY() float64 {
+	return weaponBobMaxY * g.moveSpeedFrac() * math.Abs(math.Sin(2*g.Weapon.bobPhase))
+}
+
+// weaponBobScale is the current toward/away-from-camera size multiplier
+// (1 = normal, raster.DrawWeapon's bobScale): cos(2*phase) so the gun is
+// biggest (closest) every time the sway passes back through centre and
+// smallest (farthest) at each side's extreme, tracing the "half circular"
+// arc described above rather than a flat left-right slide. Scaled by
+// moveSpeedFrac like the other two, so it's exactly 1 (no size change) at
+// rest.
+func (g *Game) weaponBobScale() float64 {
+	return 1 + weaponBobDepth*g.moveSpeedFrac()*math.Cos(2*g.Weapon.bobPhase)
 }
 
 type weaponPhase int
@@ -567,7 +612,7 @@ func (g *Game) playerAimSlope() float64 {
 func (g *Game) updateWeapon(dt float64) {
 	w := &g.Weapon
 	w.idleTics += dt * ticsPerSecond // free-running, drives the IdleFrames loop
-	w.bobPhase += dt * bobCycleHz * 2 * math.Pi
+	w.bobPhase += dt * bobCycleHz * 2 * math.Pi * g.moveSpeedFrac()
 	if w.bobPhase >= 2*math.Pi {
 		w.bobPhase = math.Mod(w.bobPhase, 2*math.Pi)
 	}

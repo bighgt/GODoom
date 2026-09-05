@@ -205,5 +205,5 @@ func (r *Renderer) blitSprite(name string, x, y int) {
 // Thin wrapper around the shared blit (blit.go), which every sprite draw
 // in this package (and DrawWeapon's own non-offset variant) goes through.
 func (r *Renderer) blitSpriteImage(sp *assets.RGBA, x, y int) {
-	r.blit(sp, x, y, true, 256, false) // status-bar transform (obeys hudScale)
+	r.blit(sp, x, y, true, 256, false, 1) // status-bar transform (obeys hudScale)
 }

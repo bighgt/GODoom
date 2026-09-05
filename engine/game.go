@@ -678,7 +678,7 @@ func (g *Game) renderFrame() error {
 		// the way vanilla shades a psprite (the muzzle flash stays full
 		// bright).
 		g.Raster.DrawWeapon(def.SpritePrefix, gunFrame, def.FlashPrefix, flashFrame, hasFlash, g.Weapon.Offset,
-			g.weaponBobX(), g.spriteSectorLight(g.Camera.X, g.Camera.Y))
+			g.weaponBobX(), g.weaponBobY(), g.weaponBobScale(), g.spriteSectorLight(g.Camera.X, g.Camera.Y))
 		if g.Crosshair != "" && g.Crosshair != "off" {
 			g.Raster.DrawCrosshair(g.Crosshair, g.CrosshairSize)
 		}

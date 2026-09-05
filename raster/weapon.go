@@ -7,6 +7,20 @@ import "fmt"
 // sprite's height, so "fully lowered" reads as fully offscreen.
 const weaponDropPx = 300
 
+// weaponBottomOverlap pushes the gun's resting position slightly further
+// down than its own bounding box strictly requires, so it hangs a little
+// off the bottom of the screen instead of sitting exactly flush with it.
+// Two things otherwise open a visible gap under the gun there: many
+// weapon sprites (especially third-party HD packs, which don't all agree
+// on how much transparent padding to leave below the drawn pixels) don't
+// actually reach the bottom row of their own bounding box; and
+// engine.Game.weaponBobY lifts the gun UP from its resting position while
+// walking, which would crack a gap open on its own even with a perfectly
+// tight sprite. Comfortably bigger than weaponBobMaxY so the bob's rise
+// never uncovers it — the extra pixels are simply clipped by blit's normal
+// off-screen check, the same as the lowered-weapon travel below.
+const weaponBottomOverlap = 20
+
 // DrawWeapon draws the current weapon's viewmodel sprite at gunFrame
 // (e.g. 'A' -> spritePrefix+"A0"), bottom-anchored and horizontally
 // centered by its own pixel dimensions, and — when hasFlash is true — the
@@ -16,10 +30,12 @@ const weaponDropPx = 300
 // them off the real per-weapon animation timing ported from id's info.c
 // (see engine/weapons.go) — this function only draws whatever frame it's
 // told to. raiseOffset is 0 (fully raised/ready) to 1 (fully lowered/
-// offscreen) — see engine.WeaponState.Offset. bobX is a small side-to-side
-// walking sway in the same HUD pixel space — see engine.Game.weaponBobX —
-// applied to the gun only; the flash then rides along with it since its
-// own position is computed relative to the gun's.
+// offscreen) — see engine.WeaponState.Offset. bobX/bobY/bobScale are the
+// walking sway/bob/toward-camera-and-back motion, all in the same HUD
+// pixel space — see engine.Game.weaponBobX/weaponBobY/weaponBobScale —
+// applied to the gun only; the flash then rides along with it (in position;
+// it stays its own native size) since its own position is computed
+// relative to the gun's.
 //
 // The flash's placement deliberately does NOT use the general
 // hotspot-relative blit (blit.go's honorOffset) the status bar uses:
@@ -33,7 +49,7 @@ const weaponDropPx = 300
 // position plus the two sprites' offset delta — the same relative
 // alignment the original data intends, without needing to reproduce its
 // absolute projection math.
-func (r *Renderer) DrawWeapon(spritePrefix string, gunFrame byte, flashPrefix string, flashFrame byte, hasFlash bool, raiseOffset, bobX float64, sectorLight int16) {
+func (r *Renderer) DrawWeapon(spritePrefix string, gunFrame byte, flashPrefix string, flashFrame byte, hasFlash bool, raiseOffset, bobX, bobY, bobScale float64, sectorLight int16) {
 	gunSp, ok := r.textures.Sprite(spriteName(spritePrefix, gunFrame))
 	if !ok {
 		return
@@ -44,15 +60,22 @@ func (r *Renderer) DrawWeapon(spritePrefix string, gunFrame byte, flashPrefix st
 	// (fills the screen height) and the config hudScale — which sizes the
 	// status bar — does not shrink or grow it.
 	gunTPU := tpu(gunSp)
-	gunW := float64(gunSp.Width) / gunTPU
-	gunH := float64(gunSp.Height) / gunTPU
+	// bobScale (engine.Game.weaponBobScale) is applied to the gun's own
+	// footprint BEFORE centering it, so growing/shrinking it for the
+	// toward/away-from-camera motion keeps it centered horizontally and
+	// anchored to the same resting baseline rather than drifting off one
+	// corner as it scales.
+	gunW := float64(gunSp.Width) / gunTPU * bobScale
+	gunH := float64(gunSp.Height) / gunTPU * bobScale
 	gunX := int((hudLogicalW-gunW)/2 + bobX) // bobX: the walking side-to-side sway (engine.Game.weaponBobX)
-	gunY := int(hudLogicalH - gunH + raiseOffset*(gunH+weaponDropPx))
+	// bobY (engine.Game.weaponBobY) is subtracted, not added: positive bobY
+	// is "risen above rest", and Y grows downward in this pixel space.
+	gunY := int(hudLogicalH - gunH + weaponBottomOverlap + raiseOffset*(gunH+weaponDropPx) - bobY)
 	// The held weapon dims with the room it's in — id shades a psprite with
 	// spritelights[MAXLIGHTSCALE-1], the bright end of its sector's
 	// scalelight (see pspriteShade). The muzzle flash overlay stays full
 	// bright (it's an FF_FULLBRIGHT sprite that lights the gun, not lit by it).
-	r.blit(gunSp, gunX, gunY, false, pspriteShade(sectorLight, false), true) // weapon transform (ignores hudScale)
+	r.blit(gunSp, gunX, gunY, false, pspriteShade(sectorLight, false), true, bobScale) // weapon transform (ignores hudScale)
 
 	if !hasFlash {
 		return
@@ -62,9 +85,9 @@ func (r *Renderer) DrawWeapon(spritePrefix string, gunFrame byte, flashPrefix st
 		return
 	}
 	flashTPU := tpu(flashSp)
-	flashX := gunX + int(float64(gunSp.OffsetX)/gunTPU) - int(float64(flashSp.OffsetX)/flashTPU)
-	flashY := gunY + int(float64(gunSp.OffsetY)/gunTPU) - int(float64(flashSp.OffsetY)/flashTPU)
-	r.blit(flashSp, flashX, flashY, false, 256, true)
+	flashX := gunX + int(float64(gunSp.OffsetX)/gunTPU*bobScale) - int(float64(flashSp.OffsetX)/flashTPU)
+	flashY := gunY + int(float64(gunSp.OffsetY)/gunTPU*bobScale) - int(float64(flashSp.OffsetY)/flashTPU)
+	r.blit(flashSp, flashX, flashY, false, 256, true, 1)
 }
 
 func spriteName(prefix string, frame byte) string {

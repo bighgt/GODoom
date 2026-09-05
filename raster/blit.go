@@ -30,9 +30,14 @@ func tpu(sp *assets.RGBA) float64 {
 // weapon by the player's sector light (the status bar and HUD always pass
 // 256 — they're pure UI).
 //
+// scale multiplies the sprite's logical footprint (1 = native size);
+// DrawWeapon uses this for the weapon's toward/away-from-camera bob — a
+// value other than 1 just draws the same source pixels into a bigger or
+// smaller destination rect, an ordinary zoom, not a real depth change.
+//
 // Vanilla graphics are opaque-or-transparent, so transparent source texels
 // are simply skipped. Nearest sampling keeps the pixel-art look.
-func (r *Renderer) blit(sp *assets.RGBA, logicalX, logicalY int, honorOffset bool, shade uint32, weaponSpace bool) {
+func (r *Renderer) blit(sp *assets.RGBA, logicalX, logicalY int, honorOffset bool, shade uint32, weaponSpace bool, scale float64) {
 	tpu := sp.TexelsPerUnit
 	if tpu <= 0 {
 		tpu = 1
@@ -45,8 +50,8 @@ func (r *Renderer) blit(sp *assets.RGBA, logicalX, logicalY int, honorOffset boo
 		ly -= float64(sp.OffsetY) / tpu
 	}
 
-	// Logical footprint = the sprite's size in 1x (map/HUD) units.
-	dx0, dy0, dw, dh := r.hudRect(lx, ly, float64(sp.Width)/tpu, float64(sp.Height)/tpu, weaponSpace)
+	// Logical footprint = the sprite's size in 1x (map/HUD) units, scaled.
+	dx0, dy0, dw, dh := r.hudRect(lx, ly, float64(sp.Width)/tpu*scale, float64(sp.Height)/tpu*scale, weaponSpace)
 	if dw < 1 || dh < 1 {
 		return
 	}
