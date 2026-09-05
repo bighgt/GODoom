@@ -11,6 +11,7 @@ package worldgeo
 
 import (
 	"math"
+	"sort"
 
 	"twopointfive/assets"
 	"twopointfive/bsp"
@@ -80,12 +81,18 @@ type Vert struct {
 // backend binds Tex (nil = the sky texture) once and issues a single
 // vkCmdDraw of Count vertices starting at First. Runs are in Textures
 // order, sky last. Bright is the run's brightmap mask (nil = none — the
-// backend binds a black dummy), resolved once per texture like Tex.
+// backend binds a black dummy), resolved once per texture like Tex. Cell is
+// which visGrid cell this run's geometry belongs to (StaticDraws only — a
+// per-frame Draws run's Cell is always 0 and unused); see visgrid.go and
+// Builder.CullStats. It doesn't affect drawing today — every backend still
+// iterates every Draw every frame — it's Stage 1 of a visibility-culling
+// scoping pass, kept as plain data until (if) a Stage 2 ever reads it.
 type Draw struct {
 	Tex    *assets.RGBA
 	Bright *assets.RGBA
 	First  int
 	Count  int
+	Cell   int32
 }
 
 // Geometry splits the world into a static part (all the level's walls and
@@ -102,6 +109,12 @@ type Geometry struct {
 	StaticTris    []Vert
 	StaticDraws   []Draw
 	StaticVersion uint32 // bumped by New / Invalidate
+	// StaticDrawVisible is parallel to StaticDraws: whether Builder's last
+	// UpdateVisibility call found that draw's grid cell within the camera's
+	// view. A backend's colour pass skips a StaticDraws entry whose
+	// StaticDrawVisible is false; nil (before the first UpdateVisibility
+	// call) means "treat everything as visible" — see UpdateVisibility.
+	StaticDrawVisible []bool
 	// StaticOpaqueCount is the vertex index in StaticTris where the alpha-
 	// tested 2-sided middle textures begin (opaque walls/flats/sky come
 	// first). A backend depth pre-pass draws StaticTris[:StaticOpaqueCount]
@@ -183,11 +196,13 @@ type Builder struct {
 	tex     *assets.Textures
 	texID   map[*assets.RGBA]uint16
 	g       Geometry
-	polys   [][]bsp.Point     // per subsector: the closed flat polygon (nil for a few slivers)
-	fan     []bsp.Point       // reused scratch for the seg-fan fallback
-	buckets map[uint16][]Vert // opaque static: per texture slot (SkyTex for sky)
-	masked  map[uint16][]Vert // static KindMasked (2-sided middles): per texture slot
-	sprites map[uint16][]Vert // per texture slot, AddSprites billboards — reused across calls
+	polys   [][]bsp.Point            // per subsector: the closed flat polygon (nil for a few slivers)
+	fan     []bsp.Point              // reused scratch for the seg-fan fallback
+	grid    *visGrid                 // Stage 1 visibility-culling scoping — see visgrid.go
+	curCell int32                    // this subsector's grid cell, set once per emitSubsectorIdx call
+	buckets map[uint16]map[int32][]Vert // opaque static: per texture slot (SkyTex for sky), per grid cell
+	masked  map[uint16]map[int32][]Vert // static KindMasked (2-sided middles): per texture slot, per grid cell
+	sprites map[uint16][]Vert           // per texture slot, AddSprites billboards — reused across calls
 }
 
 // New binds a builder to a level. tex resolves texture / flat names to the
@@ -199,10 +214,11 @@ func New(lvl *wad.Level, tree bsp.Node, tex *assets.Textures) *Builder {
 		lvl: lvl, tree: tree, tex: tex,
 		texID:   make(map[*assets.RGBA]uint16),
 		polys:   bsp.SubsectorPolygons(tree, lvl),
-		buckets: make(map[uint16][]Vert),
-		masked:  make(map[uint16][]Vert),
+		buckets: make(map[uint16]map[int32][]Vert),
+		masked:  make(map[uint16]map[int32][]Vert),
 		sprites: make(map[uint16][]Vert),
 	}
+	b.grid = newLevelVisGrid(lvl)
 	// Resolve the per-map WAD sky (a wall texture named SKY1..4) once; a
 	// caller can still override it with a panorama via SetSky.
 	if sky, ok := tex.WallTexture(skyTextureForMap(lvl.Name)); ok && sky != nil {
@@ -212,50 +228,136 @@ func New(lvl *wad.Level, tree bsp.Node, tex *assets.Textures) *Builder {
 	return b
 }
 
+// newLevelVisGrid builds a visGrid spanning lvl's vertex bounds — the same
+// bounds-from-vertices pattern engine/collisiongrid.go's buildCollisionGrid
+// uses, just for a coarser purpose.
+func newLevelVisGrid(lvl *wad.Level) *visGrid {
+	minX, minY := float32(math.Inf(1)), float32(math.Inf(1))
+	maxX, maxY := float32(math.Inf(-1)), float32(math.Inf(-1))
+	for _, v := range lvl.Vertexes {
+		x, y := float32(v.X), float32(v.Y)
+		if x < minX {
+			minX = x
+		}
+		if x > maxX {
+			maxX = x
+		}
+		if y < minY {
+			minY = y
+		}
+		if y > maxY {
+			maxY = y
+		}
+	}
+	if minX > maxX { // no vertices at all — degenerate but shouldn't happen for a real level
+		minX, minY, maxX, maxY = 0, 0, 1, 1
+	}
+	return newVisGrid(minX, minY, maxX, maxY)
+}
+
 // Invalidate rebuilds the static world geometry (all subsectors' walls and
 // flats) and bumps StaticVersion so the backend re-uploads it. Call after a
 // door / lift / floor mover changes a sector's height — otherwise the
 // per-frame Build reuses the cached list untouched.
 func (b *Builder) Invalidate() {
-	for k := range b.buckets {
-		b.buckets[k] = b.buckets[k][:0]
+	for slot := range b.buckets {
+		for cell := range b.buckets[slot] {
+			b.buckets[slot][cell] = b.buckets[slot][cell][:0]
+		}
 	}
-	for k := range b.masked {
-		b.masked[k] = b.masked[k][:0]
+	for slot := range b.masked {
+		for cell := range b.masked[slot] {
+			b.masked[slot][cell] = b.masked[slot][cell][:0]
+		}
 	}
 	for i := range b.lvl.Subsectors {
 		b.emitSubsectorIdx(i)
 	}
 	// Concatenate into one triangle list: opaque per-texture runs, then the
 	// sky run, then (after StaticOpaqueCount) the alpha-tested 2-sided
-	// middle-texture runs. One Draw per run.
+	// middle-texture runs. One Draw per (texture, grid cell) run — see
+	// visgrid.go; this doesn't change what's drawn (every Draw is still
+	// submitted every frame), just how many Draw entries describe it.
 	b.g.StaticTris = b.g.StaticTris[:0]
 	b.g.StaticDraws = b.g.StaticDraws[:0]
 	for slot := uint16(0); int(slot) < len(b.g.Textures); slot++ {
-		bk := b.buckets[slot]
-		if len(bk) == 0 {
+		for _, cell := range sortedCells(b.buckets[slot]) {
+			bk := b.buckets[slot][cell]
+			if len(bk) == 0 {
+				continue
+			}
+			b.g.StaticDraws = append(b.g.StaticDraws, Draw{Tex: b.g.Textures[slot], Bright: b.g.Brightmaps[slot], First: len(b.g.StaticTris), Count: len(bk), Cell: cell})
+			b.g.StaticTris = append(b.g.StaticTris, bk...)
+		}
+	}
+	for _, cell := range sortedCells(b.buckets[SkyTex]) {
+		sky := b.buckets[SkyTex][cell]
+		if len(sky) == 0 {
 			continue
 		}
-		b.g.StaticDraws = append(b.g.StaticDraws, Draw{Tex: b.g.Textures[slot], Bright: b.g.Brightmaps[slot], First: len(b.g.StaticTris), Count: len(bk)})
-		b.g.StaticTris = append(b.g.StaticTris, bk...)
-	}
-	if sky := b.buckets[SkyTex]; len(sky) > 0 {
-		b.g.StaticDraws = append(b.g.StaticDraws, Draw{Tex: nil, First: len(b.g.StaticTris), Count: len(sky)})
+		b.g.StaticDraws = append(b.g.StaticDraws, Draw{Tex: nil, First: len(b.g.StaticTris), Count: len(sky), Cell: cell})
 		b.g.StaticTris = append(b.g.StaticTris, sky...)
 	}
 	b.g.StaticOpaqueCount = len(b.g.StaticTris)
 	for slot := uint16(0); int(slot) < len(b.g.Textures); slot++ {
-		bk := b.masked[slot]
-		if len(bk) == 0 {
-			continue
+		for _, cell := range sortedCells(b.masked[slot]) {
+			bk := b.masked[slot][cell]
+			if len(bk) == 0 {
+				continue
+			}
+			b.g.StaticDraws = append(b.g.StaticDraws, Draw{Tex: b.g.Textures[slot], Bright: b.g.Brightmaps[slot], First: len(b.g.StaticTris), Count: len(bk), Cell: cell})
+			b.g.StaticTris = append(b.g.StaticTris, bk...)
 		}
-		b.g.StaticDraws = append(b.g.StaticDraws, Draw{Tex: b.g.Textures[slot], Bright: b.g.Brightmaps[slot], First: len(b.g.StaticTris), Count: len(bk)})
-		b.g.StaticTris = append(b.g.StaticTris, bk...)
 	}
 	// Process-monotonic so a fresh builder (level change) and a door move
 	// both hand the backend a version it hasn't uploaded yet.
 	staticVersionSeq++
 	b.g.StaticVersion = staticVersionSeq
+}
+
+// sortedCells returns m's keys in ascending order — map iteration order is
+// randomized in Go, and Invalidate runs rarely enough (door/lift moves)
+// that a deterministic Draw order is worth a small sort rather than
+// leaving build-to-build Draw ordering to chance.
+func sortedCells(m map[int32][]Vert) []int32 {
+	if len(m) == 0 {
+		return nil
+	}
+	cells := make([]int32, 0, len(m))
+	for c := range m {
+		cells = append(cells, c)
+	}
+	sort.Slice(cells, func(i, j int) bool { return cells[i] < cells[j] })
+	return cells
+}
+
+// UpdateVisibility is Stage 2 of the static-geometry visibility-culling
+// scoping (see the plan doc): it tests every StaticDraws entry's grid cell
+// against cam's view and records the result in Geometry.StaticDrawVisible
+// (reused/resized in place, so a warm level allocates nothing here) —
+// render/vulkan/world.go's colour pass reads that array to skip drawing
+// what it says is out of view. Call once per frame, after Build, before
+// DrawWorld. Returns the same (visible, total) draw/vertex counts as
+// before purely for the existing periodic diagnostic log — the counting is
+// a free byproduct of the loop this now has to run anyway.
+func (b *Builder) UpdateVisibility(cam Camera) (visibleDraws, totalDraws, visibleVerts, totalVerts int) {
+	totalDraws = len(b.g.StaticDraws)
+	if cap(b.g.StaticDrawVisible) < totalDraws {
+		b.g.StaticDrawVisible = make([]bool, totalDraws)
+	} else {
+		b.g.StaticDrawVisible = b.g.StaticDrawVisible[:totalDraws]
+	}
+	for i, d := range b.g.StaticDraws {
+		totalVerts += d.Count
+		minX, minY, maxX, maxY := b.grid.bounds(d.Cell)
+		vis := cellVisible(cam, minX, minY, maxX, maxY)
+		b.g.StaticDrawVisible[i] = vis
+		if vis {
+			visibleDraws++
+			visibleVerts += d.Count
+		}
+	}
+	return
 }
 
 var staticVersionSeq uint32
@@ -390,15 +492,21 @@ func (b *Builder) slot(t, bright *assets.RGBA) uint16 {
 	return id
 }
 
-// emit appends one triangle to the bucket for its texture slot — the masked
-// set for KindMasked (alpha-tested 2-sided middles, kept out of the depth
-// pre-pass), the opaque set otherwise.
+// emit appends one triangle to the bucket for its (texture slot, grid cell)
+// — the masked set for KindMasked (alpha-tested 2-sided middles, kept out
+// of the depth pre-pass), the opaque set otherwise. b.curCell is set once
+// per subsector by emitSubsectorIdx before any of its triangles reach here.
 func (b *Builder) emit(a, c, d Vert) {
+	m := b.buckets
 	if a.Kind == KindMasked {
-		b.masked[a.Tex] = append(b.masked[a.Tex], a, c, d)
-		return
+		m = b.masked
 	}
-	b.buckets[a.Tex] = append(b.buckets[a.Tex], a, c, d)
+	byCell := m[a.Tex]
+	if byCell == nil {
+		byCell = make(map[int32][]Vert)
+		m[a.Tex] = byCell
+	}
+	byCell[b.curCell] = append(byCell[b.curCell], a, c, d)
 }
 
 func (b *Builder) emitSubsectorIdx(idx int) {
@@ -432,6 +540,19 @@ func (b *Builder) emitSubsectorIdx(idx int) {
 		}
 		poly = b.fan
 	}
+
+	// This subsector's geometry all lands in one visGrid cell, chosen by its
+	// polygon centroid — see visGrid.cellOf's doc for why a whole-subsector
+	// assignment instead of per-vertex.
+	var cx, cy float32
+	for _, p := range poly {
+		cx += p.X
+		cy += p.Y
+	}
+	if n := float32(len(poly)); n > 0 {
+		cx, cy = cx/n, cy/n
+	}
+	b.curCell = b.grid.cellOf(cx, cy)
 
 	b.emitFlat(poly, frontSec, false) // floor, faces up
 	b.emitFlat(poly, frontSec, true)  // ceiling, faces down

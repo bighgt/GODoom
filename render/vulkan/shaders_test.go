@@ -12,18 +12,18 @@ import (
 func TestEmbeddedSPIRV(t *testing.T) {
 	const spirvMagic = 0x07230203
 	blobs := map[string][]byte{
-		"blit.vert":        blitVertSPV,
-		"blit.frag":        blitFragSPV,
-		"light.frag":       litLightFragSPV,
-		"bright.frag":      litBrightFragSPV,
-		"blur.frag":        litBlurFragSPV,
-		"composite.frag":   litCompositeFragSPV,
-		"world.vert":       worldVertSPV,
-		"world.frag":       worldFragSPV,
-		"worldblit.frag":   worldBlitFragSPV,
-		"worldshadow.frag": worldShadowFragSPV,
-		"depthonly.vert":   depthOnlyVertSPV,
-		"depth.frag":       depthFragSPV,
+		"blit.vert":         blitVertSPV,
+		"blit.frag":         blitFragSPV,
+		"light.frag":        litLightFragSPV,
+		"bright.frag":       litBrightFragSPV,
+		"blur.frag":         litBlurFragSPV,
+		"composite.frag":    litCompositeFragSPV,
+		"world.vert":        worldVertSPV,
+		"world.frag":        worldFragSPV,
+		"worldblit.frag":    worldBlitFragSPV,
+		"worldambient.frag": worldAmbientFragSPV,
+		"depthonly.vert":    depthOnlyVertSPV,
+		"depth.frag":        depthFragSPV,
 	}
 	for name, b := range blobs {
 		if len(b) == 0 {

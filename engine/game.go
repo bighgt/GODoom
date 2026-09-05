@@ -753,10 +753,19 @@ func (g *Game) renderFrame() error {
 			wc.SpotIntensity, wc.SpotRadius = spot.Intensity, spot.Radius
 			wc.SpotCosOuter, wc.SpotCosInner = spot.CosOuter, spot.CosInner
 		}
+		// Static-geometry visibility culling (see the "vivid-gliding-river"
+		// plan doc): tests every StaticDraws entry's grid cell against this
+		// frame's camera and records the result on geom.StaticDrawVisible —
+		// render/vulkan/world.go's colour pass reads that to skip drawing
+		// what's out of view. Must run every frame (not just the debug-log
+		// window below): it's the actual cull now, not only a diagnostic.
+		visD, totD, visV, totV := g.WorldBuilder.UpdateVisibility(wc)
 		if g.dbgHWFrames < 5400 {
 			g.dbgHWFrames++
 			if g.dbgHWFrames <= 3 || g.dbgHWFrames%1800 == 0 {
 				log.Printf("engine: [hw] frame %d — collectLights -> %d light(s) to DrawWorld", g.dbgHWFrames, len(lights))
+				log.Printf("engine: [hw] frame %d — visibility grid: %d/%d draws, %d/%d verts drawn (culled %.0f%%)",
+					g.dbgHWFrames, visD, totD, visV, totV, 100*(1-float64(visD)/float64(max(totD, 1))))
 			}
 		}
 		if err := g.Renderer.DrawWorld(geom, wc, g.Raster.Width, g.Raster.Height, g.Raster.Overlay(), lights); err != nil {

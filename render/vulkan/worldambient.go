@@ -11,16 +11,22 @@ import (
 	"twopointfive/render/worldgeo"
 )
 
-// Quarter-resolution dynamic-light shadow-occlusion pass for the hardware
-// path. dynShadow() (worldshadow.frag) marches this slot's full-res depth
-// buffer toward the leading dynamic lights exactly as it used to inline in
-// worldblit.frag, but now writes its result into ONE shared, low-resolution
-// offscreen image instead of running per full-res pixel. worldblit.frag then
-// samples that image back at full res through the ordinary linear/clamp
-// sampler (wr.clampSampler) — the low-res-then-bilinear-upsample read IS the
-// soft blur on the shadow edge, no separate blur pass needed, the same way
+// Quarter-resolution "ambient" pass for the hardware path: dynamic-light
+// shadows, SSAO, and god rays, all pre-computed here (worldambient.frag)
+// into one shared, low-resolution offscreen image instead of running per
+// full-res pixel in worldblit.frag. worldblit.frag then samples that image
+// back at full res through the ordinary linear/clamp sampler
+// (wr.clampSampler) — the low-res-then-bilinear-upsample read IS a real
+// soft blur from hardware texture filtering for all three (a shadow
+// penumbra, an AO darkening, a god-ray glow are all inherently
+// low-frequency), no separate blur pass needed, the same way
 // worldbloom.go's mip pyramid leans on hardware filtering rather than a
-// hand-rolled box/Gaussian kernel.
+// hand-rolled box/Gaussian kernel. Running SSAO's 12-tap disc gather and
+// god rays' 24-step march at 1/16th the pixel count (instead of every
+// full-res pixel, as both used to) is the actual performance win here; the
+// softening is a side benefit that started this pass (this used to be
+// shadow-only — see the "shadow" naming still on a few fields/constants
+// below, kept rather than renamed everywhere for a purely cosmetic diff).
 //
 // Shape mirrors worldbloom.go (one shared image reused every frame, built
 // via wMakeImage + the generic litPipeline/litPipelineLayout helpers), but
@@ -28,34 +34,45 @@ import (
 // the shared framePool in worldsetup.go — this pass never touches that
 // pool's already-fragile arithmetic.
 
-//go:embed shaders/worldshadow.frag.spv
-var worldShadowFragSPV []byte
+//go:embed shaders/worldambient.frag.spv
+var worldAmbientFragSPV []byte
 
-// dynShadowStrength/March/Bias are the shadow march's tuning constants —
-// named constants rather than a config knob since they're an internal
-// quality/cost tradeoff, not something a player would tune. strength 0
-// would disable the pass; march is how far along the ray-to-light to search
-// for an occluder; bias is the depth-difference slack (camera-forward map
-// units) before a sample counts as an occluder, so a surface doesn't shadow
-// itself.
+// dynShadowStrength/March/Bias are the shadow march's tuning constants, and
+// aoStrength/aoRadius/aoBias/godrayStrength/sunX/Y/Z are the SSAO/god-ray
+// ones moved here from recordWorldCommandBuffer's old local block when
+// those two effects joined the shadow pass — named constants rather than a
+// config knob since they're an internal quality/cost tradeoff, not
+// something a player would tune. sunDir is a fixed, normalised world-space
+// direction (high, toward +X/+Y) so god rays streak from a bright sky
+// opening the player is roughly facing.
 const (
 	dynShadowStrength = 0.6
 	dynShadowMarch    = 320.0
 	dynShadowBias     = 2.0
+
+	ambAOStrength     = 0.40 // deepest crease darkens ~40%; AO multiplies final light
+	ambAORadius       = 48.0
+	ambAOBias         = 1.5
+	ambGodrayStrength = 0.35
+	ambSunX           = 0.40 // |(ambSunX,ambSunY,ambSunZ)| == 1, ~60 deg elevation
+	ambSunY           = 0.30
+	ambSunZ           = 0.866
 )
 
-// worldShadow holds the shadow-term pass's resources: one shared image at
+// worldAmbient holds the ambient pass's resources: one shared image at
 // wr.w/4 x wr.h/4 (not double-buffered — every slot's pass writes into the
 // same image in turn, exactly like worldbloom.go's mip images), its render
 // pass/framebuffer/pipeline, and descriptors.
-type worldShadow struct {
+type worldAmbient struct {
 	img  litImage
 	w, h int
 	fb   vk.Framebuffer
 	rp   vk.RenderPass
 
-	dslSrc    vk.DescriptorSetLayout // binding0 = this slot's depth, binding1 = this slot's World UBO
-	dslSample vk.DescriptorSetLayout // binding0 = the shared shadow image — worldblit's 2nd descriptor set
+	// dslSrc: binding0 = this slot's depth, binding1 = this slot's World
+	// UBO, binding2 = this slot's scene colour (god rays only).
+	dslSrc    vk.DescriptorSetLayout
+	dslSample vk.DescriptorSetLayout // binding0 = the shared ambient image — worldblit's 2nd descriptor set
 	pool      vk.DescriptorPool
 
 	plGen   vk.PipelineLayout
@@ -65,7 +82,7 @@ type worldShadow struct {
 	setSample vk.DescriptorSet // one set: the image it points at never changes per slot
 }
 
-func (r *Renderer) worldCreateShadowPass() error {
+func (r *Renderer) worldCreateAmbientPass() error {
 	wr := r.wr
 	w, h := wr.w/4, wr.h/4
 	if w < 1 {
@@ -74,10 +91,10 @@ func (r *Renderer) worldCreateShadowPass() error {
 	if h < 1 {
 		h = 1
 	}
-	wr.shadow.w, wr.shadow.h = w, h
+	wr.ambient.w, wr.ambient.h = w, h
 
 	var err error
-	wr.shadow.img, err = r.wMakeImage(w, h, sceneHDRFormat,
+	wr.ambient.img, err = r.wMakeImage(w, h, sceneHDRFormat,
 		vk.ImageUsageFlags(vk.ImageUsageColorAttachmentBit)|vk.ImageUsageFlags(vk.ImageUsageSampledBit),
 		vk.ImageAspectFlags(vk.ImageAspectColorBit), 1)
 	if err != nil {
@@ -126,20 +143,20 @@ func (r *Renderer) worldCreateShadowPass() error {
 	}
 	var rp vk.RenderPass
 	if res := vk.CreateRenderPass(r.device, &rpInfo, nil, &rp); res != vk.Success {
-		return fmt.Errorf("vulkan: shadow render pass: %s", vk.Error(res))
+		return fmt.Errorf("vulkan: ambient render pass: %s", vk.Error(res))
 	}
-	wr.shadow.rp = rp
+	wr.ambient.rp = rp
 
 	fbInfo := vk.FramebufferCreateInfo{
 		SType: vk.StructureTypeFramebufferCreateInfo, RenderPass: rp,
-		AttachmentCount: 1, PAttachments: []vk.ImageView{wr.shadow.img.view},
+		AttachmentCount: 1, PAttachments: []vk.ImageView{wr.ambient.img.view},
 		Width: uint32(w), Height: uint32(h), Layers: 1,
 	}
 	var fb vk.Framebuffer
 	if res := vk.CreateFramebuffer(r.device, &fbInfo, nil, &fb); res != vk.Success {
-		return fmt.Errorf("vulkan: shadow framebuffer: %s", vk.Error(res))
+		return fmt.Errorf("vulkan: ambient framebuffer: %s", vk.Error(res))
 	}
-	wr.shadow.fb = fb
+	wr.ambient.fb = fb
 
 	mk := func(bindings []vk.DescriptorSetLayoutBinding) (vk.DescriptorSetLayout, error) {
 		info := vk.DescriptorSetLayoutCreateInfo{
@@ -149,7 +166,7 @@ func (r *Renderer) worldCreateShadowPass() error {
 		}
 		var l vk.DescriptorSetLayout
 		if res := vk.CreateDescriptorSetLayout(r.device, &info, nil, &l); res != vk.Success {
-			return nil, fmt.Errorf("vulkan: shadow dsl: %s", vk.Error(res))
+			return nil, fmt.Errorf("vulkan: ambient dsl: %s", vk.Error(res))
 		}
 		return l, nil
 	}
@@ -157,10 +174,10 @@ func (r *Renderer) worldCreateShadowPass() error {
 		Binding: 1, DescriptorType: vk.DescriptorTypeUniformBuffer, DescriptorCount: 1,
 		StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
 	}
-	if wr.shadow.dslSrc, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0), uboBinding}); err != nil {
+	if wr.ambient.dslSrc, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0), uboBinding, samplerBinding(2)}); err != nil {
 		return err
 	}
-	if wr.shadow.dslSample, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0)}); err != nil {
+	if wr.ambient.dslSample, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0)}); err != nil {
 		return err
 	}
 
@@ -172,17 +189,17 @@ func (r *Renderer) worldCreateShadowPass() error {
 		MaxSets:       uint32(maxFramesInFlight + 1), // setSrc per slot + one shared setSample
 		PoolSizeCount: 2,
 		PPoolSizes: []vk.DescriptorPoolSize{
-			// depth sampler per setSrc, + one sampler for the shared setSample.
-			{Type: vk.DescriptorTypeCombinedImageSampler, DescriptorCount: uint32(maxFramesInFlight + 1)},
+			// depth + scene samplers per setSrc, + one sampler for the shared setSample.
+			{Type: vk.DescriptorTypeCombinedImageSampler, DescriptorCount: uint32(2*maxFramesInFlight + 1)},
 			// World UBO per setSrc.
 			{Type: vk.DescriptorTypeUniformBuffer, DescriptorCount: uint32(maxFramesInFlight)},
 		},
 	}
 	var pool vk.DescriptorPool
 	if res := vk.CreateDescriptorPool(r.device, &poolInfo, nil, &pool); res != vk.Success {
-		return fmt.Errorf("vulkan: shadow descriptor pool: %s", vk.Error(res))
+		return fmt.Errorf("vulkan: ambient descriptor pool: %s", vk.Error(res))
 	}
-	wr.shadow.pool = pool
+	wr.ambient.pool = pool
 
 	alloc := func(layout vk.DescriptorSetLayout) (vk.DescriptorSet, error) {
 		info := vk.DescriptorSetAllocateInfo{
@@ -191,7 +208,7 @@ func (r *Renderer) worldCreateShadowPass() error {
 		}
 		var s vk.DescriptorSet
 		if res := vk.AllocateDescriptorSets(r.device, &info, &s); res != vk.Success {
-			return nil, fmt.Errorf("vulkan: shadow descriptor set: %s", vk.Error(res))
+			return nil, fmt.Errorf("vulkan: ambient descriptor set: %s", vk.Error(res))
 		}
 		return s, nil
 	}
@@ -199,11 +216,11 @@ func (r *Renderer) worldCreateShadowPass() error {
 	var writes []vk.WriteDescriptorSet
 	for i := range wr.slots {
 		sl := &wr.slots[i]
-		s, aerr := alloc(wr.shadow.dslSrc)
+		s, aerr := alloc(wr.ambient.dslSrc)
 		if aerr != nil {
 			return aerr
 		}
-		wr.shadow.setSrc[i] = s
+		wr.ambient.setSrc[i] = s
 		writes = append(writes,
 			vk.WriteDescriptorSet{
 				SType: vk.StructureTypeWriteDescriptorSet, DstSet: s, DstBinding: 0,
@@ -217,42 +234,49 @@ func (r *Renderer) worldCreateShadowPass() error {
 				DescriptorCount: 1, DescriptorType: vk.DescriptorTypeUniformBuffer,
 				PBufferInfo: []vk.DescriptorBufferInfo{{Buffer: sl.ubo, Offset: 0, Range: vk.DeviceSize(worldUBOFloats * 4)}},
 			},
+			vk.WriteDescriptorSet{
+				SType: vk.StructureTypeWriteDescriptorSet, DstSet: s, DstBinding: 2,
+				DescriptorCount: 1, DescriptorType: vk.DescriptorTypeCombinedImageSampler,
+				PImageInfo: []vk.DescriptorImageInfo{{
+					Sampler: wr.clampSampler, ImageView: sl.scene.view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
+				}},
+			},
 		)
 	}
-	ss, err := alloc(wr.shadow.dslSample)
+	ss, err := alloc(wr.ambient.dslSample)
 	if err != nil {
 		return err
 	}
-	wr.shadow.setSample = ss
+	wr.ambient.setSample = ss
 	writes = append(writes, vk.WriteDescriptorSet{
 		SType: vk.StructureTypeWriteDescriptorSet, DstSet: ss, DstBinding: 0,
 		DescriptorCount: 1, DescriptorType: vk.DescriptorTypeCombinedImageSampler,
 		PImageInfo: []vk.DescriptorImageInfo{{
-			Sampler: wr.clampSampler, ImageView: wr.shadow.img.view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
+			Sampler: wr.clampSampler, ImageView: wr.ambient.img.view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
 		}},
 	})
 	vk.UpdateDescriptorSets(r.device, uint32(len(writes)), writes, 0, nil)
 
-	if wr.shadow.plGen, err = r.litPipelineLayout(wr.shadow.dslSrc, 64); err != nil {
+	if wr.ambient.plGen, err = r.litPipelineLayout(wr.ambient.dslSrc, 96); err != nil {
 		return err
 	}
-	if wr.shadow.pipeGen, err = r.litPipeline(worldShadowFragSPV, wr.shadow.rp, wr.shadow.plGen); err != nil {
+	if wr.ambient.pipeGen, err = r.litPipeline(worldAmbientFragSPV, wr.ambient.rp, wr.ambient.plGen); err != nil {
 		return err
 	}
 	return nil
 }
 
-// recordShadowTerm draws the quarter-res occlusion buffer for this slot.
-// Called from recordWorldCommandBuffer right after the world pass ends and
-// before the bloom pass — cam gives it the camera basis needed to
+// recordAmbientTerm draws the quarter-res shadow/AO/god-ray buffer for this
+// slot. Called from recordWorldCommandBuffer right after the world pass
+// ends and before the bloom pass — cam gives it the camera basis needed to
 // reconstruct a world point from (screen pixel, sampled depth), the same
 // derivation the present blit pass makes for its own push constants (kept
 // separate here rather than threading it through as a parameter, so this
 // function stays self-contained).
-func (r *Renderer) recordShadowTerm(cmd vk.CommandBuffer, frame int, cam worldgeo.Camera) {
+func (r *Renderer) recordAmbientTerm(cmd vk.CommandBuffer, frame int, cam worldgeo.Camera) {
 	wr := r.wr
-	sh := &wr.shadow
-	if sh.pipeGen == nil {
+	am := &wr.ambient
+	if am.pipeGen == nil {
 		return
 	}
 	bFocal := worldgeo.FocalFor(cam, wr.h)
@@ -261,54 +285,56 @@ func (r *Renderer) recordShadowTerm(cmd vk.CommandBuffer, frame int, cam worldge
 	bHorizon := float32(wr.h)*0.5 + float32(math.Tan(cam.Pitch)*bFocal)
 
 	vk.CmdBeginRenderPass(cmd, &vk.RenderPassBeginInfo{
-		SType: vk.StructureTypeRenderPassBeginInfo, RenderPass: sh.rp, Framebuffer: sh.fb,
-		RenderArea:      vk.Rect2D{Extent: vk.Extent2D{Width: uint32(sh.w), Height: uint32(sh.h)}},
-		ClearValueCount: 1, PClearValues: []vk.ClearValue{vk.NewClearValue([]float32{1, 1, 1, 1})}, // 1 = unshadowed
+		SType: vk.StructureTypeRenderPassBeginInfo, RenderPass: am.rp, Framebuffer: am.fb,
+		RenderArea:      vk.Rect2D{Extent: vk.Extent2D{Width: uint32(am.w), Height: uint32(am.h)}},
+		ClearValueCount: 1, PClearValues: []vk.ClearValue{vk.NewClearValue([]float32{1, 1, 0, 1})}, // r=shadow,g=ao unshadowed/unoccluded; b=godray 0
 	}, vk.SubpassContentsInline)
-	vk.CmdBindPipeline(cmd, vk.PipelineBindPointGraphics, sh.pipeGen)
-	vk.CmdSetViewport(cmd, 0, 1, []vk.Viewport{fullViewport(sh.w, sh.h)})
-	vk.CmdSetScissor(cmd, 0, 1, []vk.Rect2D{fullScissor(sh.w, sh.h)})
-	vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, sh.plGen, 0, 1, []vk.DescriptorSet{sh.setSrc[frame]}, 0, nil)
+	vk.CmdBindPipeline(cmd, vk.PipelineBindPointGraphics, am.pipeGen)
+	vk.CmdSetViewport(cmd, 0, 1, []vk.Viewport{fullViewport(am.w, am.h)})
+	vk.CmdSetScissor(cmd, 0, 1, []vk.Rect2D{fullScissor(am.w, am.h)})
+	vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, am.plGen, 0, 1, []vk.DescriptorSet{am.setSrc[frame]}, 0, nil)
 
-	push := [16]float32{
+	push := [24]float32{
 		float32(worldgeo.NearPlane), float32(worldgeo.FarPlane), bSin, bCos,
 		float32(bFocal), float32(cam.X), float32(cam.Y), float32(cam.Z),
 		bHorizon, float32(wr.w), float32(wr.h), float32(cam.ShadowCasterN),
-		dynShadowStrength, dynShadowMarch, dynShadowBias, 0,
+		dynShadowStrength, dynShadowMarch, dynShadowBias, ambAOStrength,
+		ambAORadius, ambAOBias, ambGodrayStrength, 0,
+		ambSunX, ambSunY, ambSunZ, 0,
 	}
-	vk.CmdPushConstants(cmd, sh.plGen, vk.ShaderStageFlags(vk.ShaderStageFragmentBit), 0, 64, unsafe.Pointer(&push[0]))
+	vk.CmdPushConstants(cmd, am.plGen, vk.ShaderStageFlags(vk.ShaderStageFragmentBit), 0, 96, unsafe.Pointer(&push[0]))
 	vk.CmdDraw(cmd, 3, 1, 0, 0)
 	vk.CmdEndRenderPass(cmd)
 }
 
-func (r *Renderer) destroyShadowPass() {
+func (r *Renderer) destroyAmbientPass() {
 	wr := r.wr
 	if wr == nil {
 		return
 	}
-	sh := &wr.shadow
+	am := &wr.ambient
 	dev := r.device
-	if sh.pipeGen != nil {
-		vk.DestroyPipeline(dev, sh.pipeGen, nil)
+	if am.pipeGen != nil {
+		vk.DestroyPipeline(dev, am.pipeGen, nil)
 	}
-	if sh.plGen != nil {
-		vk.DestroyPipelineLayout(dev, sh.plGen, nil)
+	if am.plGen != nil {
+		vk.DestroyPipelineLayout(dev, am.plGen, nil)
 	}
-	if sh.pool != nil {
-		vk.DestroyDescriptorPool(dev, sh.pool, nil)
+	if am.pool != nil {
+		vk.DestroyDescriptorPool(dev, am.pool, nil)
 	}
-	if sh.dslSrc != nil {
-		vk.DestroyDescriptorSetLayout(dev, sh.dslSrc, nil)
+	if am.dslSrc != nil {
+		vk.DestroyDescriptorSetLayout(dev, am.dslSrc, nil)
 	}
-	if sh.dslSample != nil {
-		vk.DestroyDescriptorSetLayout(dev, sh.dslSample, nil)
+	if am.dslSample != nil {
+		vk.DestroyDescriptorSetLayout(dev, am.dslSample, nil)
 	}
-	if sh.fb != nil {
-		vk.DestroyFramebuffer(dev, sh.fb, nil)
+	if am.fb != nil {
+		vk.DestroyFramebuffer(dev, am.fb, nil)
 	}
-	if sh.rp != nil {
-		vk.DestroyRenderPass(dev, sh.rp, nil)
+	if am.rp != nil {
+		vk.DestroyRenderPass(dev, am.rp, nil)
 	}
-	freeLitImage(dev, sh.img)
-	*sh = worldShadow{}
+	freeLitImage(dev, am.img)
+	*am = worldAmbient{}
 }

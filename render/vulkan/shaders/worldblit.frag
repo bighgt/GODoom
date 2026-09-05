@@ -13,17 +13,20 @@
 //                    reconstruct the world point from (pixel, sampled
 //                    depth), reflect the eye ray about the rippled normal,
 //                    march uDepth for the first geometry it crosses.
-//   2. SSAO        — reconstruct position + normal from uDepth, gather a
-//                    rotated disc, darken creases. World pixels only.
-//   3. god rays    — radial scatter of sky / bright HDR toward the sun's
-//                    projected screen point.
-//   3b. dyn shadows — bilinear sample of uShadowTerm, the quarter-res
-//                    occlusion buffer worldshadow.frag pre-marched this
-//                    frame; the low-res-then-bilinear read is the soft blur.
-//   4. tonemap     — ACES filmic (Narkowicz fit) of (scene+bloom)*exposure.
-//   5. FXAA        — console-variant edge AA on the tonemapped image.
-//   6. CAS         — FidelityFX-style contrast-adaptive sharpen.
-//   7. overlay + ordered-free triangular dither to kill 8-bit banding.
+//   2. ambient     — one bilinear sample of uAmbientTerm, the quarter-res
+//                    buffer worldambient.frag pre-computed this frame:
+//                    r = dynamic-light shadow, g = SSAO, b = god-ray glow.
+//                    Moving all three off full-res pixels and onto a
+//                    quarter-res buffer is a real perf win (SSAO's disc
+//                    gather and god rays' march are the two most
+//                    per-pixel-expensive things this shader used to do);
+//                    the low-res-then-bilinear-upsample read is also what
+//                    makes the shadow edge soft, not any math in this
+//                    shader.
+//   3. tonemap     — ACES filmic (Narkowicz fit) of (scene+bloom)*exposure.
+//   4. FXAA        — console-variant edge AA on the tonemapped image.
+//   5. CAS         — FidelityFX-style contrast-adaptive sharpen.
+//   6. overlay + ordered-free triangular dither to kill 8-bit banding.
 
 layout(location = 0) in vec2 fragUV;
 layout(location = 0) out vec4 outColor;
@@ -32,22 +35,23 @@ layout(set = 0, binding = 0) uniform sampler2D uScene;   // HDR, render res
 layout(set = 0, binding = 1) uniform sampler2D uBloom;   // HDR, half res (linear upsample)
 layout(set = 0, binding = 2) uniform sampler2D uOverlay; // LDR straight-alpha
 layout(set = 0, binding = 3) uniform sampler2D uDepth;   // world pass D32 depth, render res (nearest)
-// The dynamic-light shadow-occlusion term (worldshadow.go/.frag), quarter
+// The pre-computed shadow/AO/god-ray term (worldambient.go/.frag), quarter
 // render resolution — this is a SEPARATE descriptor set (set 1) rather than
 // a 5th binding on set 0, so this pass's own dedicated pool never has to
 // touch worldsetup.go's shared framePool sizing. Sampled through the
 // ordinary linear/clamp sampler: that bilinear upscale from quarter-res IS
-// the soft blur on the shadow edge, not any math in this shader.
-layout(set = 1, binding = 0) uniform sampler2D uShadowTerm;
+// the soft blur on the shadow edge (and the AO/god-ray softening), not any
+// math in this shader.
+layout(set = 1, binding = 0) uniform sampler2D uAmbientTerm;
 
 layout(push_constant) uniform PC {
     vec4 p0; // exposure, bloomStrength, waterClock, nearPlane
     vec4 p1; // sinA, cosA, focal(px), farPlane
     vec4 p2; // camX, camY, camZ, horizonY(px, pitch-sheared)
-    vec4 p3; // width, height, ssrStrength, aoStrength
-    vec4 p4; // sunDir.xyz (world), godrayStrength
-    vec4 p5; // aoRadius(world u), sharpenStrength(0..1), ditherStrength(LSBs), aoBias(world u)
-    vec4 p6; // vestigial — the dyn-light shadow march moved to worldshadow.frag
+    vec4 p3; // width, height, ssrStrength, aoStrength (vestigial — SSAO moved to worldambient.frag)
+    vec4 p4; // sunDir.xyz (vestigial — god rays moved to worldambient.frag), godrayStrength
+    vec4 p5; // aoRadius(vestigial), sharpenStrength(0..1), ditherStrength(LSBs), aoBias(vestigial)
+    vec4 p6; // vestigial — the dyn-light shadow march moved to worldambient.frag
     vec4 p7; // screen tint: rgb, amount (0 = none; amount < 0 also = heat wobble)
 } pc;
 
@@ -171,93 +175,9 @@ vec3 waterSSR(vec2 uv, vec3 baseHDR, float ez0) {
     return mix(baseHDR, refl, hit * edge * fres * pc.p3.z);
 }
 
-// ---- 2. SSAO ---------------------------------------------------------------
-
-vec3 reconNormal(vec2 uv, vec3 P) {
-    vec2 res = pc.p3.xy;
-    vec2 tx = vec2(1.0 / res.x, 0.0), ty = vec2(0.0, 1.0 / res.y);
-    float dC = depthAtUV(uv);
-    float dR = depthAtUV(uv + tx), dL = depthAtUV(uv - tx);
-    float dD = depthAtUV(uv + ty), dU = depthAtUV(uv - ty);
-    vec3 pR = worldFromUV(uv + tx, dR);
-    vec3 pL = worldFromUV(uv - tx, dL);
-    vec3 pD = worldFromUV(uv + ty, dD);
-    vec3 pU = worldFromUV(uv - ty, dU);
-    // pick the neighbour on each axis nearer in camera-forward distance, so
-    // the normal isn't smeared across a depth discontinuity.
-    vec3 ddx = (abs(dR - dC) < abs(dC - dL)) ? (pR - P) : (P - pL);
-    vec3 ddy = (abs(dD - dC) < abs(dC - dU)) ? (pD - P) : (P - pU);
-    vec3 n = cross(ddx, ddy);
-    float nl = length(n);
-    if (nl < 1e-6) return vec3(0.0, 0.0, 1.0);
-    n /= nl;
-    vec3 toCam = vec3(pc.p2.x, pc.p2.y, pc.p2.z) - P;
-    if (dot(n, toCam) < 0.0) n = -n;
-    return n;
-}
-
-float ssao(vec2 uv, vec3 P, vec3 N, float ez0) {
-    float w = pc.p3.x, h = pc.p3.y, focal = pc.p1.z;
-    float radius = pc.p5.x;
-    // world radius -> screen pixels at this depth -> uv
-    float rUVx = (radius * focal / max(ez0, 1.0)) / w;
-    float rUVy = (radius * focal / max(ez0, 1.0)) / h;
-    vec3 Pb = P + N * pc.p5.w; // bias off the surface
-
-    float rot = hash12(uv * vec2(w, h)) * 6.2831853;
-    const int K = 12;
-    float occ = 0.0;
-    for (int i = 0; i < K; ++i) {
-        float ang = rot + float(i) * (6.2831853 / float(K));
-        float rad = (float(i) + 0.5) / float(K);
-        vec2 s = uv + vec2(cos(ang) * rUVx, sin(ang) * rUVy) * rad;
-        if (s.x < 0.0 || s.x > 1.0 || s.y < 0.0 || s.y > 1.0) continue;
-        vec3 SP = worldFromUV(s, depthAtUV(s));
-        vec3 dv = SP - Pb;
-        float dl = length(dv);
-        if (dl < 0.02 || dl > radius) continue;
-        float ndl = max(dot(N, dv / dl), 0.0);
-        occ += ndl * (1.0 - dl / radius);
-    }
-    float ao = 1.0 - (occ / float(K)) * (pc.p3.w * 3.0);
-    return clamp(ao, 1.0 - pc.p3.w, 1.0);
-}
-
-// ---- 3. god rays --------------------------------------------------------
-
-vec3 godRays(vec2 uv) {
-    float w = pc.p3.x, h = pc.p3.y, focal = pc.p1.z;
-    float sinA = pc.p1.x, cosA = pc.p1.y;
-    vec3 sd = pc.p4.xyz;
-
-    float ez = sd.x * cosA + sd.y * sinA;   // camera-forward part of the sun dir
-    if (ez <= 0.03) return vec3(0.0);       // sun behind the camera
-    float ex = sd.x * sinA - sd.y * cosA;
-    vec2 sun = vec2(0.5 + focal * ex / ez / w,
-                    (pc.p2.w - focal * sd.z / ez) / h);
-
-    vec2 m = clamp(sun, vec2(0.0), vec2(1.0));
-    float off = length((sun - m) * vec2(w, h));
-    float sunVis = clamp(1.0 - off / (0.6 * h), 0.0, 1.0);
-    if (sunVis <= 0.0) return vec3(0.0);
-
-    const int N = 24;
-    vec2 delta = (sun - uv) * (0.85 / float(N));
-    vec2 p = uv;
-    float decay = 1.0;
-    vec3 acc = vec3(0.0);
-    for (int i = 0; i < N; ++i) {
-        p += delta;
-        vec2 cp = clamp(p, vec2(0.0), vec2(1.0));
-        vec4 s = texture(uScene, cp);
-        // alpha 0.5 == sky (world.frag marks it): ~1 there, ~0 for world/water.
-        float sky = 1.0 - smoothstep(0.05, 0.35, abs(s.a - 0.5));
-        float bright = smoothstep(0.75, 1.7, luma(s.rgb));
-        acc += s.rgb * max(sky, bright) * decay;
-        decay *= 0.92;
-    }
-    return acc / float(N) * sunVis;
-}
+// SSAO and god rays used to live here, run per full-res pixel; both moved
+// to worldambient.frag's quarter-res pass (see the file header) — main()
+// below just samples their pre-computed result from uAmbientTerm now.
 
 // ---- 5. FXAA (console variant, on the tonemapped image) ----------------
 
@@ -278,12 +198,17 @@ vec3 fxaa(vec2 uv, vec3 mid) {
     float rcpMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
     dir = clamp(dir * rcpMin, -8.0, 8.0) * tx;
 
-    vec3 rgbA = 0.5 * (mappedAt(uv + dir * (1.0 / 3.0 - 0.5)) +
-                       mappedAt(uv + dir * (2.0 / 3.0 - 0.5)));
-    vec3 rgbB = rgbA * 0.5 + 0.25 * (mappedAt(uv + dir * -0.5) +
-                                     mappedAt(uv + dir *  0.5));
-    float lB = luma601(rgbB);
-    return (lB < lMin || lB > lMax) ? rgbA : rgbB;
+    // Primary blend only — this used to have a second-order refinement here
+    // (rgbB: two more mappedAt taps plus a min/max reject test) that only
+    // ever changed the result on the minority of edge pixels where rgbA's
+    // luma fell outside the local min/max. Dropping it roughly halves this
+    // function's worst-case cost (an edge pixel used to cost up to 8
+    // mappedAt evaluations — 2 texture samples + a full ACES tonemap each
+    // — now at most 6: 4 for the initial contrast check, 2 for this blend)
+    // for a small loss of edge-refinement quality most players won't
+    // notice next to the CAS sharpen pass that runs right after it.
+    return mappedAt(uv + dir * (1.0 / 3.0 - 0.5)) * 0.5 +
+           mappedAt(uv + dir * (2.0 / 3.0 - 0.5)) * 0.5;
 }
 
 // ---- 6. CAS (contrast-adaptive sharpen, FidelityFX RCAS shape) --------
@@ -322,29 +247,28 @@ void main() {
         hdr = waterSSR(uv, hdr, ez0);
     }
 
-    // 2. SSAO — world surfaces only (not sky, not water)
-    if (pc.p3.w > 0.0 && !isWater && !isSky && ez0 < 20000.0) {
-        vec3 P = worldFromUV(uv, ez0);
-        vec3 N = reconNormal(uv, P);
-        hdr *= ssao(uv, P, N, ez0);
-    }
-
-    // 3. god rays
-    if (pc.p4.w > 0.0) {
-        hdr += godRays(uv) * pc.p4.w * vec3(1.06, 1.0, 0.88);
-    }
-
-    // 3b. dynamic-light shadows — pre-marched at quarter res by
-    // worldshadow.frag; sampled here bilinearly, which is what makes the
-    // shadow edge soft rather than a per-pixel math trick.
+    // 2. ambient (SSAO + god rays + dynamic-light shadows) — one bilinear
+    // sample of the quarter-res buffer worldambient.frag pre-computed this
+    // frame: r = shadow, g = AO, b = god-ray glow. Order preserved from
+    // when these ran inline here: AO multiplies first, then the god-ray
+    // glow adds (with its fixed warm tint), then shadow multiplies last —
+    // so a shadowed pixel dims its own god-ray contribution too, same as
+    // before.
+    vec3 amb = texture(uAmbientTerm, uv).rgb;
     if (!isWater && !isSky && ez0 < 20000.0) {
-        hdr *= texture(uShadowTerm, uv).r;
+        hdr *= amb.g; // SSAO
+    }
+    if (pc.p4.w > 0.0) {
+        hdr += amb.b * pc.p4.w * vec3(1.06, 1.0, 0.88); // god rays
+    }
+    if (!isWater && !isSky && ez0 < 20000.0) {
+        hdr *= amb.r; // dynamic-light shadows
     }
 
-    // 4. tonemap
+    // 3. tonemap
     vec3 mapped = aces((hdr + texture(uBloom, uv).rgb * pc.p0.y) * pc.p0.x);
 
-    // 5. FXAA + 6. CAS — skip on water and sky: their taps (mappedAt) omit
+    // 4. FXAA + 5. CAS — skip on water and sky: their taps (mappedAt) omit
     // the SSR reflection / are a smooth gradient, so AA there would wash the
     // reflection out and sharpening would only amplify banding. Silhouette
     // edges against sky are still cleaned from the geometry side.
@@ -353,7 +277,7 @@ void main() {
         if (pc.p5.y > 0.0) mapped = cas(uv, mapped);
     }
 
-    // 6b. sector-effect screen tint (lava / nukage / blood) — after tonemap,
+    // 6. sector-effect screen tint (lava / nukage / blood) — after tonemap,
     // before the HUD so the overlay stays true-colour. A negative amount also
     // asks for a slow heat wobble + brightness breathing (lava).
     float tintAmt = abs(pc.p7.w);

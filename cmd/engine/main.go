@@ -149,16 +149,16 @@ func run() error {
 	mpix := float64(renderW*renderH) / 1e6
 	log.Printf("engine: window framebuffer %dx%d, CPU render target %dx%d (%.1f Mpix, %s x%.2f)",
 		fbW, fbH, renderW, renderH, mpix, base, cfg.RenderScale)
-	// The software rasterizer's cost is close to linear in render pixels
-	// (section 18 of game_design.txt). Flag a heavy target so a low frame
-	// rate is self-explanatory.
-	if mpix > 2.4 {
-		lever := "lower `resolution` or set `renderScale` below 1.0"
-		if cfg.Windowed {
-			lever = "use a smaller window or set `renderScale` below 1.0"
-		}
-		log.Printf("engine: that's a large render target for a CPU rasterizer — if the frame rate is low, %s", lever)
-	}
+	// The "large render target" / "filtered sampling is CPU-heavy" warnings
+	// below (and the matching WarmTextureCache work) only mean anything for
+	// the CPU rasterizer's own 3D-world pass — raster.Render/drawMobjs,
+	// which the hardware (GPU-geometry) path never calls at all (renderFrame
+	// just preps the small 2D overlay plane there; the world and its sprites
+	// are the GPU's job, textured through its own always-on anisotropic
+	// sampler, independent of this "textureQuality" setting entirely). Both
+	// are deferred until hw's FINAL value is known (after the hardware
+	// init/fallback below), not the configured intent — a hardware init
+	// failure still needs the warm cache once it falls back to software.
 
 	lit := cfg.LightingMode == config.LightingEnhanced
 	hw := cfg.Renderer == config.RendererHardware
@@ -175,10 +175,6 @@ func run() error {
 	ras.SetHUDScale(cfg.HUDScale)
 	ras.SetWeaponScale(cfg.WeaponScale)
 	ras.SetTextureQuality(cfg.TextureQuality)
-	if cfg.TextureQuality != config.TextureNearest {
-		log.Printf("engine: textureQuality=%s — filtered wall/flat sampling is CPU-heavy on the software rasterizer; set it to \"nearest\" if the frame rate suffers", cfg.TextureQuality)
-		ras.WarmTextureCache(level) // build mip chains now, not mid-frame on first sight of a room
-	}
 	ras.SetGroundShadows(cfg.GroundShadows)
 	if lit {
 		ras.SetGBuffer(true)
@@ -224,6 +220,30 @@ func run() error {
 	log.Printf("engine: rendering on %s (%s)", renderer.DeviceName, renderer.DeviceTypeName)
 	if renderer.DeviceIsSoftware {
 		log.Println("engine: WARNING — Vulkan selected a CPU/software device; this is not real hardware rendering")
+	}
+
+	// Only the CPU rasterizer path (vanilla/enhanced, including a
+	// hardware-init fallback that just landed here as hw=false) ever runs
+	// raster.Render/drawMobjs against renderW*renderH pixels or filters a
+	// texture through it — the hardware path's world/sprites are entirely
+	// the GPU's job. Gating on the FINAL hw (post-fallback) rather than the
+	// configured intent means a failed hardware init still gets its warm
+	// cache instead of hitching mid-frame on the first room.
+	if !hw {
+		// The software rasterizer's cost is close to linear in render pixels
+		// (section 18 of game_design.txt). Flag a heavy target so a low
+		// frame rate is self-explanatory.
+		if mpix > 2.4 {
+			lever := "lower `resolution` or set `renderScale` below 1.0"
+			if cfg.Windowed {
+				lever = "use a smaller window or set `renderScale` below 1.0"
+			}
+			log.Printf("engine: that's a large render target for a CPU rasterizer — if the frame rate is low, %s", lever)
+		}
+		if cfg.TextureQuality != config.TextureNearest {
+			log.Printf("engine: textureQuality=%s — filtered wall/flat sampling is CPU-heavy on the software rasterizer; set it to \"nearest\" if the frame rate suffers", cfg.TextureQuality)
+			ras.WarmTextureCache(level) // build mip chains now, not mid-frame on first sight of a room
+		}
 	}
 
 	game := engine.NewGame(win, renderer, ras, w, level, tree, cam, cfg)

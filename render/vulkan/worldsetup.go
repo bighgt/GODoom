@@ -490,13 +490,14 @@ func (r *Renderer) worldCreatePipelines() error {
 	blInfo := vk.PipelineLayoutCreateInfo{
 		SType:          vk.StructureTypePipelineLayoutCreateInfo,
 		SetLayoutCount: 2,
-		PSetLayouts:    []vk.DescriptorSetLayout{wr.dslBlit, wr.shadow.dslSample},
+		PSetLayouts:    []vk.DescriptorSetLayout{wr.dslBlit, wr.ambient.dslSample},
 		// worldblit.frag PC (8 vec4 = 128B, the guaranteed maxPushConstantsSize
 		// floor): p0 exposure,bloomStrength,waterClock,near; p1 sinA,cosA,focal,
-		// far; p2 camX,camY,camZ,horizonY; p3 w,h,ssrStrength,aoStrength;
-		// p4 sunDir.xyz,godrayStrength; p5 aoRadius,sharpenStrength,ditherStrength,
-		// aoBias; p6 vestigial (the dyn-light shadow march moved to
-		// worldshadow.go's own pass, sampled here via set 1 instead); p7
+		// far; p2 camX,camY,camZ,horizonY; p3 w,h,ssrStrength,aoStrength(vestigial);
+		// p4 sunDir.xyz(vestigial),godrayStrength; p5 aoRadius(vestigial),
+		// sharpenStrength,ditherStrength,aoBias(vestigial); p6 vestigial (the
+		// dyn-light shadow march, SSAO, and god rays all moved to
+		// worldambient.go's own pass, sampled here via set 1 instead); p7
 		// screenTint.rgb,amount
 		PushConstantRangeCount: 1,
 		PPushConstantRanges:    []vk.PushConstantRange{{StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit), Offset: 0, Size: 128}},

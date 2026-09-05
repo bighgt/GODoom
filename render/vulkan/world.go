@@ -27,16 +27,19 @@ import (
 //
 // Per frame DrawWorld records into one command buffer:
 //
-//	A  world.vert/frag   packed triangle list -> offscreen RGBA16F HDR scene
-//	                     colour (render res) + a sampleable D32 depth buffer
-//	B  worldshadow.frag  quarter-res dynamic-light shadow-occlusion term —
-//	                     the low res + the present pass's bilinear read of
-//	                     it is what makes the shadow edge soft
-//	C  worldbloom.go     scene bright part -> a mip-pyramid glow buffer
-//	D  worldblit.frag    SSR / SSAO / god rays / contact shadow, ACES
-//	                     tonemap, FXAA, CAS, screen tint, then upscale
-//	                     letterboxed to the swapchain with the crisp
-//	                     un-composited 2D overlay (HUD/weapon) on top
+//	A  world.vert/frag    packed triangle list -> offscreen RGBA16F HDR scene
+//	                      colour (render res) + a sampleable D32 depth buffer
+//	B  worldambient.frag  quarter-res dynamic-light shadow + SSAO + god-ray
+//	                      term — the low res + the present pass's bilinear
+//	                      read of it is both a real perf win (two of the
+//	                      most per-pixel-expensive effects now run at
+//	                      1/16th the pixel count) and what makes the shadow
+//	                      edge soft
+//	C  worldbloom.go      scene bright part -> a mip-pyramid glow buffer
+//	D  worldblit.frag     SSR / contact shadow, ACES tonemap, FXAA, CAS,
+//	                      screen tint, then upscale letterboxed to the
+//	                      swapchain with the crisp un-composited 2D overlay
+//	                      (HUD/weapon) on top
 //
 // Pass C reuses r.renderPass / r.framebuffers (the vanilla blit's), so a
 // window resize only rebuilds the swapchain-sized resources; the offscreen
@@ -200,7 +203,7 @@ type worldResources struct {
 	texCache map[*assets.RGBA]*worldTex // keyed by the shared bitmap pointer
 
 	bloom  worldBloom  // HDR bright-pass + blur (worldbloom.go)
-	shadow worldShadow // quarter-res dynamic-light shadow term (worldshadow.go)
+	ambient worldAmbient // quarter-res shadow/AO/god-ray term (worldambient.go)
 
 	// Static world geometry (all walls + flats) — one device-local vertex
 	// buffer, re-uploaded only when the builder bumps StaticVersion (a door
@@ -258,7 +261,7 @@ func NewWorld(win *window.Window, srcW, srcH int, vsync, debug bool) (*Renderer,
 		r.worldCreateBloom, // before descriptors — setBlit samples bloom mip 0
 		r.worldCreateDummyTex,
 		r.worldCreateBuffers,
-		r.worldCreateShadowPass, // needs sl.depth (offscreen) + sl.ubo (buffers); before worldCreatePipelines (needs wr.shadow.dslSample)
+		r.worldCreateAmbientPass, // needs sl.depth/sl.scene (offscreen) + sl.ubo (buffers); before worldCreatePipelines (needs wr.ambient.dslSample)
 		r.worldCreateDescriptorLayouts,
 		r.worldCreateDescriptors,
 		r.worldCreatePipelines,
@@ -670,39 +673,65 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 	vk.CmdPushConstants(cmd, wr.plWorld, vk.ShaderStageFlags(vk.ShaderStageVertexBit), 0, 64, unsafe.Pointer(&vp[0]))
 	vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, wr.plWorld, 1, 1, []vk.DescriptorSet{sl.set1}, 0, nil)
 
-	drawRuns := func(buf vk.Buffer, runs []worldgeo.Draw) {
+	// visible, when non-nil, parallels runs: a false entry is this frame's
+	// static-geometry visibility cull skipping a Draw outside the camera's
+	// view (worldgeo.Geometry.StaticDrawVisible, from Builder.UpdateVisibility
+	// — see render/worldgeo/visgrid.go). Only g.StaticDraws carries this;
+	// the per-frame sprite/voxel Draws list (g.Draws) is passed nil, i.e.
+	// unfiltered, same as before.
+	drawRuns := func(buf vk.Buffer, runs []worldgeo.Draw, visible []bool) {
 		if buf == nil || len(runs) == 0 {
 			return
 		}
 		vk.CmdBindVertexBuffers(cmd, 0, 1, []vk.Buffer{buf}, []vk.DeviceSize{0})
-		for _, d := range runs {
+		// lastTex/lastWT track the texture (and its resolved descriptor)
+		// bound by the PREVIOUS drawn (not skipped) run: since the
+		// static-geometry visibility grid split what used to be one Draw
+		// per texture into several — one per (texture, cell) — consecutive
+		// runs now share a texture far more often than before, and both
+		// rebinding the identical descriptor set AND re-doing the
+		// wr.texCache map lookup for it are pure waste. nil never matches a
+		// real *assets.RGBA (or the g.Sky substitution below), so the very
+		// first run always does both.
+		var lastTex *assets.RGBA
+		var lastWT *worldTex
+		for i, d := range runs {
 			if d.Count == 0 {
+				continue
+			}
+			if visible != nil && i < len(visible) && !visible[i] {
 				continue
 			}
 			tex := d.Tex
 			if tex == nil { // sky run
 				tex = g.Sky
 			}
-			wt := wr.texCache[tex]
-			if wt == nil {
-				continue // texture unresolved / not uploaded — skip the run
+			wt := lastWT
+			if tex != lastTex {
+				wt = wr.texCache[tex]
+				if wt == nil {
+					continue // texture unresolved / not uploaded — skip the run
+				}
+				vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, wr.plWorld, 0, 1, []vk.DescriptorSet{wt.set}, 0, nil)
+				lastTex, lastWT = tex, wt
 			}
-			vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, wr.plWorld, 0, 1, []vk.DescriptorSet{wt.set}, 0, nil)
 			vk.CmdDraw(cmd, uint32(d.Count), 1, uint32(d.First), 0)
 		}
 	}
-	drawRuns(wr.staticVBO, g.StaticDraws) // level walls + flats (device-local)
-	drawRuns(sl.vbuf, g.Draws)            // this frame's sprite / voxel-billboard quads
+	drawRuns(wr.staticVBO, g.StaticDraws, g.StaticDrawVisible) // level walls + flats (device-local), visibility-culled
+	drawRuns(sl.vbuf, g.Draws, nil)                            // this frame's sprite / voxel-billboard quads, unfiltered
 	// Voxel models — own pipeline, still inside the world pass so the depth
 	// buffer sorts them against the level and the textured geometry.
 	r.recordVoxels(cmd, sl, g, cam)
 	vk.CmdEndRenderPass(cmd)
 	// rpScene's finalLayout transitions the scene image to shader-read for us.
 
-	// (3) dynamic-light shadow term: quarter-res occlusion buffer (worldshadow.go)
-	// — its low resolution plus the present pass's bilinear read of it is what
-	// makes the shadow edge soft, not any math in the shader itself.
-	r.recordShadowTerm(cmd, frame, cam)
+	// (3) ambient term: quarter-res shadow/AO/god-ray buffer (worldambient.go)
+	// — its low resolution plus the present pass's bilinear read of it is
+	// both a real perf win (SSAO's disc gather and god rays' march run at
+	// 1/16th the pixel count) and what makes the shadow edge soft, not any
+	// math in the shader itself.
+	r.recordAmbientTerm(cmd, frame, cam)
 
 	// (4) bloom: build the HDR mip pyramid -> bloom mip 0.
 	r.recordBloom(cmd, frame)
@@ -725,7 +754,7 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 		Extent: vk.Extent2D{Width: uint32(vpLB.Width), Height: uint32(vpLB.Height)},
 	}})
 	vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, wr.plBlit, 0, 2,
-		[]vk.DescriptorSet{sl.setBlit, wr.shadow.setSample}, 0, nil)
+		[]vk.DescriptorSet{sl.setBlit, wr.ambient.setSample}, 0, nil)
 	// worldblit.frag PC: tonemap params + the camera basis it needs to
 	// reconstruct a world point from (screen pixel, sampled depth) and march
 	// the depth buffer for the water SSR reflection. horizonY / focal match
@@ -734,29 +763,33 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 	bSin := float32(math.Sin(cam.Angle))
 	bCos := float32(math.Cos(cam.Angle))
 	bHorizon := float32(wr.h)*0.5 + float32(math.Tan(cam.Pitch)*bFocal)
-	// worldblit.frag post-chain tuning. Any *Strength at 0 disables that
-	// stage. sunDir is a fixed, normalised world-space direction (high,
-	// toward +X/+Y) so god rays streak from a bright sky opening the player
-	// is roughly facing.
+	// worldblit.frag post-chain tuning still owned here (SSR/CAS/dither);
+	// aoStrength/aoRadius/aoBias/godrayStrength/sunDir moved to
+	// worldambient.go's own constants when SSAO/god rays joined the
+	// ambient pass (see the p3/p4/p5 slots below — the shader no longer
+	// reads most of them, but the Go array is still fixed-size).
 	const (
-		ssrStrength      = 0.9
-		aoStrength       = 0.40 // deepest crease darkens ~40%; AO multiplies final light
-		aoRadius         = 48.0
-		aoBias           = 1.5
-		godrayStrength   = 0.35
-		sharpenStrength  = 0.35              // CAS 0..1
-		ditherStrength   = 1.0               // +/- 1 LSB triangular-PDF, kills 8-bit banding
-		sunX, sunY, sunZ = 0.40, 0.30, 0.866 // |sun| == 1, ~60 deg elevation
+		ssrStrength     = 0.9
+		sharpenStrength = 0.35 // CAS 0..1
+		ditherStrength  = 1.0  // +/- 1 LSB triangular-PDF, kills 8-bit banding
 	)
 	blitPC := [32]float32{
 		wr.bloom.exposure, wr.bloom.strength, float32(cam.Time), float32(worldgeo.NearPlane),
 		bSin, bCos, float32(bFocal), float32(worldgeo.FarPlane),
 		float32(cam.X), float32(cam.Y), float32(cam.Z), bHorizon,
-		float32(wr.w), float32(wr.h), ssrStrength, aoStrength,
-		sunX, sunY, sunZ, godrayStrength,
-		aoRadius, sharpenStrength, ditherStrength, aoBias,
+		// p3.w (aoStrength) is vestigial: SSAO itself now runs in
+		// worldambient.go's pass; only godrayStrength below (p4.w) is
+		// still read here, to scale+tint the pre-marched god-ray luma
+		// worldblit.frag samples from the ambient buffer.
+		float32(wr.w), float32(wr.h), ssrStrength, ambAOStrength,
+		// p4: vestigial sunDir.xyz (god rays' own march moved to
+		// worldambient.go too) + the still-used godrayStrength.
+		ambSunX, ambSunY, ambSunZ, ambGodrayStrength,
+		// p5: vestigial aoRadius/aoBias (x/w) alongside the still-used
+		// sharpen/dither strengths (y/z).
+		ambAORadius, sharpenStrength, ditherStrength, ambAOBias,
 		// p6: vestigial — worldblit.frag's own shadow march was replaced by
-		// worldshadow.go's quarter-res pass (recordShadowTerm, which reads
+		// worldambient.go's quarter-res pass (recordAmbientTerm, which reads
 		// these same dynShadowStrength/March/Bias constants), so this slot
 		// is unused by the shader now. Left populated rather than reworking
 		// the fixed 8-vec4 push-constant layout for a purely cosmetic win.
@@ -782,7 +815,7 @@ func (r *Renderer) destroyWorldResources() {
 	dev := r.device
 
 	r.destroyBloom()
-	r.destroyShadowPass()
+	r.destroyAmbientPass()
 	r.destroyVoxelResources()
 
 	for _, p := range []vk.Pipeline{wr.pipeWorld, wr.pipeDepth, wr.pipeBlit} {
