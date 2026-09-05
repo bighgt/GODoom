@@ -82,17 +82,24 @@ type Vert struct {
 // vkCmdDraw of Count vertices starting at First. Runs are in Textures
 // order, sky last. Bright is the run's brightmap mask (nil = none — the
 // backend binds a black dummy), resolved once per texture like Tex. Cell is
-// which visGrid cell this run's geometry belongs to (StaticDraws only — a
-// per-frame Draws run's Cell is always 0 and unused); see visgrid.go and
-// Builder.CullStats. It doesn't affect drawing today — every backend still
-// iterates every Draw every frame — it's Stage 1 of a visibility-culling
-// scoping pass, kept as plain data until (if) a Stage 2 ever reads it.
+// which visGrid cell this run's geometry was bucketed under (StaticDraws
+// only — a per-frame Draws run's Cell is always 0 and unused) — see
+// visgrid.go; it groups draws for batching but is not itself what gets
+// culled. MinX/MinY/MaxX/MaxY is this run's actual world-space vertex
+// bounding box (StaticDraws only), computed once in Invalidate:
+// UpdateVisibility tests THIS box rather than the grid cell's nominal
+// bounds, because a single subsector — and so a single cell's worth of
+// geometry — can span well past one visGridCellSize on a large outdoor
+// map (a wide subsector is still assigned by its centroid, see
+// visGrid.cellOf), which would otherwise let the fixed cell box cull
+// geometry the camera is standing right next to.
 type Draw struct {
-	Tex    *assets.RGBA
-	Bright *assets.RGBA
-	First  int
-	Count  int
-	Cell   int32
+	Tex                    *assets.RGBA
+	Bright                 *assets.RGBA
+	First                  int
+	Count                  int
+	Cell                   int32
+	MinX, MinY, MaxX, MaxY float32
 }
 
 // Geometry splits the world into a static part (all the level's walls and
@@ -110,8 +117,9 @@ type Geometry struct {
 	StaticDraws   []Draw
 	StaticVersion uint32 // bumped by New / Invalidate
 	// StaticDrawVisible is parallel to StaticDraws: whether Builder's last
-	// UpdateVisibility call found that draw's grid cell within the camera's
-	// view. A backend's colour pass skips a StaticDraws entry whose
+	// UpdateVisibility call found that draw's own bounding box (Draw.MinX/
+	// MinY/MaxX/MaxY) within the camera's view. A backend's colour pass
+	// skips a StaticDraws entry whose
 	// StaticDrawVisible is false; nil (before the first UpdateVisibility
 	// call) means "treat everything as visible" — see UpdateVisibility.
 	StaticDrawVisible []bool
@@ -286,7 +294,8 @@ func (b *Builder) Invalidate() {
 			if len(bk) == 0 {
 				continue
 			}
-			b.g.StaticDraws = append(b.g.StaticDraws, Draw{Tex: b.g.Textures[slot], Bright: b.g.Brightmaps[slot], First: len(b.g.StaticTris), Count: len(bk), Cell: cell})
+			minX, minY, maxX, maxY := bucketBounds(bk)
+			b.g.StaticDraws = append(b.g.StaticDraws, Draw{Tex: b.g.Textures[slot], Bright: b.g.Brightmaps[slot], First: len(b.g.StaticTris), Count: len(bk), Cell: cell, MinX: minX, MinY: minY, MaxX: maxX, MaxY: maxY})
 			b.g.StaticTris = append(b.g.StaticTris, bk...)
 		}
 	}
@@ -295,7 +304,8 @@ func (b *Builder) Invalidate() {
 		if len(sky) == 0 {
 			continue
 		}
-		b.g.StaticDraws = append(b.g.StaticDraws, Draw{Tex: nil, First: len(b.g.StaticTris), Count: len(sky), Cell: cell})
+		minX, minY, maxX, maxY := bucketBounds(sky)
+		b.g.StaticDraws = append(b.g.StaticDraws, Draw{Tex: nil, First: len(b.g.StaticTris), Count: len(sky), Cell: cell, MinX: minX, MinY: minY, MaxX: maxX, MaxY: maxY})
 		b.g.StaticTris = append(b.g.StaticTris, sky...)
 	}
 	b.g.StaticOpaqueCount = len(b.g.StaticTris)
@@ -305,7 +315,8 @@ func (b *Builder) Invalidate() {
 			if len(bk) == 0 {
 				continue
 			}
-			b.g.StaticDraws = append(b.g.StaticDraws, Draw{Tex: b.g.Textures[slot], Bright: b.g.Brightmaps[slot], First: len(b.g.StaticTris), Count: len(bk), Cell: cell})
+			minX, minY, maxX, maxY := bucketBounds(bk)
+			b.g.StaticDraws = append(b.g.StaticDraws, Draw{Tex: b.g.Textures[slot], Bright: b.g.Brightmaps[slot], First: len(b.g.StaticTris), Count: len(bk), Cell: cell, MinX: minX, MinY: minY, MaxX: maxX, MaxY: maxY})
 			b.g.StaticTris = append(b.g.StaticTris, bk...)
 		}
 	}
@@ -313,6 +324,31 @@ func (b *Builder) Invalidate() {
 	// both hand the backend a version it hasn't uploaded yet.
 	staticVersionSeq++
 	b.g.StaticVersion = staticVersionSeq
+}
+
+// bucketBounds is the world-space (X, Y) bounding box of a bucket's
+// vertices — Invalidate calls this once per (texture, cell) run so
+// UpdateVisibility can test a Draw's actual footprint instead of assuming
+// it fits inside its nominal visGrid cell (see Draw's doc comment). bk is
+// never empty here (callers already skip that case).
+func bucketBounds(bk []Vert) (minX, minY, maxX, maxY float32) {
+	minX, minY = bk[0].X, bk[0].Y
+	maxX, maxY = minX, minY
+	for _, v := range bk[1:] {
+		if v.X < minX {
+			minX = v.X
+		}
+		if v.X > maxX {
+			maxX = v.X
+		}
+		if v.Y < minY {
+			minY = v.Y
+		}
+		if v.Y > maxY {
+			maxY = v.Y
+		}
+	}
+	return
 }
 
 // sortedCells returns m's keys in ascending order — map iteration order is
@@ -349,8 +385,7 @@ func (b *Builder) UpdateVisibility(cam Camera) (visibleDraws, totalDraws, visibl
 	}
 	for i, d := range b.g.StaticDraws {
 		totalVerts += d.Count
-		minX, minY, maxX, maxY := b.grid.bounds(d.Cell)
-		vis := cellVisible(cam, minX, minY, maxX, maxY)
+		vis := cellVisible(cam, d.MinX, d.MinY, d.MaxX, d.MaxY)
 		b.g.StaticDrawVisible[i] = vis
 		if vis {
 			visibleDraws++

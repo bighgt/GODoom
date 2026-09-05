@@ -49,6 +49,38 @@ func TestCellVisibleForwardVsBehind(t *testing.T) {
 	}
 }
 
+// TestUpdateVisibilityUsesDrawBoundsNotNominalCell reproduces the bug a
+// wide outdoor subsector triggers (see cellOf's doc): its geometry is
+// bucketed under one grid cell by its centroid, but a subsector wider than
+// visGridCellSize (common in a map's big outdoor sectors — E1M2's courtyard
+// has several) leaves that cell's own square nowhere near the subsector's
+// actual footprint. UpdateVisibility must cull against the draw's own
+// MinX/MinY/MaxX/MaxY, not the grid cell's nominal bounds, or geometry the
+// camera is standing right in front of gets wrongly culled as "not visible"
+// (reported as whole sections of a level rendering as flat black).
+func TestUpdateVisibilityUsesDrawBoundsNotNominalCell(t *testing.T) {
+	b := &Builder{grid: newVisGrid(-4096, -4096, 4096, 4096)}
+	// This draw's real geometry sits right in front of the camera below, but
+	// centroid-bucketing assigned it to a nominal cell far off to one side —
+	// simulating a subsector whose footprint outgrows visGridCellSize.
+	awayCell := b.grid.cellOf(-3000, -3000)
+	b.g.StaticDraws = []Draw{{Count: 3, Cell: awayCell, MinX: 0, MinY: -200, MaxX: 800, MaxY: 200}}
+
+	cam := Camera{X: 0, Y: 0, Angle: 0, FOVDeg: 90} // facing +X, straight at the draw's real bbox
+
+	// Sanity: the draw's nominal cell (what the old, buggy code tested) is
+	// indeed out of view — otherwise this test isn't isolating the fix.
+	nomMinX, nomMinY, nomMaxX, nomMaxY := b.grid.bounds(awayCell)
+	if cellVisible(cam, nomMinX, nomMinY, nomMaxX, nomMaxY) {
+		t.Fatal("test setup invalid: the nominal cell is visible too, doesn't isolate the fix")
+	}
+
+	visD, _, _, _ := b.UpdateVisibility(cam)
+	if visD != 1 {
+		t.Fatalf("draw with real geometry in front of the camera was culled via its nominal cell: UpdateVisibility -> %d visible, want 1", visD)
+	}
+}
+
 func TestUpdateVisibilityStatsAndArrayAgree(t *testing.T) {
 	lvl, tree, tex := loadLevel(t)
 	b := New(lvl, tree, tex)

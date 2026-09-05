@@ -5,13 +5,16 @@ import "math"
 // Static-geometry visibility culling (see the "vivid-gliding-river" plan
 // doc from that session): a coarse world-space grid giving Builder's
 // per-texture draw buckets a second axis — location — to split on, plus a
-// per-frame test of which cells the camera can actually see.
-// render/vulkan/world.go's colour pass skips a StaticDraws entry whose grid
-// cell tests as not visible (Geometry.StaticDrawVisible, populated by
-// Builder.UpdateVisibility) — the depth pre-pass does not (see that file
-// for why: it draws one contiguous vertex range rather than iterating
-// per-Draw, so filtering it would need its own restructuring; left as a
-// known, deliberate gap rather than attempted here).
+// per-frame test of which draws the camera can actually see.
+// render/vulkan/world.go's colour pass skips a StaticDraws entry whose
+// actual vertex bounding box (Draw.MinX/MinY/MaxX/MaxY, computed once in
+// Invalidate from that draw's own vertices — not the grid cell's nominal
+// bounds; see cellOf's doc for why the two can differ) tests as not visible
+// (Geometry.StaticDrawVisible, populated by Builder.UpdateVisibility) — the
+// depth pre-pass does not (see that file for why: it draws one contiguous
+// vertex range rather than iterating per-Draw, so filtering it would need
+// its own restructuring; left as a known, deliberate gap rather than
+// attempted here).
 
 // visGridCellSize is the bucket size. engine/collisiongrid.go's
 // collisionGrid — the pattern this mirrors — uses 128 units/cell, tuned for
@@ -48,11 +51,14 @@ func newVisGrid(minX, minY, maxX, maxY float32) *visGrid {
 // this once per subsector, at its polygon's centroid, treating the whole
 // subsector as one atomic visibility unit (the same granularity id's own
 // renderer uses) rather than duplicating a straddling subsector's vertices
-// into every cell its bounding box touches: at this cell size a subsector
-// spanning more than one cell is rare, and picking the centroid's cell
-// avoids inflating the static VBO for the sake of a Stage-1 diagnostic. A
-// real Stage 2 cull would need to revisit this (see the plan doc's "Open
-// questions").
+// into every cell its bounding box touches: this is purely a batching key,
+// not itself the culling test, so a subsector spanning more than one
+// visGridCellSize (common in a map's big outdoor sectors — e.g. E1M2's
+// courtyard) only costs a coarser (texture, cell) split, not a wrong
+// answer: Invalidate derives each Draw's actual vertex bounding box
+// (Draw.MinX/MinY/MaxX/MaxY) from what centroid-bucketing put there, and
+// UpdateVisibility culls against that real footprint rather than this
+// cell's nominal square — see the Draw doc comment.
 func (g *visGrid) cellOf(x, y float32) int32 {
 	col := int((x - g.minX) / visGridCellSize)
 	row := int((y - g.minY) / visGridCellSize)
