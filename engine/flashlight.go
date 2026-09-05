@@ -21,8 +21,12 @@ import (
 const (
 	// flashlightRadius is the beam's hard cutoff — well past the muzzle
 	// flash's 340u point light, since a headlamp is meant to reach across
-	// a room.
-	flashlightRadius = 900.0
+	// a room. A monster gets no dynamicDiffuse contribution at all past
+	// this distance (the falloff is a hard (1-(d/R)^2)^2, exactly 0 at R),
+	// so it's the actual answer to "how far away does a monster read as
+	// lit and detailed rather than just flat ambient" — bumped up from the
+	// original 900 so that reveal happens well before point-blank range.
+	flashlightRadius = 1400.0
 	// flashlightConeOuterDeg/InnerDeg are the cone half-angles: fully lit
 	// inside Inner, fading to nothing at Outer.
 	flashlightConeOuterDeg = 32.0
@@ -36,7 +40,7 @@ const (
 	// point, up a little so it reads as head-mounted rather than
 	// gun-mounted.
 	flashlightForward = 10.0
-	flashlightUp       = 6.0
+	flashlightUp      = 6.0
 	// flashlightExtraLight is the vanilla-path raster.ExtraLight bump.
 	// Flat, not flickered: ExtraLight moves brightness a whole sector-light
 	// row at a time, so animating it would band rather than flicker.
