@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"twopointfive/assets"
 	"twopointfive/audio"
@@ -48,6 +49,20 @@ func main() {
 	if err != nil {
 		os.Exit(1)
 	}
+}
+
+// stageTimer logs how long one startup stage took. Picking a WAD and a map
+// happens through native dialogs the OS keeps responsive on its own, but
+// everything after that — parsing, BSP build, texture indexing, GPU/pipeline
+// setup, static-geometry build, voxel meshing — is synchronous, one-time
+// work with no progress bar of its own; a slow one of these is exactly what
+// a "not responding" window-manager warning during load looks like from the
+// outside. Logging each stage's duration turns "it hangs on load" into "it
+// spent N seconds in this specific stage" for the next person (or profiling
+// pass) to act on. Call the returned func when the stage finishes.
+func stageTimer(name string) func() {
+	start := time.Now()
+	return func() { log.Printf("engine: [load] %s: %s", name, time.Since(start).Round(time.Millisecond)) }
 }
 
 func run() error {
@@ -89,26 +104,37 @@ func run() error {
 	mapName := chooseStartMap(maps, cfg.Map)
 	log.Printf("engine: found %d map(s), loading %s", len(maps), mapName)
 
+	// From here on the window (once created below) is up but the game isn't
+	// running its event/render loop yet — see stageTimer's doc comment. Time
+	// it all so a slow load is diagnosable instead of just looking hung.
+	loadStart := time.Now()
+
+	done := stageTimer("parse level lump")
 	level, err := w.LoadLevel(mapName)
 	if err != nil {
 		return err
 	}
+	done()
 	log.Printf("engine: %s: %d vertexes, %d linedefs, %d sidedefs, %d sectors, %d things, %d segs, %d subsectors, %d nodes",
 		mapName, len(level.Vertexes), len(level.Linedefs), len(level.Sidedefs), len(level.Sectors),
 		len(level.Things), len(level.Segs), len(level.Subsectors), len(level.Nodes))
 
+	done = stageTimer("build BSP tree")
 	tree, err := bsp.Build(level)
 	if err != nil {
 		return err
 	}
+	done()
 	innerCount, leafCount := bsp.CountNodesAndLeaves(tree)
 	log.Printf("engine: BSP tree built: %d inner nodes, %d leaves (subsectors)", innerCount, leafCount)
 
+	done = stageTimer("index texture packs")
 	textures, err := assets.New(w)
 	if err != nil {
 		return err
 	}
 	textures.SetQuake1Textures(cfg.Quake1Textures)
+	done()
 
 	wm := "fullscreen"
 	if cfg.Windowed {
@@ -128,12 +154,23 @@ func run() error {
 	cam.FOVDeg = cfg.FOVDegrees
 	log.Printf("engine: player start at (%.0f, %.0f, %.0f), facing %.0f°", cam.X, cam.Y, cam.Z, cam.Angle*180/math.Pi)
 
+	done = stageTimer("open window")
 	win, err := window.New(cfg.WindowWidth, cfg.WindowHeight, "TwoPointFive — "+mapName, !cfg.Windowed)
 	if err != nil {
 		return err
 	}
 	defer win.Destroy()
 	win.EnableMouseLook()
+	done()
+	// The window exists now but nothing pumps its event queue again until
+	// game.Run's loop starts — every remaining stage below is a candidate
+	// for the desktop's compositor to decide the window has hung (an
+	// unanswered _NET_WM_PING) and offer to force-quit it, especially on a
+	// slow disk or a bigger asset pack than this was tuned against. None of
+	// them takes long enough on their own to trip that today (see the
+	// stageTimer log), but ping the window between them anyway rather than
+	// assume that stays true.
+	win.PollEvents()
 
 	fbW, fbH := win.FramebufferSize()
 	if cfg.Windowed && (fbW <= 0 || fbH <= 0) {
@@ -183,6 +220,7 @@ func run() error {
 	// Vulkan validation layers cost double-digit percent and add per-call
 	// latency; keep them off unless explicitly asked for (TPF_VK_DEBUG=1).
 	vkDebug := os.Getenv("TPF_VK_DEBUG") != ""
+	done = stageTimer("create GPU renderer (device + pipelines + shaders)")
 	var renderer *vulkan.Renderer
 	if hw {
 		renderer, err = vulkan.NewWorld(win, renderW, renderH, cfg.VSync, vkDebug)
@@ -216,6 +254,8 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	done()
+	win.PollEvents()
 	defer renderer.Destroy()
 	log.Printf("engine: rendering on %s (%s)", renderer.DeviceName, renderer.DeviceTypeName)
 	if renderer.DeviceIsSoftware {
@@ -242,7 +282,10 @@ func run() error {
 		}
 		if cfg.TextureQuality != config.TextureNearest {
 			log.Printf("engine: textureQuality=%s — filtered wall/flat sampling is CPU-heavy on the software rasterizer; set it to \"nearest\" if the frame rate suffers", cfg.TextureQuality)
+			done = stageTimer("warm filtered-texture cache")
 			ras.WarmTextureCache(level) // build mip chains now, not mid-frame on first sight of a room
+			done()
+			win.PollEvents()
 		}
 	}
 
@@ -250,7 +293,10 @@ func run() error {
 	game.LitMode = lit // may have been forced off by the fallback above
 	if hw {
 		game.HardwareMode = true
+		done = stageTimer("build static world geometry (BSP walk + texture decode)")
 		game.WorldBuilder = worldgeo.New(level, tree, textures)
+		done()
+		win.PollEvents()
 		game.ApplyMapInfo() // push the starting level's UMAPINFO sky to the fresh WorldBuilder
 		// HDR tonemap exposure (config) + a fixed bloom strength for the
 		// glow around dynamic lights / bright texels. The mip-pyramid bloom
@@ -265,7 +311,11 @@ func run() error {
 		if strings.HasPrefix(mapName, "MAP") {
 			pk3 = "Doom2_Voxel.pk3"
 		}
-		if vs, err := assets.LoadVoxelPackDir(pk3); err != nil {
+		done = stageTimer("load voxel pack " + pk3)
+		vs, err := assets.LoadVoxelPackDir(pk3)
+		done()
+		win.PollEvents()
+		if err != nil {
 			log.Printf("engine: voxel models unavailable (%v) — using sprites", err)
 		} else {
 			game.Voxels = vs
@@ -274,7 +324,10 @@ func run() error {
 			if hw {
 				// Mesh + upload every model up front so no first-sight GPU
 				// stall hits the render loop mid-game.
+				done = stageTimer("mesh + upload voxel models")
 				renderer.WarmVoxels(vs.Models())
+				done()
+				win.PollEvents()
 			}
 		}
 	}
@@ -298,6 +351,7 @@ func run() error {
 		game.OnMusicChange = func(m string) { playLevelMusic(w, music, game.MapMusicLump(m), m) }
 	}
 
+	log.Printf("engine: [load] total (map chosen -> first frame): %s", time.Since(loadStart).Round(time.Millisecond))
 	log.Println("engine: entering main loop (WASD/mouse to move+look, Space to jump, E to use doors/switches, 1-7 weapons, left click to fire, F1 cycles HUD, Esc to quit)")
 	return game.Run()
 }

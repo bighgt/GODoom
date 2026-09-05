@@ -4,6 +4,8 @@ import (
 	_ "embed"
 	"fmt"
 	"math"
+	"runtime"
+	"sync"
 	"unsafe"
 
 	vk "github.com/goki/vulkan"
@@ -161,11 +163,55 @@ func (r *Renderer) worldCreateVoxelPipeline() error {
 // device stall per model on first sight in the render loop (Cheello's Doom1
 // pack has ~300 distinct models). Called at level load on the hardware
 // path; safe on a nil / non-hardware renderer.
+//
+// The meshing itself (worldgeo.BuildVoxelMesh: an occupancy flood-fill plus
+// exposed-face emission per model) is pure CPU work with no Vulkan calls and
+// no shared state between models, and dominates this function's cost — on a
+// ~300-model pack it was measured taking several seconds run one model at a
+// time, most of a level load's total time. It's spread across every core
+// below; only that meshing step is concurrent — buffer creation and the
+// GPU upload after it still run on this goroutine exactly as before.
 func (r *Renderer) WarmVoxels(models []*assets.VoxelModel) {
 	if r == nil || !r.hw || r.wr == nil {
 		return
 	}
 	wr := r.wr
+
+	type job struct {
+		m    *assets.VoxelModel
+		data []byte
+	}
+	jobs := make([]job, 0, len(models))
+	for _, m := range models {
+		if m == nil || wr.voxCache[m] != nil {
+			continue
+		}
+		jobs = append(jobs, job{m: m})
+	}
+	if len(jobs) == 0 {
+		return
+	}
+
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(jobs) {
+		workers = len(jobs)
+	}
+	next := make(chan int)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range next {
+				jobs[i].data = worldgeo.BuildVoxelMesh(jobs[i].m)
+			}
+		}()
+	}
+	for i := range jobs {
+		next <- i
+	}
+	close(next)
+	wg.Wait()
 
 	type pending struct {
 		m      *assets.VoxelModel
@@ -178,22 +224,18 @@ func (r *Renderer) WarmVoxels(models []*assets.VoxelModel) {
 	var todo []pending
 	var scratch []byte // all meshes concatenated, staged in one buffer
 
-	for _, m := range models {
-		if m == nil || wr.voxCache[m] != nil {
+	for _, j := range jobs {
+		if len(j.data) == 0 {
+			wr.voxCache[j.m] = &voxelMesh{}
 			continue
 		}
-		data := worldgeo.BuildVoxelMesh(m)
-		if len(data) == 0 {
-			wr.voxCache[m] = &voxelMesh{}
-			continue
-		}
-		vbuf, vmem, err := r.deviceLocalVertexBuffer(len(data))
+		vbuf, vmem, err := r.deviceLocalVertexBuffer(len(j.data))
 		if err != nil {
 			return
 		}
-		todo = append(todo, pending{m: m, vbuf: vbuf, vbufMem: vmem, off: len(scratch), size: len(data),
-			count: uint32(len(data) / worldgeo.VoxelPackedVertexSize)})
-		scratch = append(scratch, data...)
+		todo = append(todo, pending{m: j.m, vbuf: vbuf, vbufMem: vmem, off: len(scratch), size: len(j.data),
+			count: uint32(len(j.data) / worldgeo.VoxelPackedVertexSize)})
+		scratch = append(scratch, j.data...)
 	}
 	if len(todo) == 0 {
 		return
