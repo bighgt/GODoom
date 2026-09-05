@@ -95,6 +95,24 @@ float fade(bool isFlat) {
     return (32.0 - row) / 32.0;
 }
 
+// AMBIENT_GAMMA shapes sectorAmbientFrac's curve: <1 lifts the midtones (a
+// half-lit room reads noticeably more than half as bright) while keeping the
+// 0 and 1 endpoints fixed, so a truly dark sector still reads dark next to a
+// merely-dim one instead of everything above near-black bunching together.
+const float AMBIENT_GAMMA = 0.6;
+
+// sectorAmbientFrac is the sector's OWN authored brightness (light level *
+// lightScale, extralight excluded), as a 0..1 fraction — deliberately NOT
+// run through fade()'s distance-diminish term. Real ambient fill in a room
+// doesn't fall off with how far across it you're standing; only a specific
+// light source's falloff should do that. Used to scale the ambient-light
+// floor below so a well-lit room stays legible at any range while a dark
+// room stays dark, instead of one flat floor erasing the difference.
+float sectorAmbientFrac() {
+    float frac = clamp(vLight * W.light.x, 0.0, 1.0);
+    return pow(frac, AMBIENT_GAMMA);
+}
+
 // skyColorAt samples the sky texture by view direction for a given screen
 // pixel, mirroring raster/sky.go: horizontally skyPixPerTurn texture
 // columns per 360 deg yaw; vertically the vanilla skytexturemid mapping —
@@ -405,11 +423,15 @@ void main() {
     // light.frag's model.
     float bmask = dot(texture(uBright, vUV).rgb, vec3(0.299, 0.587, 0.114));
     float litAmt = max(base, bmask);
-    // Ambient floor (config ambientLight, W.light.w): a fully-shadowed
-    // surface never reads darker than this fraction of its real texture
-    // colour — the actual visibility fix, distinct from the tint below.
-    // 0 reproduces the old behaviour.
-    litAmt = max(litAmt, W.light.w);
+    // Ambient floor (config ambientLight, W.light.w), scaled by how bright
+    // THIS sector actually is (sectorAmbientFrac, undiminished by camera
+    // distance): a monster standing across a well-lit room still reads
+    // detailed instead of fading to near-black by mid-room, while one in a
+    // genuinely dark sector gets little to no lift — "less ambient reaches
+    // them" — and only a real light source (torch, muzzle flash, the
+    // flashlight) picks it out. 0 reproduces the old crush-to-black
+    // behaviour regardless of sector brightness.
+    litAmt = max(litAmt, W.light.w * sectorAmbientFrac());
     // Hemisphere tint: a deep shadow settles toward a faint sky-tinted fill
     // instead of crushing to pure black, so unlit corners read as "in
     // shadow" with some environment bounce rather than as void. Fades out

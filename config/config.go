@@ -203,15 +203,20 @@ type Config struct {
 	// darker (0.75, the default, is a deliberately moodier baseline than
 	// vanilla Doom), higher washes the map out. Clamped to [0.1, 2.0].
 	LightScale float64 `json:"lightScale"`
-	// AmbientLight is a minimum brightness floor applied after LightScale
-	// and every dynamic light are summed, in the enhanced and hardware
-	// pipelines: a fully-shadowed surface never reads darker than this
-	// fraction of its real texture colour, so a pitch-black sector stays
-	// legible even with no torches nearby and the flashlight off. 0 (off)
-	// reproduces the old crush-to-near-black behaviour; higher values trade
-	// moodiness for visibility. Default 0.2, clamped to [0, 1]. Ignored by
-	// the vanilla pipeline (which has no dynamic lights and its own,
-	// non-configurable colormap floor).
+	// AmbientLight is a brightness-floor GAIN applied after LightScale and
+	// every dynamic light are summed, in the enhanced and hardware
+	// pipelines: a surface (wall, flat, or a monster/thing sprite) never
+	// reads darker than AmbientLight * that sector's OWN authored
+	// brightness, undiminished by camera distance — so a monster standing
+	// across a well-lit room stays legible and detailed instead of fading
+	// toward black by mid-room the way the distance-based fade alone would
+	// leave it, while a monster in a genuinely dark sector gets little to
+	// no lift and needs a real light source (torch, muzzle flash, the
+	// flashlight) to be seen. 0 (off) reproduces the old crush-to-near-
+	// black behaviour in every sector regardless of its brightness; higher
+	// values trade moodiness for visibility. Default 0.2, clamped to
+	// [0, 1]. Ignored by the vanilla pipeline (which has no dynamic lights
+	// and its own, non-configurable colormap floor).
 	AmbientLight float64 `json:"ambientLight"`
 	// Exposure is a final multiply on the enhanced pipeline's HDR colour
 	// just before the tonemap — the knob to pull the whole image up or down

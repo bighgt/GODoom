@@ -29,8 +29,8 @@
   "//lightingMode": "enhanced | vanilla  —  enhanced = CPU emits a G-buffer + Vulkan does deferred lighting/HDR/bloom; vanilla = CPU shades every wall/flat, GPU only blits. Auto-falls back to vanilla if the GPU path won't start (default enhanced)",
   "lightingMode": "enhanced",
   "//lightScale": "0.1 .. 2.0  —  multiplies every sector's authored light before shading; lower = darker (default 0.75)",
-  "lightScale": 0.40,
-  "//ambientLight": "0.0 .. 1.0  —  minimum brightness floor applied after lightScale and every dynamic light are summed (enhanced/hardware only): a fully-shadowed surface never reads darker than this fraction of its real texture colour, so dark rooms stay legible even with no torches nearby and the flashlight off. 0 = old crush-to-near-black behaviour (default 0.2)",
+  "lightScale": 0.60,
+  "//ambientLight": "0.0 .. 1.0  —  brightness-floor gain (enhanced/hardware only): a surface (wall, flat, or monster/thing) never reads darker than ambientLight * that sector's own authored brightness, undiminished by distance — so a monster across a well-lit room stays visible instead of fading to black by mid-room, while one in a genuinely dark sector still needs a real light source to be seen. 0 = old flat crush-to-near-black behaviour regardless of sector brightness (default 0.2)",
   "ambientLight": 0.50,
   "//exposure": "0.1 .. 4.0  —  final multiply on the enhanced pipeline's HDR colour before the tonemap; ignored by vanilla mode (default 1.0)",
   "exposure": 1.0,
@@ -41,7 +41,7 @@
   "//fogColor": "hex \"RRGGBB\" (leading # ok)  —  distance-fog colour. Empty (default) disables fog. Works in all three render paths (software vanilla/enhanced, hardware)",
   "fogColor": "",
   "//fogDensity": "0 .. 0.02  —  exponential distance-fog strength: fogFactor = 1 - exp(-density * distance) in map units. 0 (default) = off. ~0.0006 a light haze, ~0.003 a heavy murk. Fog is only applied when fogColor is also set",
-  "fogDensity": 0.4,
+  "fogDensity": 0.2,
   "//textureQuality": "nearest | bilinear | trilinear | aniso2x | aniso4x | aniso8x | aniso16x  —  one global texture filter for walls, flats, sprites and voxels. nearest = classic hard pixels (fastest). The filtered modes are CPU-heavy: ~5x the frame cost at trilinear, ~8x at aniso8x/16x (1080p). Unknown -> nearest (default nearest)",
   "textureQuality": "aniso8x",
 
@@ -52,7 +52,7 @@
   "//voxelScale": "0.25 .. 4.0  —  map units per voxel; Cheello's Voxel Doom is authored at 1.0 (default 1.0)",
   "voxelScale": 0.9,
   "//quake1Textures": "true | false  —  layer a Quake 1 texture pack (assets/textures/quake1/, built by `go run ./tools/importquake` from assets/import/Quake1_Textures.pk3) over the hi-res set: a Quake texture wins for every Doom name the curated table covers, all others fall through to assets/textures/walls|flats then the WAD. Leaves the existing hi-res PNGs untouched (default false)",
-  "quake1Textures": true,
+  "quake1Textures": false,
 
   "//switchWeaponOnPickup": "true | false  —  true = auto-switch to a newly picked-up weapon (id's behaviour); false = keep the current one up (default true)",
   "switchWeaponOnPickup": true,

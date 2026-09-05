@@ -318,10 +318,19 @@ void main() {
     float bright = texelFetch(uLightParam, ip, 0).g;
     float litAmt = max(baseFade, bright);
 
-    // Ambient floor (config ambientLight, S.spotCosInner.y): a fully-shadowed
-    // surface never reads darker than this fraction of its real texture
-    // colour — the actual visibility fix. 0 reproduces the old behaviour.
-    litAmt = max(litAmt, S.spotCosInner.y);
+    // Ambient floor (config ambientLight, S.spotCosInner.y), scaled by how
+    // bright THIS sector actually is — lightLevel (already lightScale'd,
+    // pre-quantisation, NOT diminished by view distance the way baseFade
+    // is): a monster across a well-lit room still reads detailed instead of
+    // fading to near-black by mid-room, while one in a genuinely dark
+    // sector gets little to no lift, so only a real light source picks it
+    // out there. AMBIENT_GAMMA<1 lifts midtones so a half-lit room reads
+    // noticeably more than half as bright, without moving the 0/1
+    // endpoints — matches world.frag's sectorAmbientFrac. 0 reproduces the
+    // old crush-to-black behaviour regardless of sector brightness.
+    const float AMBIENT_GAMMA = 0.6;
+    float sectorAmbientFrac = pow(clamp(lightLevel / 255.0, 0.0, 1.0), AMBIENT_GAMMA);
+    litAmt = max(litAmt, S.spotCosInner.y * sectorAmbientFrac);
 
     // Cool ambient floor: a deep shadow settles toward a faint blue rather
     // than crushing to pure black — matches world.frag. Fades out as the
