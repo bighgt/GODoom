@@ -6,14 +6,13 @@ import (
 
 	vk "github.com/goki/vulkan"
 
-	"twopointfive/raster"
 	"twopointfive/render/worldgeo"
 )
 
 // This file is the one-time resource build for the hardware-geometry path
-// (see world.go): the offscreen scene + depth targets, the two fade LUT
-// images, the per-slot host buffers, the descriptor layouts / sets, and the
-// world + present-blit pipelines. Per-texture GPU images live in worldtex.go.
+// (see world.go): the offscreen scene + depth targets, the per-slot host
+// buffers, the descriptor layouts / sets, and the world + present-blit
+// pipelines. Per-texture GPU images live in worldtex.go.
 
 // wMakeImage allocates a device-local image + view for an arbitrary format /
 // usage / aspect / mip count. Mirrors litMakeImage but isn't limited to
@@ -280,24 +279,12 @@ func (r *Renderer) worldCreateOffscreen() error {
 	return nil
 }
 
-func (r *Renderer) worldCreateLUTs() error {
+// worldCreateDummyTex builds the 1x1 black fallback brightmap. (Formerly
+// also built the two vanilla-LUT images world.frag sampled its sector fade
+// from; that fade is now the continuous formula in fade() — see world.frag
+// — so the LUTs and their upload path were dead weight and were removed.)
+func (r *Renderer) worldCreateDummyTex() error {
 	wr := r.wr
-	lut := raster.BuildLightLUT()
-
-	scaledDst := vk.ImageUsageFlags(vk.ImageUsageTransferDstBit) | vk.ImageUsageFlags(vk.ImageUsageSampledBit)
-	var err error
-	if wr.scaleLUT, err = r.wMakeImage(lut.ScaleCols, lut.Levels, vk.FormatR16Unorm, scaledDst, vk.ImageAspectFlags(vk.ImageAspectColorBit), 1); err != nil {
-		return err
-	}
-	if wr.zLUT, err = r.wMakeImage(lut.ZCols, lut.Levels, vk.FormatR16Unorm, scaledDst, vk.ImageAspectFlags(vk.ImageAspectColorBit), 1); err != nil {
-		return err
-	}
-	if err := r.uploadLUT(wr.scaleLUT.image, lut.ScaleCols, lut.Levels, lut.Scale); err != nil {
-		return err
-	}
-	if err := r.uploadLUT(wr.zLUT.image, lut.ZCols, lut.Levels, lut.Z); err != nil {
-		return err
-	}
 
 	// 1x1 black dummy — bound to set-0 binding 1 for any texture that has no
 	// brightmap, so world.frag can sample uBright unconditionally.
@@ -309,22 +296,6 @@ func (r *Renderer) worldCreateLUTs() error {
 	}
 	wr.dummyTex = dummy
 	return r.uploadImagePixels(dummy.image, 1, 1, []byte{0, 0, 0, 255}, vk.ImageLayoutShaderReadOnlyOptimal)
-}
-
-// uploadLUT converts a 0..256 brightness table to R16_UNORM (256 -> 1.0) and
-// uploads it as a single-mip image left in SHADER_READ_ONLY_OPTIMAL.
-func (r *Renderer) uploadLUT(img vk.Image, w, h int, vals []uint16) error {
-	pix := make([]byte, w*h*2)
-	for i, v := range vals {
-		u := uint32(v)
-		if u > 256 {
-			u = 256
-		}
-		n := uint16(u * 65535 / 256)
-		pix[i*2] = byte(n)
-		pix[i*2+1] = byte(n >> 8)
-	}
-	return r.uploadImagePixels(img, w, h, pix, vk.ImageLayoutShaderReadOnlyOptimal)
 }
 
 func (r *Renderer) worldCreateBuffers() error {
@@ -383,7 +354,11 @@ func (r *Renderer) worldCreateDescriptorLayouts() error {
 	if wr.dsl0, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0), samplerBinding(1)}); err != nil {
 		return err
 	}
-	if wr.dsl1, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0), samplerBinding(1), uboBinding}); err != nil {
+	// binding 2 is a deliberate gap: bindings 0/1 used to be the two dead
+	// vanilla-LUT samplers (see worldCreateDummyTex's comment) — leaving the
+	// UBO at its existing binding number means voxel.frag (which shares this
+	// exact layout, bound at its own set 0) needed no renumbering either.
+	if wr.dsl1, err = mk([]vk.DescriptorSetLayoutBinding{uboBinding}); err != nil {
 		return err
 	}
 	// present blit: uScene (HDR), uBloom (HDR half-res), uOverlay, uDepth (world pass D32), world UBO
@@ -401,9 +376,10 @@ func (r *Renderer) worldCreateDescriptors() error {
 		MaxSets:       uint32(2 * maxFramesInFlight), // set1 + setBlit per slot
 		PoolSizeCount: 2,
 		PPoolSizes: []vk.DescriptorPoolSize{
-			// per slot: set1 = 2 samplers (LUTs), setBlit = 4 samplers
-			// (scene, bloom, overlay, depth); +2 slack.
-			{Type: vk.DescriptorTypeCombinedImageSampler, DescriptorCount: uint32(6*maxFramesInFlight + 2)},
+			// per slot: set1 = 0 samplers (its 2 LUT samplers were removed as
+			// dead code), setBlit = 4 samplers (scene, bloom, overlay,
+			// depth); +2 slack.
+			{Type: vk.DescriptorTypeCombinedImageSampler, DescriptorCount: uint32(4*maxFramesInFlight + 2)},
 			// per slot: set1 + setBlit each bind the world UBO; +1 slack.
 			{Type: vk.DescriptorTypeUniformBuffer, DescriptorCount: uint32(2*maxFramesInFlight + 1)},
 		},
@@ -467,8 +443,6 @@ func (r *Renderer) worldCreateDescriptors() error {
 			return err
 		}
 		writes = append(writes,
-			imgW(sl.set1, 0, wr.clampSampler, wr.scaleLUT.view),
-			imgW(sl.set1, 1, wr.clampSampler, wr.zLUT.view),
 			vk.WriteDescriptorSet{
 				SType:           vk.StructureTypeWriteDescriptorSet,
 				DstSet:          sl.set1,
@@ -498,7 +472,7 @@ func (r *Renderer) worldCreateDescriptors() error {
 func (r *Renderer) worldCreatePipelines() error {
 	wr := r.wr
 
-	// World pipeline layout: set 0 (per-texture), set 1 (LUT + UBO),
+	// World pipeline layout: set 0 (per-texture), set 1 (World UBO),
 	// push-constant mat4 (the view-projection) in the vertex stage.
 	wlInfo := vk.PipelineLayoutCreateInfo{
 		SType:                  vk.StructureTypePipelineLayoutCreateInfo,
@@ -515,13 +489,15 @@ func (r *Renderer) worldCreatePipelines() error {
 
 	blInfo := vk.PipelineLayoutCreateInfo{
 		SType:          vk.StructureTypePipelineLayoutCreateInfo,
-		SetLayoutCount: 1,
-		PSetLayouts:    []vk.DescriptorSetLayout{wr.dslBlit},
+		SetLayoutCount: 2,
+		PSetLayouts:    []vk.DescriptorSetLayout{wr.dslBlit, wr.shadow.dslSample},
 		// worldblit.frag PC (8 vec4 = 128B, the guaranteed maxPushConstantsSize
 		// floor): p0 exposure,bloomStrength,waterClock,near; p1 sinA,cosA,focal,
 		// far; p2 camX,camY,camZ,horizonY; p3 w,h,ssrStrength,aoStrength;
 		// p4 sunDir.xyz,godrayStrength; p5 aoRadius,sharpenStrength,ditherStrength,
-		// aoBias; p6 contactShadowLight.xyz,radius; p7 screenTint.rgb,amount
+		// aoBias; p6 vestigial (the dyn-light shadow march moved to
+		// worldshadow.go's own pass, sampled here via set 1 instead); p7
+		// screenTint.rgb,amount
 		PushConstantRangeCount: 1,
 		PPushConstantRanges:    []vk.PushConstantRange{{StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit), Offset: 0, Size: 128}},
 	}

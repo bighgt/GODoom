@@ -20,18 +20,20 @@ import (
 // Hardware (GPU-geometry) renderer — the "Tier 2" path. The CPU walks the
 // BSP into a per-texture-grouped triangle list (render/worldgeo) and the GPU
 // does rasterisation, perspective-correct texturing, mip/anisotropic
-// filtering, the depth test, and the exact vanilla sector/distance fade
-// (world.frag samples the LUT raster.BuildLightLUT bakes). One draw call per
-// texture — plain Vulkan 1.0, no bindless. Selected by config
-// "renderer": "hardware"; the CPU software rasterizer stays the default and
-// the fallback.
+// filtering, the depth test, and a continuous vanilla-style sector/distance
+// fade (world.frag's fade()). One draw call per texture — plain Vulkan 1.0,
+// no bindless. Selected by config "renderer": "hardware"; the CPU software
+// rasterizer stays the default and the fallback.
 //
 // Per frame DrawWorld records into one command buffer:
 //
 //	A  world.vert/frag   packed triangle list -> offscreen RGBA16F HDR scene
 //	                     colour (render res) + a sampleable D32 depth buffer
-//	B  worldbloom.go     scene bright part -> a mip-pyramid glow buffer
-//	C  worldblit.frag    SSR / SSAO / god rays / contact shadow, ACES
+//	B  worldshadow.frag  quarter-res dynamic-light shadow-occlusion term —
+//	                     the low res + the present pass's bilinear read of
+//	                     it is what makes the shadow edge soft
+//	C  worldbloom.go     scene bright part -> a mip-pyramid glow buffer
+//	D  worldblit.frag    SSR / SSAO / god rays / contact shadow, ACES
 //	                     tonemap, FXAA, CAS, screen tint, then upscale
 //	                     letterboxed to the swapchain with the crisp
 //	                     un-composited 2D overlay (HUD/weapon) on top
@@ -150,7 +152,7 @@ type worldSlot struct {
 	depth litImage // D32 depth for the world pass
 	fb    vk.Framebuffer
 
-	set1    vk.DescriptorSet // world.frag set 1: uScaleLUT, uZLUT, World UBO
+	set1    vk.DescriptorSet // world.frag set 1: World UBO
 	setBlit vk.DescriptorSet // worldblit.frag: uScene, uOverlay
 }
 
@@ -172,12 +174,10 @@ type worldResources struct {
 	clampSampler vk.Sampler // LUT / scene / overlay: linear, clamp-to-edge
 	depthSampler vk.Sampler // world-pass depth for the blit's water SSR: nearest, clamp
 
-	scaleLUT litImage // R16_UNORM, ScaleCols x Levels (walls/sprites fade)
-	zLUT     litImage // R16_UNORM, ZCols x Levels     (flats fade)
 	dummyTex litImage // 1x1 black — set-0 binding 1 for textures with no brightmap
 
 	dsl0    vk.DescriptorSetLayout // set 0: per-texture sampler2D
-	dsl1    vk.DescriptorSetLayout // set 1: uScaleLUT, uZLUT, World UBO
+	dsl1    vk.DescriptorSetLayout // set 1: World UBO
 	dslBlit vk.DescriptorSetLayout // present: uScene, uOverlay
 
 	plWorld   vk.PipelineLayout
@@ -199,7 +199,8 @@ type worldResources struct {
 
 	texCache map[*assets.RGBA]*worldTex // keyed by the shared bitmap pointer
 
-	bloom worldBloom // HDR bright-pass + blur (worldbloom.go)
+	bloom  worldBloom  // HDR bright-pass + blur (worldbloom.go)
+	shadow worldShadow // quarter-res dynamic-light shadow term (worldshadow.go)
 
 	// Static world geometry (all walls + flats) — one device-local vertex
 	// buffer, re-uploaded only when the builder bumps StaticVersion (a door
@@ -255,8 +256,9 @@ func NewWorld(win *window.Window, srcW, srcH int, vsync, debug bool) (*Renderer,
 		r.worldCreateSceneRenderPass,
 		r.worldCreateOffscreen,
 		r.worldCreateBloom, // before descriptors — setBlit samples bloom mip 0
-		r.worldCreateLUTs,
+		r.worldCreateDummyTex,
 		r.worldCreateBuffers,
+		r.worldCreateShadowPass, // needs sl.depth (offscreen) + sl.ubo (buffers); before worldCreatePipelines (needs wr.shadow.dslSample)
 		r.worldCreateDescriptorLayouts,
 		r.worldCreateDescriptors,
 		r.worldCreatePipelines,
@@ -697,10 +699,15 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 	vk.CmdEndRenderPass(cmd)
 	// rpScene's finalLayout transitions the scene image to shader-read for us.
 
-	// (3) bloom: build the HDR mip pyramid -> bloom mip 0.
+	// (3) dynamic-light shadow term: quarter-res occlusion buffer (worldshadow.go)
+	// — its low resolution plus the present pass's bilinear read of it is what
+	// makes the shadow edge soft, not any math in the shader itself.
+	r.recordShadowTerm(cmd, frame, cam)
+
+	// (4) bloom: build the HDR mip pyramid -> bloom mip 0.
 	r.recordBloom(cmd, frame)
 
-	// (4) present blit: tonemap(scene*exposure + bloom*strength), upscaled
+	// (5) present blit: tonemap(scene*exposure + bloom*strength), upscaled
 	// letterboxed, with the crisp overlay composited on top.
 	vpLB := r.letterboxViewport()
 	vk.CmdBeginRenderPass(cmd, &vk.RenderPassBeginInfo{
@@ -717,7 +724,8 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 		Offset: vk.Offset2D{X: int32(vpLB.X), Y: int32(vpLB.Y)},
 		Extent: vk.Extent2D{Width: uint32(vpLB.Width), Height: uint32(vpLB.Height)},
 	}})
-	vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, wr.plBlit, 0, 1, []vk.DescriptorSet{sl.setBlit}, 0, nil)
+	vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, wr.plBlit, 0, 2,
+		[]vk.DescriptorSet{sl.setBlit, wr.shadow.setSample}, 0, nil)
 	// worldblit.frag PC: tonemap params + the camera basis it needs to
 	// reconstruct a world point from (screen pixel, sampled depth) and march
 	// the depth buffer for the water SSR reflection. horizonY / focal match
@@ -739,12 +747,6 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 		sharpenStrength  = 0.35              // CAS 0..1
 		ditherStrength   = 1.0               // +/- 1 LSB triangular-PDF, kills 8-bit banding
 		sunX, sunY, sunZ = 0.40, 0.30, 0.866 // |sun| == 1, ~60 deg elevation
-		// Screen-space dynamic-light shadows (worldblit.frag dynShadow):
-		// strength 0 disables. march = how far along the ray-to-light to
-		// search for an occluder; bias in camera-forward units.
-		dynShadowStrength = 0.6
-		dynShadowMarch    = 320.0
-		dynShadowBias     = 2.0
 	)
 	blitPC := [32]float32{
 		wr.bloom.exposure, wr.bloom.strength, float32(cam.Time), float32(worldgeo.NearPlane),
@@ -753,8 +755,11 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 		float32(wr.w), float32(wr.h), ssrStrength, aoStrength,
 		sunX, sunY, sunZ, godrayStrength,
 		aoRadius, sharpenStrength, ditherStrength, aoBias,
-		// p6: screen-space dynamic-light shadows — count (reads lightPos[0..N)
-		// from the world UBO), strength, march distance, depth bias.
+		// p6: vestigial — worldblit.frag's own shadow march was replaced by
+		// worldshadow.go's quarter-res pass (recordShadowTerm, which reads
+		// these same dynShadowStrength/March/Bias constants), so this slot
+		// is unused by the shader now. Left populated rather than reworking
+		// the fixed 8-vec4 push-constant layout for a purely cosmetic win.
 		float32(cam.ShadowCasterN), dynShadowStrength, dynShadowMarch, dynShadowBias,
 		// p7: full-frame sector-effect tint (rgb, amount; A<0 also = heat wobble)
 		cam.TintR, cam.TintG, cam.TintB, cam.TintA,
@@ -777,6 +782,7 @@ func (r *Renderer) destroyWorldResources() {
 	dev := r.device
 
 	r.destroyBloom()
+	r.destroyShadowPass()
 	r.destroyVoxelResources()
 
 	for _, p := range []vk.Pipeline{wr.pipeWorld, wr.pipeDepth, wr.pipeBlit} {
@@ -805,8 +811,6 @@ func (r *Renderer) destroyWorldResources() {
 		freeLitImage(dev, wt.bright)
 	}
 	wr.texCache = nil
-	freeLitImage(dev, wr.scaleLUT)
-	freeLitImage(dev, wr.zLUT)
 	freeLitImage(dev, wr.dummyTex)
 	for i := range wr.slots {
 		sl := &wr.slots[i]

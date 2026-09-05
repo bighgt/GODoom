@@ -20,14 +20,12 @@ layout(push_constant) uniform PC {
 
 const int MAX_LIGHTS = 64;
 
-// Shares the world path's set-1 layout (dslT1: LUTs + World UBO), but the
-// voxel pipeline layout has just that one set, so it's bound at set 0 here.
-layout(set = 0, binding = 0) uniform sampler2D uScaleLUT; // walls/sprites, 48 cols, 16 rows
-layout(set = 0, binding = 1) uniform sampler2D uZLUT;     // (unused here, part of the shared set)
+// Shares the world path's set-1 layout (dsl1: World UBO), but the voxel
+// pipeline layout has just that one set, so it's bound at set 0 here.
 layout(set = 0, binding = 2) uniform World {
     vec4 cam;
     vec4 screen;
-    vec4 light;    // lightScale, extraLight, scaleRef, lutLevels
+    vec4 light;    // lightScale, extraLight, scaleRef, ambientLight
     vec4 nLights;
     vec4 fog;      // unused here, but must be declared so the arrays below
     vec4 amb;      // land at the same std140 offset world.frag reads them at
@@ -53,6 +51,17 @@ float spriteFade() {
     return (32.0 - row) / 32.0;
 }
 
+// Ambient floor (config ambientLight, W.light.w) scaled by this voxel's own
+// sector brightness, undiminished by distance — see world.frag's
+// sectorAmbientFrac(). Without this a voxel-model monster in a dark sector
+// would sit noticeably darker than a sprite-drawn one standing right next
+// to it, since sprites/walls already get this floor and voxels didn't.
+const float AMBIENT_GAMMA = 0.6; // keep == world.frag
+float sectorAmbientFrac() {
+    float frac = clamp(pc.shade.x * W.light.x, 0.0, 1.0);
+    return pow(frac, AMBIENT_GAMMA);
+}
+
 const float DYN_GAIN = 2.2; // keep == world.frag
 
 vec3 dynamicDiffuse() {
@@ -70,7 +79,7 @@ vec3 dynamicDiffuse() {
         if (atten <= 0.0) continue;
         atten *= atten;
         float ndotl = max(dot(N, d * inversesqrt(max(d2, 1e-8))), 0.0);
-        sum += W.lightColor[i].rgb * (atten * (0.35 + 0.65 * ndotl)); // see world.frag
+        sum += W.lightColor[i].rgb * (atten * (0.25 + 0.75 * ndotl)); // see world.frag
     }
     vec3 g = sum * DYN_GAIN;
     float m = max(g.x, max(g.y, g.z));
@@ -82,7 +91,7 @@ void main() {
         outColor = vec4(vColor * 1.35, 1.0); // emissive — pushed >1 for bloom
         return;
     }
-    float base = spriteFade();
+    float base = max(spriteFade(), W.light.w * sectorAmbientFrac());
     vec3 lit = vec3(base) + dynamicDiffuse(); // HDR — see world.frag
     outColor = vec4(vColor * lit + vColor * hemiAmbient() * (1.0 - clamp(base, 0.0, 1.0)), 1.0);
 }

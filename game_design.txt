@@ -725,8 +725,10 @@ fade + dynamic light loop, then shades walls/flats/sky, the alpha-tested
 world.vert/world.frag: one draw call per texture (a bound set-0 per Draw,
 plain Vulkan 1.0 — no bindless), wall/flat/sprite images uploaded once as
 device-local mip chains (GPU blit chain) sampled with an anisotropic REPEAT
-sampler, the exact vanilla scalelight/zlight fade sampled from two
-R16_UNORM LUT images (raster.BuildLightLUT). Set-0 binding 1 is the run's
+sampler, a continuous take on the vanilla scalelight/zlight fade computed
+directly in the shader (fade() — sector light -> lightnum -> startmap minus
+a smooth 1/distance term; the old quantised two-LUT version was removed as
+dead code once this replaced it). Set-0 binding 1 is the run's
 brightmap mask (worldgeo.Draw.Bright, resolved once per texture like Tex; a
 1x1 black dummy when it has none); world.frag lights a masked texel to
 max(sectorFade, luma(uBright)) + a small bloom kicker so a lit panel /

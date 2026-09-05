@@ -17,6 +17,9 @@
 //                    rotated disc, darken creases. World pixels only.
 //   3. god rays    — radial scatter of sky / bright HDR toward the sun's
 //                    projected screen point.
+//   3b. dyn shadows — bilinear sample of uShadowTerm, the quarter-res
+//                    occlusion buffer worldshadow.frag pre-marched this
+//                    frame; the low-res-then-bilinear read is the soft blur.
 //   4. tonemap     — ACES filmic (Narkowicz fit) of (scene+bloom)*exposure.
 //   5. FXAA        — console-variant edge AA on the tonemapped image.
 //   6. CAS         — FidelityFX-style contrast-adaptive sharpen.
@@ -25,10 +28,17 @@
 layout(location = 0) in vec2 fragUV;
 layout(location = 0) out vec4 outColor;
 
-layout(binding = 0) uniform sampler2D uScene;   // HDR, render res
-layout(binding = 1) uniform sampler2D uBloom;   // HDR, half res (linear upsample)
-layout(binding = 2) uniform sampler2D uOverlay; // LDR straight-alpha
-layout(binding = 3) uniform sampler2D uDepth;   // world pass D32 depth, render res (nearest)
+layout(set = 0, binding = 0) uniform sampler2D uScene;   // HDR, render res
+layout(set = 0, binding = 1) uniform sampler2D uBloom;   // HDR, half res (linear upsample)
+layout(set = 0, binding = 2) uniform sampler2D uOverlay; // LDR straight-alpha
+layout(set = 0, binding = 3) uniform sampler2D uDepth;   // world pass D32 depth, render res (nearest)
+// The dynamic-light shadow-occlusion term (worldshadow.go/.frag), quarter
+// render resolution — this is a SEPARATE descriptor set (set 1) rather than
+// a 5th binding on set 0, so this pass's own dedicated pool never has to
+// touch worldsetup.go's shared framePool sizing. Sampled through the
+// ordinary linear/clamp sampler: that bilinear upscale from quarter-res IS
+// the soft blur on the shadow edge, not any math in this shader.
+layout(set = 1, binding = 0) uniform sampler2D uShadowTerm;
 
 layout(push_constant) uniform PC {
     vec4 p0; // exposure, bloomStrength, waterClock, nearPlane
@@ -37,16 +47,9 @@ layout(push_constant) uniform PC {
     vec4 p3; // width, height, ssrStrength, aoStrength
     vec4 p4; // sunDir.xyz (world), godrayStrength
     vec4 p5; // aoRadius(world u), sharpenStrength(0..1), ditherStrength(LSBs), aoBias(world u)
-    vec4 p6; // dyn-light shadows: count, strength, marchDist, depthBias
+    vec4 p6; // vestigial — the dyn-light shadow march moved to worldshadow.frag
     vec4 p7; // screen tint: rgb, amount (0 = none; amount < 0 also = heat wobble)
 } pc;
-
-// The world UBO, bound here too (binding 4) — dynShadow() needs the light
-// positions. Layout must match world.frag's World block up to lightPos[].
-layout(binding = 4, std140) uniform W {
-    vec4 cam, screen, light, nLights, fog, amb;
-    vec4 lightPos[64]; // xyz = world pos, w = 1 / radius^2
-} wU;
 
 // ---- shared helpers -------------------------------------------------------
 
@@ -300,55 +303,6 @@ vec3 cas(vec2 uv, vec3 e) {
     return clamp(res, 0.0, 1.0);
 }
 
-// ---- 6b. screen-space shadows for the leading dynamic lights ----------
-
-// For each of the first pc.p6.x lights (muzzle flash, in-flight shots,
-// monster attacks, then the nearest torches), march uDepth from the shaded
-// point P toward the light. On-screen geometry between them occludes that
-// light; the pixel is dimmed by that light's falloff-weighted share, so a
-// distant or dim light casts only a faint shadow. Screen-space only — an
-// occluder the camera can't see casts nothing.
-float dynShadow(vec3 P) {
-    int n = int(pc.p6.x + 0.5);
-    if (n <= 0) return 1.0;
-    float strength = pc.p6.y, marchMax = pc.p6.z, bias = pc.p6.w;
-
-    float w = pc.p3.x, h = pc.p3.y, focal = pc.p1.z;
-    float sinA = pc.p1.x, cosA = pc.p1.y, nearP = pc.p0.w;
-    float camX = pc.p2.x, camY = pc.p2.y, camZ = pc.p2.z, horizonY = pc.p2.w;
-
-    float removed = 0.0; // Σ (falloff weight) over occluded lights
-    for (int li = 0; li < 8; ++li) {
-        if (li >= n) break;
-        vec3 Lp = wU.lightPos[li].xyz;
-        float invR2 = wU.lightPos[li].w;
-        vec3 toL = Lp - P;
-        float dist = length(toL);
-        float atten = 1.0 - dist * dist * invR2; // 1 - (d/R)^2
-        if (atten <= 0.03 || dist < 6.0) continue;
-        vec3 dir = toL / dist;
-
-        const int STEPS = 12;
-        float reach = min(dist - 3.0, marchMax);
-        float stepLen = reach / float(STEPS);
-        float occ = 0.0;
-        for (int i = 1; i <= STEPS; ++i) {
-            vec3 Q = P + dir * (stepLen * float(i) + 2.0);
-            float rx = Q.x - camX, ry = Q.y - camY;
-            float ez = rx * cosA + ry * sinA;
-            if (ez <= nearP) break;
-            float ex = rx * sinA - ry * cosA;
-            float sx = w * 0.5 + focal * ex / ez;
-            float sy = horizonY - focal * (Q.z - camZ) / ez;
-            if (sx < 0.0 || sx >= w || sy < 0.0 || sy >= h) break;
-            float diff = ez - linDepth(texelFetch(uDepth, ivec2(sx, sy), 0).r);
-            if (diff > bias && diff < 96.0) { occ = 1.0; break; }
-        }
-        removed += occ * atten * atten;
-    }
-    return 1.0 - clamp(removed, 0.0, 1.0) * strength;
-}
-
 // ---- main ---------------------------------------------------------------
 
 void main() {
@@ -380,9 +334,11 @@ void main() {
         hdr += godRays(uv) * pc.p4.w * vec3(1.06, 1.0, 0.88);
     }
 
-    // 3b. screen-space shadows from the leading dynamic lights
-    if (pc.p6.x > 0.5 && pc.p6.y > 0.0 && !isWater && !isSky && ez0 < 20000.0) {
-        hdr *= dynShadow(worldFromUV(uv, ez0));
+    // 3b. dynamic-light shadows — pre-marched at quarter res by
+    // worldshadow.frag; sampled here bilinearly, which is what makes the
+    // shadow edge soft rather than a per-pixel math trick.
+    if (!isWater && !isSky && ez0 < 20000.0) {
+        hdr *= texture(uShadowTerm, uv).r;
     }
 
     // 4. tonemap

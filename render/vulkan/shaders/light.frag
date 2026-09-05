@@ -146,10 +146,20 @@ const int   SHADOW_MAXCASTERS = 4;
 const int   SHADOW_STEPS      = 8;
 const float SHADOW_MAXLEN      = 200.0; // map units marched toward the light, at most
 
+// PENUMBRA_NEAR/FAR — see world.frag's dynShadow comment: an occluder found
+// early in the march (near the shaded point) casts a narrow, near-hard
+// shadow; one found late (near the light) spreads it into a soft, wide
+// band, the way a real (non-point) light source would. Softening this one
+// "how far along the ray" signal is what turns the shadow edge from a
+// binary cliff into a gradient.
+const float PENUMBRA_NEAR = 3.0;
+const float PENUMBRA_FAR  = 48.0;
+
 // ssShadow marches the depth buffer from a lit world point toward a light.
-// Returns 1.0 unshadowed, 0.0 fully blocked by nearer geometry. The camera
-// basis comes from S. A small step offset keeps a surface from shadowing
-// itself.
+// Returns 1.0 unshadowed, down to 0.0 fully blocked by nearer geometry,
+// with a soft gradient across the shadow boundary rather than a hard flip.
+// The camera basis comes from S. A small step offset keeps a surface from
+// shadowing itself.
 float ssShadow(vec3 world, vec3 lightPos) {
     float w = S.screen.x, h = S.screen.y, horizonY = S.screen.z;
     float sinA = S.view.x, cosA = S.view.y, focal = S.view.z;
@@ -162,6 +172,7 @@ float ssShadow(vec3 world, vec3 lightPos) {
     float march = min(ld, SHADOW_MAXLEN);
     float step = march / float(SHADOW_STEPS);
 
+    float occ = 0.0;
     for (int s = 1; s <= SHADOW_STEPS; ++s) {
         vec3 p = world + dir * (step * float(s));
         vec3 rel = p - camPos;
@@ -176,9 +187,14 @@ float ssShadow(vec3 world, vec3 lightPos) {
         // a surface here is closer to the camera than our ray sample by more
         // than a slack band -> it's between the point and the light.
         float bias = 1.5 + depth * 0.03;
-        if (sceneD < depth - bias) return 0.0;
+        float diff = depth - sceneD - bias;
+        if (diff > 0.0) {
+            float penumbra = mix(PENUMBRA_NEAR, PENUMBRA_FAR, clamp(float(s) / float(SHADOW_STEPS), 0.0, 1.0));
+            occ = max(occ, smoothstep(0.0, penumbra, diff));
+            if (occ >= 0.999) break;
+        }
     }
-    return 1.0;
+    return 1.0 - occ;
 }
 
 void main() {

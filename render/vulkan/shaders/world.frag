@@ -3,9 +3,8 @@
 // Hardware renderer — fragment stage. One draw per texture (the CPU groups
 // the triangle list into worldgeo.Draws by texture), so this samples a
 // single bound sampler2D rather than a bindless array — plain Vulkan 1.0.
-// Applies the exact vanilla sector-and-distance fade by sampling the LUT
-// raster.BuildLightLUT uploads (the same 0..256 tables raster's shadeMul /
-// lightRow use), then adds this frame's dynamic point lights on top.
+// Applies the continuous sector-and-distance fade (see fade() below), then
+// adds this frame's dynamic point lights on top.
 
 layout(location = 0) in vec2 vUV;
 layout(location = 1) in float vLight;   // sector light 0..1
@@ -20,11 +19,6 @@ layout(location = 0) out vec4 outColor;
 // mask (a 1x1 black dummy when the texture has none).
 layout(set = 0, binding = 0) uniform sampler2D uTex;
 layout(set = 0, binding = 1) uniform sampler2D uBright;
-
-// Per-frame: the two fade LUTs (R16_UNORM = multiplier/256, so 256 -> 1.0),
-// the params the fade / sky need, and this frame's dynamic point lights.
-layout(set = 1, binding = 0) uniform sampler2D uScaleLUT; // walls/sprites, 48 cols, 16 rows
-layout(set = 1, binding = 1) uniform sampler2D uZLUT;     // flats, 128 cols, 16 rows
 
 const int MAX_LIGHTS = 64; // keep == vulkan.worldMaxLights and render.MaxLights
 const int SHADOW_MAX = 24; // keep == vulkan.shadowCasterMax and engine.hwGroundShadowCap
@@ -79,10 +73,10 @@ vec3 hemisphereAmbient() {
     return mix(W.amb.rgb * 0.30, W.amb.rgb, up) * W.amb.w;
 }
 
-// fade is the base sector-and-distance shading. The vanilla LUT
-// (uScaleLUT / uZLUT) is quantised — 48 discrete distance columns — which
-// shows as an abrupt edge and stair-stepped dimming down a corridor. This
-// is the *continuous* version the enhanced software path uses
+// fade is the base sector-and-distance shading. The vanilla LUT approach
+// (48 discrete distance columns, since removed) showed as an abrupt edge
+// and stair-stepped dimming down a corridor. This is the *continuous*
+// version the enhanced software path uses
 // (light.frag's baseFade): sector light -> lightnum -> startmap, minus a
 // smooth 1/distance term, so brightness ramps down without bands. isFlat is
 // ignored (light.frag doesn't split flats from walls either).
@@ -268,15 +262,25 @@ vec3 dynamicDiffuse(vec3 N, float specMask) {
         if (atten <= 0.0) continue;
         atten *= atten;
         vec3 Ld = d * inversesqrt(max(d2, 1e-8));
-        float ndotl = max(dot(N, Ld), 0.0);
-        // 0.35 ambient floor so a light wraps around and its colour tints
-        // faces turned partly away.
+        // 0.25 ambient floor so a light wraps around and its colour tints
+        // faces turned partly away — keep == light.frag's point-light term,
+        // so the hardware and enhanced-software tiers read alike. A sprite
+        // billboard additionally gets light.frag's WRAP lambert (never goes
+        // fully dark-sided): its camera-facing normal is not a real
+        // geometric normal, so the harsh max(N.L,0) an ordinary wall gets
+        // made monsters read as wrongly dark-sided by a nearby torch. Uses
+        // the UNCLAMPED dot so a face-away sample (-1) still reads darker
+        // than a grazing one (0) — wrapping the already-clamped value would
+        // flatten that distinction away.
+        float ndlRaw = dot(N, Ld);
+        float ndotl = max(ndlRaw, 0.0); // still gates the spec term below
+        float lambert = (vKind == KIND_SPRITE) ? (0.5 + 0.5 * ndlRaw) : ndotl;
         float spec = 0.0;
         if (ndotl > 0.0 && specMask > 0.0) {
             float nh = max(dot(N, normalize(Ld + V)), 0.0);
             spec = pow(nh, SPEC_POWER) * SPEC_STRENGTH * specMask;
         }
-        sum += W.lightColor[i].rgb * (atten * (0.35 + 0.65 * ndotl + spec));
+        sum += W.lightColor[i].rgb * (atten * (0.25 + 0.75 * lambert + spec));
     }
 
     // --- flashlight spot: same falloff/lambert shape as a point light,
@@ -288,7 +292,9 @@ vec3 dynamicDiffuse(vec3 N, float specMask) {
         if (atten > 0.0) {
             atten *= atten;
             vec3 Ld = d * inversesqrt(max(d2, 1e-8));
-            float ndotl = max(dot(N, Ld), 0.0);
+            float ndlRaw = dot(N, Ld);
+            float ndotl = max(ndlRaw, 0.0);
+            float lambert = (vKind == KIND_SPRITE) ? (0.5 + 0.5 * ndlRaw) : ndotl;
             float cosAngle = dot(W.spotDirCosOuter.xyz, normalize(vWorldPos - W.spotPosInvR2.xyz));
             float cone = smoothstep(W.spotDirCosOuter.w, W.spotCosInner.x, cosAngle);
             if (cone > 0.0) {
@@ -297,7 +303,7 @@ vec3 dynamicDiffuse(vec3 N, float specMask) {
                     float nh = max(dot(N, normalize(Ld + V)), 0.0);
                     spec = pow(nh, SPEC_POWER) * SPEC_STRENGTH * specMask;
                 }
-                sum += W.spotColor.rgb * (atten * cone * (0.35 + 0.65 * ndotl + spec));
+                sum += W.spotColor.rgb * (atten * cone * (0.25 + 0.75 * lambert + spec));
             }
         }
     }
