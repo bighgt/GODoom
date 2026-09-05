@@ -27,7 +27,7 @@ func TestMuzzleFlashLightOnlyWhileFiring(t *testing.T) {
 }
 
 func rocketDef() *ProjectileDef {
-	return &ProjectileDef{ExplodePrefix: "BEXP", ExplodeFrames: []byte{'A', 'B', 'C', 'D', 'E'}, ExplodeTics: 4}
+	return &ProjectileDef{ExplodePrefix: "MISL", ExplodeFrames: []byte{'B', 'C', 'D'}, ExplodeTics: 4}
 }
 
 func TestProjectileLightColourByType(t *testing.T) {

@@ -15,7 +15,12 @@ func aimGameAtStart(g *Game) (sx, sy, sang float64) {
 	}
 	f, _ := g.sectorFloorCeil(sx, sy)
 	g.Camera.X, g.Camera.Y, g.Camera.Z, g.Camera.Angle = sx, sy, f+EyeHeight, sang
-	g.playerMobj.X, g.playerMobj.Y, g.playerMobj.Z = sx, sy, f
+	// loadRealLevel's bare-bones test playerMobj (pickup_integration_test.go)
+	// never sets Angle — normally runTic's per-tic sync (mobj.go) is what
+	// keeps it matching Camera.Angle. Set it here too so anything reading
+	// playerMobj.Angle directly (fireHitscan, aBFGSpray, ...) sees the same
+	// facing the camera was just pointed at.
+	g.playerMobj.X, g.playerMobj.Y, g.playerMobj.Z, g.playerMobj.Angle = sx, sy, f, sang
 	return sx, sy, sang
 }
 
@@ -93,6 +98,59 @@ func TestPlasmaMissDoesNotDamage(t *testing.T) {
 
 	if imp.Health != startHP {
 		t.Fatalf("plasma bolt that missed still changed imp HP %d -> %d", startHP, imp.Health)
+	}
+}
+
+// The BFG's spray must hit a second monster elsewhere in the room that the
+// ball itself never came near — the room-clearing splash that was missing
+// entirely before ProjectileDef.Spray/aBFGSpray existed.
+func TestBFGSpraysBystanderMonster(t *testing.T) {
+	g := loadRealLevel(t, "../testdata/DOOM1.WAD", "E1M1")
+	_, _, sang := aimGameAtStart(g)
+
+	// Directly ahead: the ball's own target, well short of the bystander
+	// below so the ball explodes long before it could ever reach it.
+	tx := g.Camera.X + math.Cos(sang)*40
+	ty := g.Camera.Y + math.Sin(sang)*40
+	g.P_SpawnMobj(tx, ty, onFloorZ, MT_TROOP)
+
+	// Off to one side, inside the spray's forward fan but nowhere near the
+	// ball's own straight-line flight path.
+	bAng := sang + 0.4 // ~23 degrees off centre, well inside the 45-degree half-fan
+	bx := g.Camera.X + math.Cos(bAng)*100
+	by := g.Camera.Y + math.Sin(bAng)*100
+	bystander := g.P_SpawnMobj(bx, by, onFloorZ, MT_TROOP)
+	startHP := bystander.Health
+
+	g.spawnProjectile(Weapons[wpBFG].Projectile)
+	runProjectiles(g)
+
+	if bystander.Health >= startHP {
+		t.Fatalf("BFG spray: bystander imp HP %d -> %d (no splash damage)", startHP, bystander.Health)
+	}
+}
+
+// A monster well outside the spray's forward fan (behind the player) must
+// not be hit by it — the spray is a wide cone, not an omnidirectional blast.
+func TestBFGSprayDoesNotHitBehindPlayer(t *testing.T) {
+	g := loadRealLevel(t, "../testdata/DOOM1.WAD", "E1M1")
+	_, _, sang := aimGameAtStart(g)
+
+	tx := g.Camera.X + math.Cos(sang)*40
+	ty := g.Camera.Y + math.Sin(sang)*40
+	g.P_SpawnMobj(tx, ty, onFloorZ, MT_TROOP)
+
+	behindAng := sang + math.Pi
+	bx := g.Camera.X + math.Cos(behindAng)*80
+	by := g.Camera.Y + math.Sin(behindAng)*80
+	behind := g.P_SpawnMobj(bx, by, onFloorZ, MT_TROOP)
+	startHP := behind.Health
+
+	g.spawnProjectile(Weapons[wpBFG].Projectile)
+	runProjectiles(g)
+
+	if behind.Health != startHP {
+		t.Fatalf("BFG spray hit a monster behind the player: HP %d -> %d", startHP, behind.Health)
 	}
 }
 

@@ -31,9 +31,12 @@ func TestDrawQuakeHUDCorners(t *testing.T) {
 		t.Error("Armor > 0 but nothing drawn on the armour row")
 	}
 
-	// Keys stack top-right, well clear of the bottom readouts.
-	if _, _, keys := changedBox(r, qhKeysTopY-1, qhKeysTopY+3*qhKeysRowGap); !keys {
-		t.Error("held keys not drawn top-right")
+	// Keys stack bottom-right, just above the ammo readout.
+	if _, _, keys := changedBox(r, qhKeysBottomY-1, qhKeysBottomY+3*qhKeysRowGap); !keys {
+		t.Error("held keys not drawn bottom-right")
+	}
+	if qhKeysBottomY+3*qhKeysRowGap >= qhBottomNumY {
+		t.Error("keys stack overlaps the bottom ammo/health row")
 	}
 }
 

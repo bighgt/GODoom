@@ -1,6 +1,37 @@
 package engine
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
+
+// TestWeaponBobXScalesWithSpeedAndStaysBounded: standing still, no sway;
+// moving, a small side-to-side sway whose amplitude grows with speed but
+// never exceeds weaponBobMaxX even well past top speed.
+func TestWeaponBobXScalesWithSpeedAndStaysBounded(t *testing.T) {
+	g := &Game{Weapon: WeaponState{bobPhase: math.Pi / 2}} // sin(phase) = 1, so amplitude reads directly
+
+	if bx := g.weaponBobX(); bx != 0 {
+		t.Errorf("standing still: bobX = %.3f, want 0", bx)
+	}
+
+	g.VelX, g.VelY = moveTopSpeed/2, 0
+	half := g.weaponBobX()
+	if half <= 0 || half >= weaponBobMaxX {
+		t.Errorf("half speed: bobX = %.3f, want strictly between 0 and %.3f", half, weaponBobMaxX)
+	}
+
+	g.VelX = moveTopSpeed
+	full := g.weaponBobX()
+	if math.Abs(full-weaponBobMaxX) > 1e-9 {
+		t.Errorf("top speed: bobX = %.3f, want %.3f", full, weaponBobMaxX)
+	}
+
+	g.VelX = moveTopSpeed * 4 // well past top speed — must still clamp, not overshoot
+	if over := g.weaponBobX(); math.Abs(over-weaponBobMaxX) > 1e-9 {
+		t.Errorf("past top speed: bobX = %.3f, want clamped to %.3f", over, weaponBobMaxX)
+	}
+}
 
 // TestChainsawIdleAndFiringFrames: the running chainsaw's viewmodel should
 // vibrate on SAWG C/D while idle (id's S_SAW/S_SAWB) and grind on SAWG A/B

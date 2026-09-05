@@ -92,6 +92,11 @@ func (g *Game) updateProjectiles(dt float64) {
 			if p.def.ExplodeRadius > 0 {
 				g.pRadiusAttack(&Mobj{X: p.X, Y: p.Y, Z: p.Z}, g.playerMobj, p.def.ExplodeRadius)
 			}
+			// The BFG ball's own splash is centred on the SHOOTER, not the
+			// impact point — see ProjectileDef.Spray.
+			if p.def.Spray && g.playerMobj != nil {
+				g.aBFGSpray(g.playerMobj)
+			}
 		}
 		if p.Alive {
 			alive = append(alive, p)

@@ -88,10 +88,17 @@ type ProjectileDef struct {
 	ExplodeTics   int
 	ExplodeSound  string
 	ExplodeRadius int // >0: blast-radius damage on impact (pRadiusAttack)
+	// Spray marks the BFG ball: on impact, every shootable thing the
+	// shooter can see in a wide forward cone takes a second, independent
+	// hit — see aBFGSpray. Unlike ExplodeRadius (a falloff blast centred on
+	// where the shot landed), the spray is centred on the SHOOTER, so it
+	// reaches every monster in the room the player can see, not just ones
+	// clustered near the impact point — the BFG's actual signature effect.
+	Spray bool
 	// Damage is the direct-hit damage multiplier — id's mobjinfo.damage for
 	// the missile. A shot that strikes a monster deals (P_Random()%8 + 1) *
-	// Damage (so 8x the base at most), then, if ExplodeRadius > 0, the blast
-	// on top. 0 = a purely cosmetic projectile.
+	// Damage (so 8x the base at most), then, if ExplodeRadius > 0 or Spray
+	// is set, the blast/spray on top. 0 = a purely cosmetic projectile.
 	Damage int
 }
 
@@ -176,11 +183,17 @@ var Weapons = [numWeapons]WeaponDef{
 		// MT_ROCKET's canon speed is 20*35=700 units/sec; per user
 		// feedback this project's own rocket runs 20% faster than that.
 		// deathsound sfx_barexp (DSBAREXP) — rockets and exploding barrels
-		// share an explosion sound in vanilla, not an approximation. All
-		// verified present in testdata/DOOM1.WAD (MISLA1, BEXPA0-E0, DSBAREXP).
+		// share an explosion SOUND in vanilla, not an approximation. The
+		// SPRITE is not shared, though: the rocket's own S_EXPLODE1..3
+		// states play its flying MISL sprite's own B/C/D frames (a fireball
+		// baked into the same lump as the flying rocket), not the barrel's
+		// separate BEXP animation — using BEXP here was this project's own
+		// mistake, not a vanilla quirk, and showed the barrel's fireball
+		// shape on every rocket impact. All verified present in
+		// testdata/DOOM1.WAD (MISLA1, MISLB0-D0, DSBAREXP).
 		Projectile: &ProjectileDef{
 			Sprite: "MISLA1", Speed: 700 * 1.2,
-			ExplodePrefix: "BEXP", ExplodeFrames: []byte{'A', 'B', 'C', 'D', 'E'}, ExplodeTics: 4,
+			ExplodePrefix: "MISL", ExplodeFrames: []byte{'B', 'C', 'D'}, ExplodeTics: 4,
 			ExplodeSound: "DSBAREXP", ExplodeRadius: 128,
 			Damage: 20, // MT_ROCKET: direct hit deals (P_Random%8+1)*20, plus the 128u blast
 		},
@@ -225,7 +238,8 @@ var Weapons = [numWeapons]WeaponDef{
 			Sprite: "BFS1A0", Speed: 875,
 			ExplodePrefix: "BFE1", ExplodeFrames: []byte{'A', 'B', 'C', 'D'}, ExplodeTics: 8,
 			ExplodeSound: "DSRXPLOD",
-			Damage:       100, // MT_BFG: direct hit (P_Random%8+1)*100 (the 40-ray spray isn't modelled)
+			Damage:       100, // MT_BFG: direct hit (P_Random%8+1)*100
+			Spray:        true, // plus the room-clearing spray on impact — see aBFGSpray
 		},
 	},
 	wpChainsaw: {
@@ -270,6 +284,30 @@ var Weapons = [numWeapons]WeaponDef{
 // 96/6 = 16 tics to fully raise or lower.
 const weaponRaiseSpeed = ticsPerSecond / 16.0
 
+// Weapon bob: a small side-to-side sway of the viewmodel while walking,
+// like a held object swinging slightly with each step. bobCycleHz is the
+// sway's phase rate (constant — a slow walk and a run swing at the same
+// tempo, they just differ in how far); weaponBobMaxX is the sway's full
+// amplitude in HUD pixels (raster/weapon.go's 320x200 space) at top speed,
+// deliberately small ("not dramatic" per the brief this was ported from).
+const (
+	bobCycleHz    = 3.5
+	weaponBobMaxX = 2.5
+)
+
+// weaponBobX is the current horizontal sway offset (HUD pixels,
+// raster/weapon.go's 320x200 space): a sine wave whose amplitude scales
+// with how fast the player is actually moving (0 standing still, full
+// weaponBobMaxX at moveTopSpeed) so the gun sits dead still at rest and
+// sways gently while walking.
+func (g *Game) weaponBobX() float64 {
+	speedFrac := math.Hypot(g.VelX, g.VelY) / moveTopSpeed
+	if speedFrac > 1 {
+		speedFrac = 1
+	}
+	return weaponBobMaxX * speedFrac * math.Sin(g.Weapon.bobPhase)
+}
+
 type weaponPhase int
 
 const (
@@ -289,6 +327,13 @@ type WeaponState struct {
 	fireElapsedTics float64 // time since FireWeapon, in Doom tics — indexes into FireFrames/FlashFrames
 	idleTics        float64 // free-running tic counter for the IdleFrames loop
 	idleSoundTimer  float64 // seconds until the IdleSound is re-triggered (see updateWeapon)
+
+	// bobPhase is a free-running angle (radians) driving the weapon's side-
+	// to-side sway while walking — see weaponBobX. Advances at a constant
+	// rate regardless of speed (only the sway's AMPLITUDE depends on how
+	// fast the player is moving); kept wrapped to [0, 2*pi) so it never
+	// grows unbounded over a long play session.
+	bobPhase float64
 }
 
 // NewWeaponState starts with the Pistol already raising in (Doom's own
@@ -522,6 +567,10 @@ func (g *Game) playerAimSlope() float64 {
 func (g *Game) updateWeapon(dt float64) {
 	w := &g.Weapon
 	w.idleTics += dt * ticsPerSecond // free-running, drives the IdleFrames loop
+	w.bobPhase += dt * bobCycleHz * 2 * math.Pi
+	if w.bobPhase >= 2*math.Pi {
+		w.bobPhase = math.Mod(w.bobPhase, 2*math.Pi)
+	}
 	switch w.phase {
 	case weaponLowering:
 		w.Offset += weaponRaiseSpeed * dt

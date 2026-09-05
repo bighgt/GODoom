@@ -16,7 +16,10 @@ const weaponDropPx = 300
 // them off the real per-weapon animation timing ported from id's info.c
 // (see engine/weapons.go) — this function only draws whatever frame it's
 // told to. raiseOffset is 0 (fully raised/ready) to 1 (fully lowered/
-// offscreen) — see engine.WeaponState.Offset.
+// offscreen) — see engine.WeaponState.Offset. bobX is a small side-to-side
+// walking sway in the same HUD pixel space — see engine.Game.weaponBobX —
+// applied to the gun only; the flash then rides along with it since its
+// own position is computed relative to the gun's.
 //
 // The flash's placement deliberately does NOT use the general
 // hotspot-relative blit (blit.go's honorOffset) the status bar uses:
@@ -30,7 +33,7 @@ const weaponDropPx = 300
 // position plus the two sprites' offset delta — the same relative
 // alignment the original data intends, without needing to reproduce its
 // absolute projection math.
-func (r *Renderer) DrawWeapon(spritePrefix string, gunFrame byte, flashPrefix string, flashFrame byte, hasFlash bool, raiseOffset float64, sectorLight int16) {
+func (r *Renderer) DrawWeapon(spritePrefix string, gunFrame byte, flashPrefix string, flashFrame byte, hasFlash bool, raiseOffset, bobX float64, sectorLight int16) {
 	gunSp, ok := r.textures.Sprite(spriteName(spritePrefix, gunFrame))
 	if !ok {
 		return
@@ -43,7 +46,7 @@ func (r *Renderer) DrawWeapon(spritePrefix string, gunFrame byte, flashPrefix st
 	gunTPU := tpu(gunSp)
 	gunW := float64(gunSp.Width) / gunTPU
 	gunH := float64(gunSp.Height) / gunTPU
-	gunX := int((hudLogicalW - gunW) / 2)
+	gunX := int((hudLogicalW-gunW)/2 + bobX) // bobX: the walking side-to-side sway (engine.Game.weaponBobX)
 	gunY := int(hudLogicalH - gunH + raiseOffset*(gunH+weaponDropPx))
 	// The held weapon dims with the room it's in — id shades a psprite with
 	// spritelights[MAXLIGHTSCALE-1], the bright end of its sector's

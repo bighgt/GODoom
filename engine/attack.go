@@ -154,3 +154,44 @@ func (g *Game) pRadiusAttack(spot, source *Mobj, damage int) {
 		hit(mo)
 	}
 }
+
+// bfgSprayHalfFanAngle/bfgSprayDamageDie are the BFG ball's signature
+// "spray": on impact, a wide fan of tracers reaching out from the SHOOTER
+// (not the ball's landing spot) so every monster the player can see in
+// front of them takes a second hit — the reason the BFG can flatten a
+// whole room instead of only the one monster the visible ball struck. Real
+// Doom fires this as 40 discrete rays across a 90-degree fan and lets
+// whichever ray reaches a target first damage it; aBFGSpray instead hits
+// every shootable, visible thing in the fan once — equivalent in effect
+// (40 rays densely cover a room-sized fan anyway) without needing to track
+// which of 40 rays would have reached which target first.
+const (
+	bfgSprayHalfFanAngle = 45 * math.Pi / 180 // half of id's 90-degree total fan
+	bfgSprayDamageDie    = 8                  // (P_Random()%8+1)*15 per target hit, id's own constant
+)
+
+// aBFGSpray damages every shootable, living thing within missileRange that
+// shooter can both see and is looking roughly toward (within
+// bfgSprayHalfFanAngle either side of its facing) — id's A_BFGSpray.
+func (g *Game) aBFGSpray(shooter *Mobj) {
+	hit := func(mo *Mobj) {
+		if mo == nil || mo == shooter || mo.removed || mo.Flags&MF_SHOOTABLE == 0 || mo.Health <= 0 {
+			return
+		}
+		dx, dy := mo.X-shooter.X, mo.Y-shooter.Y
+		dist := math.Hypot(dx, dy)
+		if dist <= 0 || dist > missileRange {
+			return
+		}
+		if math.Abs(normAngle(math.Atan2(dy, dx)-shooter.Angle)) > bfgSprayHalfFanAngle {
+			return
+		}
+		if !g.pCheckSight(shooter, mo) {
+			return
+		}
+		g.pDamageMobj(mo, shooter, shooter, (pRandom()%bfgSprayDamageDie+1)*15)
+	}
+	for _, mo := range g.mobjs {
+		hit(mo)
+	}
+}

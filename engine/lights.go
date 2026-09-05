@@ -33,9 +33,11 @@ func (g *Game) muzzleFlashLight() (render.Light, bool) {
 // A loaded GLDEFS lump attached to the flying sprite's frame (e.g.
 // `object DoomImpBall { frame BAL1A { light PLASMABALL } }`) wins for the
 // FLYING phase; otherwise the colour keys off the explosion-lump prefix
-// (BEXP = rocket, PLSE = plasma bolt, BFE1 = BFG). The exploding flare
-// keeps its hand-tuned ramp — GLDEFS can't express "flash that fades and
-// spreads over the blast".
+// (MISL = rocket — its own flying sprite's B/C/D frames are its explosion,
+// not the barrel's separate BEXP animation, see WeaponDef's Rocket Launcher
+// entry; PLSE = plasma bolt, BFE1 = BFG). The exploding flare keeps its
+// hand-tuned ramp — GLDEFS can't express "flash that fades and spreads
+// over the blast".
 func (g *Game) projectileLight(p *Projectile) render.Light {
 	if !p.exploding && g.gldefs != nil && len(p.def.Sprite) >= 5 {
 		if defs := g.gldefs.Frame(p.def.Sprite[:4], int(p.def.Sprite[4]-'A')); len(defs) > 0 {
@@ -59,7 +61,7 @@ func (g *Game) projectileLight(p *Projectile) render.Light {
 
 	var r, gg, b, radius float32
 	switch p.def.ExplodePrefix {
-	case "BEXP":
+	case "MISL":
 		r, gg, b, radius = 1.0, 0.55, 0.20, 220 // rocket: warm orange
 	case "PLSE":
 		r, gg, b, radius = 0.45, 0.65, 1.0, 190 // plasma: cyan-blue

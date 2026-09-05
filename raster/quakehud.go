@@ -3,8 +3,10 @@ package raster
 // DrawQuakeHUD renders a minimal Quake II-style heads-up display: a big
 // health number bottom-left and a big current-ammo number bottom-right,
 // each next to a pickup-sprite icon; the armour count above health when
-// the player has any; the held keys stacked top-right. No status-bar
-// chrome — the rest of the screen is the view.
+// the player has any; the held keys stacked bottom-right, just above the
+// ammo readout, alongside the rest of the HUD rather than isolated up in a
+// corner by themselves. No status-bar chrome — the rest of the screen is
+// the view.
 //
 // It reuses the same 320x200 HUD authoring space and graphic lumps as
 // DrawStatusBar (STTNUM/STYSNUM digits, the MEDI/ARM1/ARM2/CLIP/SHEL/CELL/
@@ -34,9 +36,10 @@ func (r *Renderer) DrawQuakeHUD(ps HUDStats) {
 		}
 	}
 
-	// Keys, stacked top-right (blue / yellow / red — card or skull).
+	// Keys, stacked bottom-right, just above the ammo readout (blue /
+	// yellow / red — card or skull).
 	for i := 0; i < 3; i++ {
-		y := qhKeysTopY + i*qhKeysRowGap
+		y := qhKeysBottomY + i*qhKeysRowGap
 		switch {
 		case ps.Keys[i]:
 			r.blitSprite(qhKeyName(i), qhKeysX, y)
@@ -73,7 +76,14 @@ const (
 	qhArmorIconY    = 169
 	qhArmorNumRight = 86 // right edge of the (small) armour digits
 
-	qhKeysX      = 308
-	qhKeysTopY   = 8
-	qhKeysRowGap = 11
+	// Keys share the ammo icon's column (x=308) and stack immediately above
+	// it rather than up in an isolated top-right corner — three small icons
+	// at most, so they read as part of the same bottom-right HUD cluster as
+	// the ammo count instead of floating alone. qhKeysBottomY (the topmost
+	// of the 3 rows, i=0 — the loop in DrawQuakeHUD grows downward toward
+	// the ammo icon at qhIconBottomY) leaves a clear gap above
+	// qhBottomNumY/qhIconBottomY.
+	qhKeysX       = 308
+	qhKeysBottomY = 130
+	qhKeysRowGap  = 11
 )

@@ -1517,8 +1517,14 @@ in, and whether it has left the geometry or exceeded projectileMaxRange =
 blast is centred there) and plays through its ExplodeFrames sequence (each
 held ExplodeTics tics) before removal. Explosion sprites draw at
 explosionSizeMultiplier = 2.0 on top of ordinary distance scaling. The
-rocket adds a 128u pRadiusAttack blast on top of its direct hit; plasma
-and BFG are direct-hit only (the BFG's 40-ray spray isn't modelled).
+rocket adds a 128u pRadiusAttack blast on top of its direct hit; plasma is
+direct-hit only; the BFG adds aBFGSpray on top of its direct hit — every
+shootable thing within missileRange, in a 90-degree fan in front of the
+PLAYER (not the ball's landing spot) and in the player's line of sight,
+takes (P_Random%8+1)*15 — the room-clearing effect the BFG is known for,
+modelled as one hit per visible target in the fan rather than id's own 40
+discrete rays (see attack.go's aBFGSpray doc comment for why that's
+equivalent here).
 
 Map objects (engine/mobj.go, info.go, states.go, spawn.go): a faithful
 port of id's mobj/state model. A Mobj is any world object — monster,
