@@ -224,7 +224,18 @@ float godRaysLuma(vec2 uv) {
 
     const int N = 24;
     vec2 delta = (sun - uv) * (0.85 / float(N));
-    vec2 p = uv;
+    // Jitter the march's starting phase per pixel (same hash12 the SSAO
+    // gather below rotates its disc with) instead of every pixel sampling
+    // at the exact same 24 fixed offsets from its own uv: with a fixed
+    // phase, pixels along any line through the sun sample at correlated
+    // distances-from-sun, which reads as concentric/parallel banding once
+    // this quarter-res result is bilinearly upsampled — most visible as
+    // near-horizontal bands when the sun sits off to one side (a march
+    // direction close to horizontal), and most noticeable while turning
+    // quickly sweeps the sun through view. Randomizing the phase turns
+    // that coherent banding into imperceptible noise without changing the
+    // effect's overall brightness (same 24 samples, same total decay).
+    vec2 p = uv + delta * hash12(uv * vec2(w, h) + 17.0);
     float decay = 1.0;
     float acc = 0.0;
     for (int i = 0; i < N; ++i) {
@@ -237,7 +248,14 @@ float godRaysLuma(vec2 uv) {
         acc += dot(s.rgb, vec3(0.2126, 0.7152, 0.0722)) * max(sky, bright) * decay;
         decay *= 0.92;
     }
-    return acc / float(N) * sunVis;
+    // Cap the result: a very bright HDR sky/bloom texel (there is no upper
+    // bound on scene-linear brightness here) times up to N=24 accumulated,
+    // decayed samples could otherwise dump enough luminance into worldblit's
+    // hdr += amb.b * godrayStrength * ... to blow the tonemap input into a
+    // flat, banded white for a few frames right as the sun sweeps past
+    // (again, most visible while turning quickly) rather than the soft glow
+    // this effect is meant to be.
+    return min(acc / float(N) * sunVis, 3.0);
 }
 
 void main() {
