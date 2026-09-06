@@ -7,7 +7,6 @@ package main
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -23,6 +22,7 @@ import (
 	"twopointfive/bsp"
 	"twopointfive/config"
 	"twopointfive/engine"
+	"twopointfive/launcher"
 	"twopointfive/raster"
 	"twopointfive/render/vulkan"
 	"twopointfive/render/worldgeo"
@@ -65,37 +65,80 @@ func stageTimer(name string) func() {
 	return func() { log.Printf("engine: [load] %s: %s", name, time.Since(start).Round(time.Millisecond)) }
 }
 
+// run is the process entry point's real body: either the headless/scripted
+// single-shot path (TPF_WAD / a .wad command-line argument — see
+// window.WADFromCommandLine) or the normal one, which loops the pre-game
+// launcher (package launcher) and a play session back and forth — Quit in
+// the launcher is the only way out; ending a game session (Escape, or the
+// game window's close button — the only two ways engine.Game.Run returns
+// today) returns to the launcher instead of exiting the process, so
+// choosing another WAD/level or tweaking a setting doesn't mean relaunching
+// the executable.
 func run() error {
-	path, err := window.PickWADFile()
-	if err != nil {
-		if errors.Is(err, window.ErrPickCancelled) {
-			log.Println("engine: no WAD file selected, exiting")
-			return nil
-		}
-		return err
+	if headless := window.WADFromCommandLine(); headless != "" {
+		return runHeadless(headless)
 	}
-	log.Printf("engine: loading %s", path)
 
-	cfg := config.Load()
-
-	picked, err := wad.Load(path)
-	if err != nil {
-		return err
+	// Sound effects and music are process-wide resources (audio.Device/
+	// MusicPlayer both join one shared, lazily-created mixer/output stream
+	// — see audio/mixer.go's sharedAudio — and NewMusicPlayer's FluidSynth
+	// setup on Linux is real, non-instant work), so they're stood up once
+	// here and handed to every play session rather than recreated — and,
+	// for MusicPlayer, torn down (Stop) — on each trip through the
+	// launcher: MusicPlayer.Stop() deletes the underlying FluidSynth synth
+	// outright (not a pause), so it must not run until the process is
+	// actually exiting.
+	dev, music := setupAudio()
+	if music != nil {
+		defer music.Stop()
 	}
-	log.Printf("engine: loaded %s WAD, %d lumps", picked.Header.Magic, picked.Header.NumLumps)
 
-	// A PWAD (or any WAD missing the core palette) can't stand on its own —
-	// it patches an IWAD. Find that IWAD and merge, load order base-then-
-	// patch, exactly like Doom's `-file`.
-	w := picked
-	if picked.Header.Magic == "PWAD" || !hasLump(picked, "PLAYPAL") {
-		iwad, iwadPath, err := resolveIWAD(path, picked, cfg.IWAD)
+	for {
+		// A separate pre-game window for picking the WAD/level and editing
+		// every config.json setting, shown before any of the engine's own
+		// windows or rendering stand up. It already did the WAD load +
+		// IWAD merge (needed to populate its own map list) and already
+		// wrote config.json, so there's nothing left to do here but take
+		// its result. config.Load() is re-read each time round so a
+		// session that just saved new settings starts the next launcher
+		// screen from them.
+		res, ok, err := launcher.Run(config.Load())
 		if err != nil {
 			return err
 		}
-		log.Printf("engine: %s is a patch WAD — merging base IWAD %s", filepath.Base(path), iwadPath)
-		w = wad.Merge(iwad, picked)
+		if !ok {
+			log.Println("engine: launcher cancelled, exiting")
+			return nil
+		}
+		log.Printf("engine: loaded %s, playing %s", res.WADPath, res.MapName)
+
+		if err := playSession(res.WADPath, res.MapName, res.Config, res.WAD, dev, music); err != nil {
+			return err
+		}
+		log.Println("engine: game session ended — back to the launcher")
 	}
+}
+
+// runHeadless is the TPF_WAD / .wad-argument escape hatch's whole flow —
+// exactly what run() did before the launcher existed, kept as a single-shot
+// path with no GUI beyond chooseStartMap's own console/native fallback, for
+// scripted runs, cmd/engine's own tests, and ad-hoc diagnostics.
+func runHeadless(path string) error {
+	log.Printf("engine: loading %s", path)
+	cfg := config.Load()
+
+	// Loads path and, if it's a PWAD (or any WAD missing the core
+	// palette), finds and merges its base IWAD — load order
+	// IWAD-then-patch, exactly like Doom's `-file` (see wad.LoadWithIWAD).
+	loaded, err := wad.LoadWithIWAD(path, cfg.IWAD)
+	if err != nil {
+		return err
+	}
+	log.Printf("engine: loaded %s WAD, %d lumps", loaded.PickedMagic, loaded.PickedLumps)
+	if loaded.IWADPath != "" {
+		log.Printf("engine: %s is a patch WAD — merging base IWAD %s", filepath.Base(path), loaded.IWADPath)
+	}
+	w := loaded.WAD
 
 	maps := w.ListMaps()
 	if len(maps) == 0 {
@@ -104,6 +147,41 @@ func run() error {
 	mapName := chooseStartMap(maps, cfg.Map)
 	log.Printf("engine: found %d map(s), loading %s", len(maps), mapName)
 
+	dev, music := setupAudio()
+	if music != nil {
+		defer music.Stop()
+	}
+	return playSession(path, mapName, cfg, w, dev, music)
+}
+
+// setupAudio brings up the shared sound-effect device and music player once
+// — see run()'s doc comment on why these are process-wide rather than
+// per-session. A nil return for either just means that subsystem is
+// unavailable (already logged here); playSession treats a nil dev/music
+// exactly like the original single-session code treated NewDevice/
+// NewMusicPlayer failing.
+func setupAudio() (*audio.Device, *audio.MusicPlayer) {
+	dev, err := audio.NewDevice()
+	if err != nil {
+		log.Printf("engine: sound effects unavailable: %v", err)
+		dev = nil
+	}
+	music, err := audio.NewMusicPlayer()
+	if err != nil {
+		log.Printf("engine: music unavailable: %v", err)
+		music = nil
+	}
+	return dev, music
+}
+
+// playSession loads mapName from w and runs one full game session — every
+// window, GPU, and CPU-rasterizer resource it creates is torn down (its
+// defers run) when this returns, whether that's a normal game-window close
+// or an error. dev/music are the process-wide audio resources setupAudio
+// created; cfg.Music still gates whether THIS session actually starts a
+// track (see setupAudio's doc comment on why the player itself isn't
+// recreated per session).
+func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio.Device, music *audio.MusicPlayer) error {
 	// From here on the window (once created below) is up but the game isn't
 	// running its event/render loop yet — see stageTimer's doc comment. Time
 	// it all so a slow load is diagnosable instead of just looking hung.
@@ -332,18 +410,13 @@ func run() error {
 		}
 	}
 
-	if dev, err := audio.NewDevice(); err != nil {
-		log.Printf("engine: sound effects unavailable: %v", err)
-	} else {
-		game.AudioDevice = dev
-	}
+	game.AudioDevice = dev // nil is fine — see setupAudio's doc comment
 
-	if !cfg.Music {
-		log.Println("engine: music disabled (config.json)")
-	} else if music, err := audio.NewMusicPlayer(); err != nil {
-		log.Printf("engine: music unavailable: %v", err)
+	if !cfg.Music || music == nil {
+		if !cfg.Music {
+			log.Println("engine: music disabled (config.json)")
+		}
 	} else {
-		defer music.Stop()
 		playLevelMusic(w, music, game.MapMusicLump(mapName), mapName)
 		// Restart music when the engine advances to the next level, and when
 		// the idmus cheat asks for a specific map's track.
@@ -518,110 +591,4 @@ func startCamera(level *wad.Level, tree bsp.Node) raster.Camera {
 	}
 
 	return raster.Camera{X: x, Y: y, Z: z, Angle: angleDeg * math.Pi / 180, FOVDeg: 90}
-}
-
-// hasLump reports whether w contains a lump of the given name.
-func hasLump(w *wad.WAD, name string) bool {
-	return w.IndexOf(name) >= 0
-}
-
-// iwadNames lists the base IWAD filenames to look for, by map format, most
-// common first. All Doom II-format IWADs (Doom II, Final Doom, Freedoom
-// Phase 2) share the MAPxx lump set, so any of them serves a Doom II PWAD.
-var iwadNames = map[string][]string{
-	"doom2": {"DOOM2.WAD", "doom2.wad", "Doom2.wad", "TNT.WAD", "tnt.wad",
-		"PLUTONIA.WAD", "plutonia.wad", "freedoom2.wad", "FREEDOOM2.WAD"},
-	"doom1": {"DOOM.WAD", "doom.wad", "DOOMU.WAD", "doomu.wad",
-		"DOOM1.WAD", "doom1.wad", "freedoom1.wad", "FREEDOOM1.WAD"},
-}
-
-// resolveIWAD finds the base IWAD a patch WAD needs. An explicit path (from
-// config.json's "iwad") wins; otherwise it works out the map format the
-// PWAD uses and hunts for a matching IWAD next to the PWAD, up its parent
-// directories, and beside the executable / working directory (also checking
-// wad/ and testdata/ subdirs). The returned WAD is a real IWAD with a
-// palette.
-func resolveIWAD(pickedPath string, picked *wad.WAD, explicit string) (*wad.WAD, string, error) {
-	usable := func(p string) (*wad.WAD, bool) {
-		iw, err := wad.Load(p)
-		if err != nil || iw.Header.Magic != "IWAD" || !hasLump(iw, "PLAYPAL") {
-			return nil, false
-		}
-		return iw, true
-	}
-
-	if explicit != "" {
-		if iw, ok := usable(explicit); ok {
-			return iw, explicit, nil
-		}
-		return nil, "", fmt.Errorf("engine: config iwad %q is not a usable IWAD (missing, unreadable, or no PLAYPAL)", explicit)
-	}
-
-	format := "doom2"
-	for _, m := range picked.ListMaps() {
-		if len(m) > 0 && m[0] == 'E' {
-			format = "doom1"
-			break
-		}
-	}
-
-	// Base directories to search, in priority order.
-	var dirs []string
-	seenDir := map[string]bool{}
-	addDir := func(d string) {
-		if d == "" {
-			return
-		}
-		for _, sub := range []string{"", "wad", "wads", "IWADs", "iwads", "testdata"} {
-			p := filepath.Join(d, sub)
-			if !seenDir[p] {
-				seenDir[p] = true
-				dirs = append(dirs, p)
-			}
-		}
-	}
-	dir := filepath.Dir(pickedPath)
-	for i := 0; i < 5 && dir != "" && dir != string(filepath.Separator); i++ {
-		addDir(dir)
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		dir = parent
-	}
-	if wd, err := os.Getwd(); err == nil {
-		addDir(wd)
-	}
-	if exe, err := os.Executable(); err == nil {
-		addDir(filepath.Dir(exe))
-	}
-
-	// Try the format's IWADs first, then the other format's (a WAD may
-	// mis-detect, and a Doom II IWAD still opens a Doom II PWAD).
-	tryOrder := []string{format}
-	if format == "doom2" {
-		tryOrder = append(tryOrder, "doom1")
-	} else {
-		tryOrder = append(tryOrder, "doom2")
-	}
-	for _, fmtKey := range tryOrder {
-		for _, name := range iwadNames[fmtKey] {
-			for _, d := range dirs {
-				p := filepath.Join(d, name)
-				if _, err := os.Stat(p); err != nil {
-					continue
-				}
-				if iw, ok := usable(p); ok {
-					return iw, p, nil
-				}
-			}
-		}
-	}
-
-	want := "DOOM2.WAD (or TNT.WAD / PLUTONIA.WAD / freedoom2.wad)"
-	if format == "doom1" {
-		want = "DOOM.WAD (or DOOM1.WAD / freedoom1.wad)"
-	}
-	return nil, "", fmt.Errorf("engine: %s is a patch WAD and needs its base IWAD — put %s next to it, or set \"iwad\": \"C:\\path\\to\\%s\" in config.json",
-		filepath.Base(pickedPath), want, strings.SplitN(want, " ", 2)[0])
 }

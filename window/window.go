@@ -24,21 +24,32 @@ type Window struct {
 	mousePositionKnown bool
 
 	// typed accumulates characters from GLFW's character callback (fired
-	// during PollEvents) until TakeTyped drains them — the raw material the
-	// engine's classic cheat-code matcher scans. Single-threaded: the
-	// callback and TakeTyped both run on the main thread.
+	// during PollEvents) until TakeTyped or TakeTypedRaw drains them — the
+	// raw material both the engine's classic cheat-code matcher (TakeTyped)
+	// and the launcher's text fields (TakeTypedRaw, menuinput.go) scan.
+	// Single-threaded: the callback and both drains run on the main thread.
+	// Never a conflict between the two drains in practice — the game window
+	// and the launcher window are different *Window instances.
 	typed []rune
+
+	// scrollX/scrollY accumulate the scroll-wheel callback (menuinput.go's
+	// TakeScroll) the same way typed accumulates characters.
+	scrollX, scrollY float64
 }
 
 // newWindow wraps a freshly created GLFW handle and installs the input
-// callbacks the polling API needs — currently just the character callback
-// that feeds TakeTyped (used for the classic cheat-code sequences).
+// callbacks the polling API needs: the character callback that feeds
+// TakeTyped/TakeTypedRaw, and the scroll callback that feeds TakeScroll.
 func newWindow(handle *glfw.Window, title string) *Window {
 	w := &Window{handle: handle, title: title}
 	handle.SetCharCallback(func(_ *glfw.Window, r rune) {
 		if len(w.typed) < 128 { // a cap so a key held at a broken repeat rate can't grow this unboundedly
 			w.typed = append(w.typed, r)
 		}
+	})
+	handle.SetScrollCallback(func(_ *glfw.Window, xoff, yoff float64) {
+		w.scrollX += xoff
+		w.scrollY += yoff
 	})
 	return w
 }
@@ -87,6 +98,34 @@ func New(width, height int, title string, fullscreen bool) (*Window, error) {
 	if err != nil {
 		glfw.Terminate()
 		return nil, fmt.Errorf("window: create window: %w", err)
+	}
+	return newWindow(handle, title), nil
+}
+
+// NewFixed creates a decorated, NON-resizable window of exactly width x
+// height, centered on the primary monitor — for the pre-game launcher
+// (package launcher), which draws into a single fixed-size CPU buffer each
+// frame (see render/vulkan's vanilla DrawFrame) rather than coping with a
+// live-resized source texture the way a truly resizable window would need.
+// Same glfw.Init/CreateWindow lifecycle as New; safe to call after a
+// previous window of either kind has been Destroy()ed (GLFW supports
+// init/terminate more than once per process).
+func NewFixed(width, height int, title string) (*Window, error) {
+	if err := glfw.Init(); err != nil {
+		return nil, fmt.Errorf("window: glfw init: %w", err)
+	}
+	glfw.WindowHint(glfw.ClientAPI, glfw.NoAPI)
+	glfw.WindowHint(glfw.Resizable, glfw.False)
+	handle, err := glfw.CreateWindow(width, height, title, nil, nil)
+	if err != nil {
+		glfw.Terminate()
+		return nil, fmt.Errorf("window: create fixed window: %w", err)
+	}
+	if mon := glfw.GetPrimaryMonitor(); mon != nil {
+		if mode := mon.GetVideoMode(); mode != nil {
+			mx, my := mon.GetPos()
+			handle.SetPos(mx+(mode.Width-width)/2, my+(mode.Height-height)/2)
+		}
 	}
 	return newWindow(handle, title), nil
 }

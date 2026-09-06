@@ -265,6 +265,14 @@ type Config struct {
 	// CrosshairSize scales the crosshair: "tiny", "small", "medium" (the
 	// default), or "large". Case-insensitive; anything else -> "medium".
 	CrosshairSize string `json:"crosshairSize"`
+	// WADPath is the last WAD file chosen in the pre-game launcher (package
+	// launcher) — an absolute or launcher-relative path. Empty (the
+	// default) means "ask"; the launcher pre-selects this one if it still
+	// exists so re-launching drops you back where you left off. Not
+	// consulted by anything outside the launcher — TPF_WAD and a `.wad`
+	// command-line argument (window.PickWADFile) still take priority over
+	// it, exactly as they did before this field existed.
+	WADPath string `json:"wadPath"`
 }
 
 // FOV bounds.
@@ -389,6 +397,7 @@ func Default() Config {
 		FogDensity:           0,
 		Crosshair:            CrosshairDot,
 		CrosshairSize:        CrosshairMedium,
+		WADPath:              "",
 	}
 }
 
@@ -627,6 +636,7 @@ func (c Config) repaired() Config {
 
 	c.IWAD = strings.TrimSpace(c.IWAD)
 	c.Map = strings.TrimSpace(c.Map)
+	c.WADPath = strings.TrimSpace(c.WADPath)
 
 	if c.DamageScale == 0 {
 		c.DamageScale = d.DamageScale
@@ -862,6 +872,20 @@ func (c Config) RenderSize(windowed bool, fbW, fbH int) (w, h int) {
 func presetOK(name string) bool {
 	_, ok := presets[name]
 	return ok
+}
+
+// ResolvePath is find() exported for a writer: the path Load() already
+// reads config.json from, or "config.json" (relative to the working
+// directory, matching tools/genconfig's own default) if none exists yet.
+// package launcher's SaveMerge call uses this so it writes back to the
+// exact file Load() found — not necessarily ./config.json, if the engine
+// was launched from bin/ or by a double-click with cwd anyone's guess (see
+// find's doc comment).
+func ResolvePath() string {
+	if path, ok := find(); ok {
+		return path
+	}
+	return fileName
 }
 
 // find locates config.json: the working directory first, then the

@@ -45,18 +45,23 @@ func PickMap(maps []string, def string) (string, error) {
 // OS-specific: a Win32/Cocoa call on Windows and macOS, a zenity/kdialog
 // helper on other Unixes).
 func PickWADFile() (string, error) {
-	if p := wadFromCommandLine(); p != "" {
+	if p := WADFromCommandLine(); p != "" {
 		return p, nil
 	}
 	return pickWAD()
 }
 
-// wadFromCommandLine looks for an explicitly-supplied WAD path: TPF_WAD
+// WADFromCommandLine looks for an explicitly-supplied WAD path: TPF_WAD
 // first, then the first command-line argument naming an existing file that
 // ends in .wad (case-insensitive). Returns "" when neither is present. A
 // TPF_WAD that points nowhere is still returned — letting the WAD loader
-// report the bad path beats silently falling back to a dialog.
-func wadFromCommandLine() string {
+// report the bad path beats silently falling back to a dialog. Exported so
+// cmd/engine can check for this headless/scripted escape hatch BEFORE
+// deciding whether to show the pre-game launcher (package launcher) at
+// all — PickWADFile itself can't be used for that check, since with no
+// explicit path it would pop the native dialog immediately rather than
+// leaving that choice to the launcher.
+func WADFromCommandLine() string {
 	if p := strings.TrimSpace(os.Getenv("TPF_WAD")); p != "" {
 		return p
 	}
