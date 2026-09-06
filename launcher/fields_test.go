@@ -51,6 +51,51 @@ func TestFieldsCoverEveryConfigField(t *testing.T) {
 	}
 }
 
+// TestOptionLabelsAreDistinctFromRawKeywords guards the actual complaint
+// this table exists to fix: a dropdown showing config.json's literal
+// keyword (aniso8x, quake2, hudStyle's "none", ...) instead of a real
+// settings label. Every kindOptions field's choices must have a non-empty
+// label, a value unique within that field's own list (so labelFor's
+// value->label lookup is never ambiguous), and at least one choice whose
+// label actually differs from its raw value — a list where every label
+// equals its value would silently defeat the whole point of this table.
+func TestOptionLabelsAreDistinctFromRawKeywords(t *testing.T) {
+	for _, f := range fields {
+		if f.kind != kindOptions {
+			continue
+		}
+		seen := make(map[string]bool, len(f.options))
+		anyDifferent := false
+		for _, o := range f.options {
+			if o.label == "" {
+				t.Errorf("%s: choice %q has an empty label", f.id, o.value)
+			}
+			if seen[o.value] {
+				t.Errorf("%s: duplicate option value %q", f.id, o.value)
+			}
+			seen[o.value] = true
+			if o.label != o.value {
+				anyDifferent = true
+			}
+		}
+		if !anyDifferent {
+			t.Errorf("%s: every label equals its raw value — labels were meant to read better than that", f.id)
+		}
+	}
+}
+
+// TestLabelForFindsAndFallsBack checks the closed dropdown box's own
+// value->label lookup directly.
+func TestLabelForFindsAndFallsBack(t *testing.T) {
+	opts := []choice{{"a", "Alpha"}, {"b", "Beta"}}
+	if got := labelFor(opts, "b"); got != "Beta" {
+		t.Errorf("labelFor(b) = %q, want Beta", got)
+	}
+	if got := labelFor(opts, "unknown"); got != "unknown" {
+		t.Errorf("labelFor(unknown) = %q, want the raw value back as a fallback", got)
+	}
+}
+
 // TestFieldAccessorsAreWired sanity-checks every row actually has the
 // accessor its kind needs, and that slider/int-slider bounds are sane —
 // catches a copy-paste row with the wrong kind or a forgotten accessor.
@@ -98,7 +143,7 @@ func TestFieldAccessorsAreWired(t *testing.T) {
 				v := *f.stringAt(&cfg)
 				found := false
 				for _, o := range f.options {
-					if o == v {
+					if o.value == v {
 						found = true
 						break
 					}

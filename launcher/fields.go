@@ -31,7 +31,27 @@ type field struct {
 
 	min, max float64
 	format   string
-	options  []string
+	options  []choice
+}
+
+// choice is one dropdown entry: value is the literal config.json keyword
+// written to Config (and compared against its current value) — label is
+// what's actually shown in the UI. Config's own accepted keywords (config.go's
+// TextureNearest, HUDStyleDoom, ...) read fine in a doc comment or a log
+// line, but "aniso8x" or "quake2" on their own aren't a settings label
+// anyone not already reading the source would recognize.
+type choice struct{ value, label string }
+
+// choices builds a []choice with the label equal to the value — for a
+// dropdown whose values are already human-readable (the map-name dropdown
+// in screen.go's top bar; a config keyword list gets its own hand-written
+// labels instead, see resolutionOptions etc. below).
+func choices(values []string) []choice {
+	out := make([]choice, len(values))
+	for i, v := range values {
+		out[i] = choice{value: v, label: v}
+	}
+	return out
 }
 
 // Section names, in the order they're drawn.
@@ -50,21 +70,54 @@ var sectionOrder = []string{
 	SectionGameplay, SectionHUD, SectionAdvanced,
 }
 
-// resolutionOptions/textureQualityOptions/... are exactly config.go's own
-// accepted keyword sets, so this table can never drift into offering a
-// value config.Load's repaired() would immediately reject.
+// resolutionOptions/textureQualityOptions/... pair exactly config.go's own
+// accepted keyword sets (so this table can never drift into offering a
+// value config.Load's repaired() would immediately reject) with a label
+// meant for the settings screen rather than a config.json value — several
+// of the raw keywords (aniso8x, quake2, hudStyle's "none") read as internal
+// shorthand rather than a setting name.
 var (
-	resolutionOptions     = []string{"540p", "600p", "720p", "900p", "1080p", "1440p", "native"}
-	textureQualityOptions = []string{
-		config.TextureNearest, config.TextureBilinear, config.TextureTrilinear,
-		config.TextureAniso2x, config.TextureAniso4x, config.TextureAniso8x, config.TextureAniso16x,
+	resolutionOptions = []choice{
+		{"540p", "540p (960x540)"},
+		{"600p", "600p (800x600)"},
+		{"720p", "720p (1280x720)"},
+		{"900p", "900p (1600x900)"},
+		{"1080p", "1080p (1920x1080)"},
+		{"1440p", "1440p (2560x1440)"},
+		{"native", "Native (Display Resolution)"},
 	}
-	lightingModeOptions = []string{config.LightingEnhanced, config.LightingVanilla}
-	rendererOptions     = []string{config.RendererSoftware, config.RendererHardware}
-	hudStyleOptions     = []string{config.HUDStyleDoom, config.HUDStyleQuake2, config.HUDStyleNone}
-	crosshairOptions    = []string{config.CrosshairOff, config.CrosshairDot, config.CrosshairCross}
-	crosshairSizeOptions = []string{
-		config.CrosshairTiny, config.CrosshairSmall, config.CrosshairMedium, config.CrosshairLarge,
+	textureQualityOptions = []choice{
+		{config.TextureNearest, "Nearest (Fastest)"},
+		{config.TextureBilinear, "Bilinear"},
+		{config.TextureTrilinear, "Trilinear"},
+		{config.TextureAniso2x, "Anisotropic 2x"},
+		{config.TextureAniso4x, "Anisotropic 4x"},
+		{config.TextureAniso8x, "Anisotropic 8x"},
+		{config.TextureAniso16x, "Anisotropic 16x (Best Quality)"},
+	}
+	lightingModeOptions = []choice{
+		{config.LightingEnhanced, "Enhanced (Dynamic Lighting)"},
+		{config.LightingVanilla, "Vanilla (Classic Shading)"},
+	}
+	rendererOptions = []choice{
+		{config.RendererSoftware, "Software (CPU Renderer)"},
+		{config.RendererHardware, "Hardware (GPU Renderer)"},
+	}
+	hudStyleOptions = []choice{
+		{config.HUDStyleDoom, "Doom (Full Status Bar)"},
+		{config.HUDStyleQuake2, "Quake II (Minimal HUD)"},
+		{config.HUDStyleNone, "None"},
+	}
+	crosshairOptions = []choice{
+		{config.CrosshairOff, "Off"},
+		{config.CrosshairDot, "Dot"},
+		{config.CrosshairCross, "Cross"},
+	}
+	crosshairSizeOptions = []choice{
+		{config.CrosshairTiny, "Tiny"},
+		{config.CrosshairSmall, "Small"},
+		{config.CrosshairMedium, "Medium"},
+		{config.CrosshairLarge, "Large"},
 	}
 )
 

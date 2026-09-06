@@ -17,7 +17,7 @@ func openDropdown(ui *UI, id string, row Rect, current string, options []string)
 		MouseX: float64(row.X + labelWidth + 5), MouseY: float64(row.Y + 5),
 		MouseLeftClicked: true, Keys: map[window.MenuKey]bool{},
 	})
-	ui.Options(id, row, "Level", current, options, func(string) {})
+	ui.Options(id, row, "Level", current, choices(options), func(string) {})
 	return ui.deferred
 }
 
@@ -92,7 +92,7 @@ func TestDropdownScrollRevealsLaterOptions(t *testing.T) {
 
 	// Frame 2: no click; scroll down 5 while hovering the list.
 	ui.Begin(Input{MouseX: float64(d.list.X + 5), MouseY: float64(d.list.Y + 5), ScrollY: -5})
-	ui.Options("map", row, "Level", opts[0], opts, write)
+	ui.Options("map", row, "Level", opts[0], choices(opts), write)
 	ui.End()
 	if got := ui.dropdownScroll["map"]; got != 5 {
 		t.Fatalf("dropdownScroll = %d, want 5 after scrolling down 5", got)
@@ -101,7 +101,7 @@ func TestDropdownScrollRevealsLaterOptions(t *testing.T) {
 	// Frame 3: no click; just re-confirm the list persisted scrolled to 5,
 	// then click its first visible row (which is now option[5], not [0]).
 	ui.Begin(Input{})
-	ui.Options("map", row, "Level", opts[0], opts, write)
+	ui.Options("map", row, "Level", opts[0], choices(opts), write)
 	if ui.deferred == nil || ui.deferred.scroll != 5 {
 		t.Fatalf("deferred.scroll = %+v, want 5 (persisted)", ui.deferred)
 	}
@@ -109,7 +109,7 @@ func TestDropdownScrollRevealsLaterOptions(t *testing.T) {
 	ui.End()
 
 	ui.Begin(Input{MouseX: float64(listX + 5), MouseY: float64(listY + 5), MouseLeftClicked: true})
-	ui.Options("map", row, "Level", opts[0], opts, write)
+	ui.Options("map", row, "Level", opts[0], choices(opts), write)
 	if !ui.End() {
 		t.Fatal("End() reported no change on a valid row click")
 	}

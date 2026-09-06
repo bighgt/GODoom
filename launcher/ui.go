@@ -46,8 +46,8 @@ const dropdownMaxRows = 8
 type deferredDropdown struct {
 	id            string
 	control, list Rect
-	options       []string
-	current       string
+	options       []choice
+	current       string // the selected VALUE (choice.value), not its label
 	write         func(string)
 	scroll        int // index of the first option drawn in list (see dropdownScroll)
 	visible       int // how many rows list actually holds (<= dropdownMaxRows)
@@ -89,13 +89,13 @@ func (ui *UI) End() (changed bool) {
 		opt := d.options[idx]
 		r := Rect{d.list.X, d.list.Y + row*rowHeight, d.list.W, rowHeight}
 		bg := theme.Panel
-		if opt == d.current {
+		if opt.value == d.current {
 			bg = theme.AccentDim
 		} else if r.Contains(int(ui.In.MouseX), int(ui.In.MouseY)) {
 			bg = theme.ControlHover
 		}
 		ui.C.FillRect(r, bg)
-		ui.C.TextLeft(r, opt, theme.Text)
+		ui.C.TextLeft(r, opt.label, theme.Text)
 	}
 	scrollable := len(d.options) > d.visible
 	if scrollable {
@@ -139,14 +139,14 @@ func (ui *UI) End() (changed bool) {
 	}
 	sel := d.options[idx]
 	ui.openDropdown = ""
-	if sel == d.current {
+	if sel.value == d.current {
 		return false
 	}
 	// The caller's *string was already captured by reference in Options();
 	// deferredDropdown keeps only the value, so the write-back happens via
 	// the pointer screen.go passed us — see Options' closure.
 	if d.write != nil {
-		d.write(sel)
+		d.write(sel.value)
 	}
 	return true
 }
@@ -278,7 +278,21 @@ func (ui *UI) Slider(id string, r Rect, label string, v *float64, min, max float
 // option; screen.go's callers pass a closure over the actual *string so
 // Options itself never needs a generic reflect-free "set string field"
 // mechanism.
-func (ui *UI) Options(id string, r Rect, label string, current string, options []string, write func(string)) {
+// labelFor is the display text for value — the matching choice's label, or
+// value itself if it isn't one of options (a config.json value this table
+// doesn't recognize — see fields_test.go's TestFieldAccessorsAreWired for
+// why that shouldn't happen for a table-driven field, but the closed
+// dropdown box still needs to show something rather than go blank).
+func labelFor(options []choice, value string) string {
+	for _, o := range options {
+		if o.value == value {
+			return o.label
+		}
+	}
+	return value
+}
+
+func (ui *UI) Options(id string, r Rect, label string, current string, options []choice, write func(string)) {
 	ui.Label(Rect{r.X, r.Y, labelWidth, r.H}, label, false)
 	box := Rect{r.X + labelWidth, r.Y, r.W - labelWidth, r.H}
 	open := ui.openDropdown == id
@@ -288,7 +302,7 @@ func (ui *UI) Options(id string, r Rect, label string, current string, options [
 	}
 	ui.C.FillRect(box, bg)
 	ui.C.StrokeRect(box, theme.Border, 1)
-	ui.C.TextLeft(box, current, theme.Text)
+	ui.C.TextLeft(box, labelFor(options, current), theme.Text)
 	ui.C.Text(box.X+box.W-16, box.Y+box.H/2, "v", theme.TextDim)
 
 	if ui.hover(box) && ui.In.MouseLeftClicked {

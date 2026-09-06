@@ -91,7 +91,7 @@ func drawTopBar(ui *UI, m *Model) {
 		mapCurrent = mapOptions[0]
 	}
 	mapRow := Rect{16, y + chipH + 26, windowW - 32, rowHeight}
-	ui.Options("mapSelect", mapRow, "Level", mapCurrent, mapOptions, func(sel string) {
+	ui.Options("mapSelect", mapRow, "Level", mapCurrent, choices(mapOptions), func(sel string) {
 		if len(m.Maps) > 0 {
 			m.MapName = sel
 		}
