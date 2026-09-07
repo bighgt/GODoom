@@ -49,19 +49,15 @@ func SaveMerge(cfg Config, path string) error {
 	ct := reflect.TypeOf(cfg)
 	cv := reflect.ValueOf(cfg)
 	var missing []string
-	for i := 0; i < ct.NumField(); i++ {
-		key, _, _ := strings.Cut(ct.Field(i).Tag.Get("json"), ",")
-		if key == "" || key == "-" {
-			continue
-		}
-		valJSON, err := json.Marshal(cv.Field(i).Interface())
+	for _, f := range configJSONFields(ct) {
+		valJSON, err := json.Marshal(cv.Field(f.Index).Interface())
 		if err != nil {
-			return fmt.Errorf("config: encode %s: %w", ct.Field(i).Name, err)
+			return fmt.Errorf("config: encode %s: %w", ct.Field(f.Index).Name, err)
 		}
-		if updated, ok := replaceJSONValue(text, key, string(valJSON)); ok {
+		if updated, ok := replaceJSONValue(text, f.Key, string(valJSON)); ok {
 			text = updated
 		} else {
-			missing = append(missing, fmt.Sprintf("  %q: %s", key, valJSON))
+			missing = append(missing, fmt.Sprintf("  %q: %s", f.Key, valJSON))
 		}
 	}
 	if len(missing) > 0 {

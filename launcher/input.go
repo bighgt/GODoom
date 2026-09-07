@@ -38,7 +38,6 @@ func (in Input) Pressed(k window.MenuKey) bool { return in.Keys[k] }
 type Poller struct {
 	win           *window.Window
 	prevLeftDown  bool
-	enterWasDown  bool // tracks KeyEnterAlsoNumpad separately — see Poll
 	keyDownSince  map[window.MenuKey]float64 // seconds of game-clock when the key went down, 0 = not down
 	keyLastRepeat map[window.MenuKey]float64
 	clock         float64
@@ -78,6 +77,9 @@ func (p *Poller) Poll(dt float64) Input {
 
 	for _, k := range allMenuKeys {
 		down := p.win.MenuKeyDown(k)
+		if k == window.MenuKeyEnter && p.win.KeyEnterAlsoNumpad() {
+			down = true // numpad Enter is just an alias for MenuKeyEnter
+		}
 		since, wasDown := p.keyDownSince[k], p.keyDownSince[k] != 0
 		switch {
 		case down && !wasDown:
@@ -94,12 +96,6 @@ func (p *Poller) Poll(dt float64) Input {
 			p.keyDownSince[k] = 0
 		}
 	}
-	// Enter: also accept the numpad key (window.KeyEnterAlsoNumpad), edge-
-	// detected the same simple way as everything in engine.handleMovement.
-	if p.win.KeyEnterAlsoNumpad() && !p.enterWasDown {
-		in.Keys[window.MenuKeyEnter] = true
-	}
-	p.enterWasDown = p.win.KeyEnterAlsoNumpad()
 
 	return in
 }

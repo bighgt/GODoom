@@ -68,22 +68,14 @@ func (m *Model) PickWAD(path string) {
 	m.Status, m.StatusErr = "", false
 }
 
-// pickDefaultMap keeps want if it's still one of maps, otherwise prefers
-// the conventional first level (E1M1 for Doom/Ultimate Doom, MAP01 for
-// Doom II and most PWADs — the same convention cmd/engine's own
-// pickStartMap uses), falling back to whatever map is listed first.
+// pickDefaultMap keeps want if it's still one of maps, otherwise falls back
+// to wad.PreferredStartMap's convention (E1M1/MAP01, else whatever map is
+// listed first — the same convention cmd/engine's own pickStartMap uses).
 func pickDefaultMap(maps []string, want string) string {
 	for _, m := range maps {
 		if strings.EqualFold(m, want) {
 			return m
 		}
 	}
-	for _, want := range []string{"E1M1", "MAP01"} {
-		for _, m := range maps {
-			if m == want {
-				return m
-			}
-		}
-	}
-	return maps[0]
+	return wad.PreferredStartMap(maps)
 }

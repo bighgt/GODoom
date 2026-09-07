@@ -415,6 +415,17 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 	if !cfg.Music || music == nil {
 		if !cfg.Music {
 			log.Println("engine: music disabled (config.json)")
+			// music is shared across trips through the launcher↔game loop
+			// (setupAudio runs once, outside this per-session function), so
+			// a previous session's track needs to be silenced explicitly —
+			// there's no fresh player this time to start silent instead.
+			// Play(nil) is musicLoop.restart's documented no-op-events path:
+			// it halts (and all-notes-offs) whatever was playing without
+			// touching the backend device/synth, unlike Stop() (which is a
+			// one-way teardown — see playLevelMusic's doc comment).
+			if music != nil {
+				music.Play(nil)
+			}
 		}
 	} else {
 		playLevelMusic(w, music, game.MapMusicLump(mapName), mapName)
@@ -433,7 +444,15 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 // looping. A UMAPINFO music lump (override) is tried first; then the
 // conventional name for the map's format (wad.MusicLumpName — "D_E1M1" for
 // ExMy, "D_RUNNIN"-style for Doom II MAPxx), then "D_"+mapname as a fallback
-// (some PWADs name Doom II music that way), then it gives up quietly.
+// (some PWADs name Doom II music that way), then it silences whatever was
+// playing and gives up quietly. That last step matters because music is a
+// single player shared across level changes and across whole launcher↔game
+// sessions (see setupAudio) — without it, a map/WAD with no track of its own
+// would just let the previous one keep playing underneath it. It silences
+// via Play(nil), not Stop(): Stop is a one-way teardown of the backend
+// device/synth (see e.g. audio's fluidsynth_windows.go/midi_linux.go doc
+// comments) meant to run once at process exit, not something safe to call
+// and then keep playing through for the rest of the session.
 func playLevelMusic(w *wad.WAD, music *audio.MusicPlayer, override, mapName string) {
 	candidates := []string{override, wad.MusicLumpName(mapName), "D_" + mapName}
 	for _, lumpName := range candidates {
@@ -444,6 +463,7 @@ func playLevelMusic(w *wad.WAD, music *audio.MusicPlayer, override, mapName stri
 		events, err := wad.DecodeMus(raw)
 		if err != nil {
 			log.Printf("engine: decode music %q: %v", lumpName, err)
+			music.Play(nil)
 			return
 		}
 		log.Printf("engine: playing music %s (%d events)", lumpName, len(events))
@@ -451,20 +471,14 @@ func playLevelMusic(w *wad.WAD, music *audio.MusicPlayer, override, mapName stri
 		return
 	}
 	log.Printf("engine: no music lump found for %s (tried %v)", mapName, candidates)
+	music.Play(nil)
 }
 
 // pickStartMap prefers the conventional first level of whichever format the
 // WAD uses (E1M1 for Doom/Ultimate Doom, MAP01 for Doom II and most PWADs),
 // falling back to whatever map was listed first.
 func pickStartMap(maps []string) string {
-	for _, want := range []string{"E1M1", "MAP01"} {
-		for _, m := range maps {
-			if m == want {
-				return want
-			}
-		}
-	}
-	return maps[0]
+	return wad.PreferredStartMap(maps)
 }
 
 // mapPickerDialog is the GUI list dialog for the WAD's maps (window.PickMap);

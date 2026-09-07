@@ -115,7 +115,7 @@ func (ui *UI) End() (changed bool) {
 	// outside click closes it.
 	if scrollable && ui.hover(d.list) && ui.In.ScrollY != 0 {
 		maxScroll := len(d.options) - d.visible
-		d.scroll = clampInt(d.scroll-int(ui.In.ScrollY), 0, maxScroll)
+		d.scroll = max(0, min(maxScroll, d.scroll-int(ui.In.ScrollY)))
 		ui.dropdownScroll[d.id] = d.scroll
 	}
 	if !ui.In.MouseLeftClicked {
@@ -256,7 +256,14 @@ func (ui *UI) Slider(id string, r Rect, label string, v *float64, min, max float
 		ui.dragSlider = id
 		fallthrough
 	case ui.dragSlider == id && ui.In.MouseLeftDown:
-		f := clamp01(float64(int(ui.In.MouseX)-track.X) / float64(max0(track.W, 1)))
+		// track.W is never <= 0 in practice, but guard the divide anyway;
+		// min/max here are this Slider's own [min,max] value-range params,
+		// shadowing the builtins, so this can't just be max(track.W, 1).
+		trackW := track.W
+		if trackW < 1 {
+			trackW = 1
+		}
+		f := clamp01(float64(int(ui.In.MouseX)-track.X) / float64(trackW))
 		nv := min + f*(max-min)
 		if nv != *v {
 			*v = nv
@@ -315,10 +322,11 @@ func (ui *UI) Options(id string, r Rect, label string, current string, options [
 	}
 	if ui.openDropdown == id {
 		visible := min(len(options), dropdownMaxRows)
+		maxScroll := max(len(options)-visible, 0)
 		ui.deferred = &deferredDropdown{
 			id: id, control: box, current: current, options: options, write: write,
 			list:    Rect{box.X, box.Y + box.H, box.W, visible * rowHeight},
-			scroll:  clampInt(ui.dropdownScroll[id], 0, max(len(options)-visible, 0)),
+			scroll:  max(0, min(maxScroll, ui.dropdownScroll[id])),
 			visible: visible,
 		}
 	}
@@ -348,7 +356,7 @@ func (ui *UI) TextField(id string, r Rect, label string, v *string) bool {
 	changed := false
 	if focused {
 		runes := []rune(*v)
-		cur := clampInt(ui.textCursor[id], 0, len(runes))
+		cur := max(0, min(len(runes), ui.textCursor[id]))
 		for _, r := range ui.In.Typed {
 			runes = append(runes[:cur], append([]rune{r}, runes[cur:]...)...)
 			cur++
@@ -445,19 +453,4 @@ func clamp01(f float64) float64 {
 		return 1
 	}
 	return f
-}
-func clampInt(v, lo, hi int) int {
-	if v < lo {
-		return lo
-	}
-	if v > hi {
-		return hi
-	}
-	return v
-}
-func max0(v, floor int) int {
-	if v < floor {
-		return floor
-	}
-	return v
 }

@@ -18,11 +18,18 @@ func Draw(ui *UI, m *Model) {
 	c := ui.C
 	c.Fill(theme.Background)
 
+	// Captured before drawSettingsPanel runs: a focused text field consumes
+	// this same Enter press itself (to commit the edit and drop focus, see
+	// TextField), so "was a field focused when this frame started" is what
+	// decides whether Enter also means Play — not ui.focusText's value
+	// afterward, which TextField has by then already cleared.
+	editingText := ui.focusText != ""
+
 	drawTopBar(ui, m)
 	drawSettingsPanel(ui, m)
 	drawBottomBar(ui, m)
 
-	if ui.In.Pressed(window.MenuKeyEnter) && !m.Done {
+	if ui.In.Pressed(window.MenuKeyEnter) && !m.Done && !editingText {
 		// Enter anywhere = Play, same convenience a "default button" gives
 		// a dialog — but still goes through the same validation as clicking
 		// PLAY (tryPlay), so it can't skip the WAD/map check.
@@ -120,9 +127,39 @@ func drawBottomBar(ui *UI, m *Model) {
 	}
 }
 
+// layoutSettings is the settings panel's one layout computation — every
+// section's header and each of its rows, in order, at the Y each would sit
+// starting from y0 — advancing by the same header/row/gap constants
+// regardless of whether draw is given. drawSettingsPanel calls it once
+// with draw == nil just to measure the total content height (for scroll
+// clamping) and once more to actually draw, so the two can no longer drift
+// apart the way a separately hand-maintained settingsContentHeight used to
+// risk: there is only one place this math is written.
+func layoutSettings(y0 int, draw func(y int, sec string, f *field)) int {
+	y := y0
+	for _, sec := range sectionOrder {
+		rows := fieldsInSection(sec)
+		if len(rows) == 0 {
+			continue
+		}
+		if draw != nil {
+			draw(y, sec, nil)
+		}
+		y += 24 + rowGap
+		for i := range rows {
+			if draw != nil {
+				draw(y, sec, &rows[i])
+			}
+			y += rowHeight + rowGap
+		}
+		y += sectionGap
+	}
+	return y - y0
+}
+
 func drawSettingsPanel(ui *UI, m *Model) {
 	viewport := Rect{0, topBarH, windowW, windowH - topBarH - bottomBarH}
-	total := settingsContentHeight()
+	total := layoutSettings(0, nil)
 
 	maxScroll := float64(max(total-viewport.H, 0))
 	if viewport.Contains(int(ui.In.MouseX), int(ui.In.MouseY)) && ui.In.ScrollY != 0 {
@@ -136,21 +173,14 @@ func drawSettingsPanel(ui *UI, m *Model) {
 	}
 
 	prevClip := ui.C.Clip(viewport)
-	y := viewport.Y - int(m.ScrollY)
-	for _, sec := range sectionOrder {
-		rows := fieldsInSection(sec)
-		if len(rows) == 0 {
-			continue
+	layoutSettings(viewport.Y-int(m.ScrollY), func(y int, sec string, f *field) {
+		if f == nil {
+			ui.SectionHeader(Rect{panelPad, y, viewport.W - 2*panelPad, 24}, sec)
+			return
 		}
-		ui.SectionHeader(Rect{panelPad, y, viewport.W - 2*panelPad, 24}, sec)
-		y += 24 + rowGap
-		for _, f := range rows {
-			r := Rect{panelPad, y, viewport.W - 2*panelPad - scrollbarW, rowHeight}
-			drawField(ui, r, f, &m.Cfg)
-			y += rowHeight + rowGap
-		}
-		y += sectionGap
-	}
+		r := Rect{panelPad, y, viewport.W - 2*panelPad - scrollbarW, rowHeight}
+		drawField(ui, r, *f, &m.Cfg)
+	})
 	ui.C.SetClip(prevClip)
 
 	if maxScroll > 0 {
@@ -160,23 +190,6 @@ func drawSettingsPanel(ui *UI, m *Model) {
 		ui.C.FillRect(Rect{windowW - scrollbarW, viewport.Y, scrollbarW, trackH}, theme.Panel)
 		ui.C.FillRect(Rect{windowW - scrollbarW + 2, thumbY, scrollbarW - 4, thumbH}, theme.ScrollThumb)
 	}
-}
-
-// settingsContentHeight mirrors drawSettingsPanel's own layout math exactly
-// (same header/row/gap constants) so scroll clamping matches what's
-// actually drawn.
-func settingsContentHeight() int {
-	h := 0
-	for _, sec := range sectionOrder {
-		rows := fieldsInSection(sec)
-		if len(rows) == 0 {
-			continue
-		}
-		h += 24 + rowGap
-		h += len(rows) * (rowHeight + rowGap)
-		h += sectionGap
-	}
-	return h
 }
 
 func drawField(ui *UI, r Rect, f field, cfg *config.Config) {

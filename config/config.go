@@ -533,6 +533,31 @@ func keyPresent(raw []byte, key string) bool {
 	return ok
 }
 
+// configField is one Config field's JSON key (its json tag, before any
+// ",omitempty"-style suffix) paired with its index into Config's reflected
+// fields.
+type configField struct {
+	Key   string
+	Index int
+}
+
+// configJSONFields walks t's (Config's) reflected fields and returns the
+// json-tagged ones, skipping any field with no tag or an explicit "-" —
+// the shared field-and-key walk missingKeys and SaveMerge (save.go) both
+// need, factored out so the two can't silently drift apart on how a
+// field's JSON key is derived.
+func configJSONFields(t reflect.Type) []configField {
+	var fields []configField
+	for i := 0; i < t.NumField(); i++ {
+		key, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+		if key == "" || key == "-" {
+			continue
+		}
+		fields = append(fields, configField{Key: key, Index: i})
+	}
+	return fields
+}
+
 // missingKeys reports the json tags of Config fields that don't appear as
 // keys in the given config.json bytes — so a partial file's absent options
 // are visible at startup rather than silently defaulted.
@@ -541,15 +566,10 @@ func missingKeys(raw []byte) []string {
 	if json.Unmarshal(raw, &present) != nil {
 		return nil
 	}
-	ct := reflect.TypeOf(Config{})
 	var missing []string
-	for i := 0; i < ct.NumField(); i++ {
-		name, _, _ := strings.Cut(ct.Field(i).Tag.Get("json"), ",")
-		if name == "" || name == "-" {
-			continue
-		}
-		if _, ok := present[name]; !ok {
-			missing = append(missing, name)
+	for _, f := range configJSONFields(reflect.TypeOf(Config{})) {
+		if _, ok := present[f.Key]; !ok {
+			missing = append(missing, f.Key)
 		}
 	}
 	return missing
