@@ -81,6 +81,36 @@ func TestApplySectorInterpNoOpAtTicBoundary(t *testing.T) {
 	}
 }
 
+func TestRenderedSectorHeightsChanged(t *testing.T) {
+	g := &Game{Level: &wad.Level{Sectors: []wad.Sector{
+		{FloorHeight: 0, CeilingHeight: 128},
+		{FloorHeight: 40, CeilingHeight: 128},
+	}}}
+
+	if !g.renderedSectorHeightsChanged() {
+		t.Error("first call: want true (force an initial build)")
+	}
+	if g.renderedSectorHeightsChanged() {
+		t.Error("second call, nothing moved: want false")
+	}
+
+	// A mover mid-glide rounds to the exact same int16 height two render
+	// frames in a row — the case this exists to catch (see its own doc
+	// comment): still false, since nothing actually changed since the last
+	// call.
+	if g.renderedSectorHeightsChanged() {
+		t.Error("third call, still nothing moved: want false")
+	}
+
+	g.Level.Sectors[1].FloorHeight = 41
+	if !g.renderedSectorHeightsChanged() {
+		t.Error("after a height actually moved: want true")
+	}
+	if g.renderedSectorHeightsChanged() {
+		t.Error("call right after a detected change: want false (snapshot now matches)")
+	}
+}
+
 func TestCollectGroundShadows(t *testing.T) {
 	g := &Game{}
 	g.Camera.X, g.Camera.Y = 0, 0

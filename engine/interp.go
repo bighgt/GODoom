@@ -128,6 +128,51 @@ func (g *Game) applySectorInterp() func() {
 	}
 }
 
+// renderedSectorHeightsChanged reports whether any sector's height this
+// frame — already interpolated by applySectorInterp, if a mover is
+// mid-glide — differs from what the static geometry was last built from,
+// and updates that snapshot (g.lastRenderedSecH) to match as a side effect.
+// Call once per frame, right after applySectorInterp and before deciding
+// whether to rebuild.
+//
+// applySectorInterp already skips a sector whose interpolated height comes
+// out equal to the CURRENT tic's authoritative one (see its own nf==cf &&
+// nc==cc check), but that alone doesn't catch the much more common case at
+// a high render frame rate: a door/lift/crusher moving a handful of map
+// units over one 1/35s tic subdivides into several render frames, and an
+// int16 height often rounds to the exact same value across two or more
+// consecutive ones. Without this second check, renderFrame/
+// SyncIsoWorldGeometry's caller would still see sectorInterpActive == true
+// on every one of those frames and pay for a full-level worldgeo.Invalidate
+// (walks every subsector) plus a synchronous, blocking GPU re-upload of the
+// entire static vertex buffer (render/vulkan's uploadStaticWorld) — for a
+// frame that looks pixel-identical to the one before. That per-frame stall,
+// for as long as any mover anywhere in the level is active, is what made
+// the hardware path's frame rate track sector-mover activity far more than
+// raw GPU throughput; skipping it here is a pure no-visual-difference
+// optimisation, not a behaviour change (geomChanged/animChanged, both far
+// less frequent, still force a rebuild unconditionally at their own call
+// sites — see renderFrame's and SyncIsoWorldGeometry's own comments).
+func (g *Game) renderedSectorHeightsChanged() bool {
+	secs := g.Level.Sectors
+	if len(g.lastRenderedSecH) != len(secs)*2 {
+		g.lastRenderedSecH = make([]int16, len(secs)*2)
+		for i := range secs {
+			g.lastRenderedSecH[i*2], g.lastRenderedSecH[i*2+1] = secs[i].FloorHeight, secs[i].CeilingHeight
+		}
+		return true // first call: force a build
+	}
+	changed := false
+	for i := range secs {
+		f, c := secs[i].FloorHeight, secs[i].CeilingHeight
+		if g.lastRenderedSecH[i*2] != f || g.lastRenderedSecH[i*2+1] != c {
+			g.lastRenderedSecH[i*2], g.lastRenderedSecH[i*2+1] = f, c
+			changed = true
+		}
+	}
+	return changed
+}
+
 func absInt(v int) int {
 	if v < 0 {
 		return -v

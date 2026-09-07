@@ -273,12 +273,38 @@ type Game struct {
 	// WorldBuilder is the per-level BSP-to-triangle-list builder for
 	// HardwareMode (nil otherwise). Rebuilt on level change (see loadMap).
 	WorldBuilder *worldgeo.Builder
+	// IsoCameraAzimuth/IsoAimX/IsoAimY are read by IsoMovementSystem (see
+	// movement_iso.go) — an isometric front end (cmd/isoengine) updates
+	// these itself each frame before calling AdvanceSimulation. Zero value
+	// is harmless (an azimuth of 0 and an aim point at the origin) before a
+	// front end's first real update; unused by the first-person front end.
+	IsoCameraAzimuth float64
+	IsoAimX, IsoAimY float64
+	// IsoAimLocked: the front end has snapped IsoAimX/Y onto a specific
+	// AimTargetPositions() entry (the crosshair is visually on it), rather
+	// than IsoAimX/Y being the mouse's raw, unsnapped ground-plane point.
+	// hitscanSpread (weapons.go) reads this to drop a hitscan shot's random
+	// inaccuracy for that one shot — the angle is already exact, so with no
+	// added spread a clear line of sight to the target is a guaranteed hit.
+	// Unused by the first-person front end.
+	IsoAimLocked bool
 	// geomHeights snapshots every sector's floor+ceiling height; renderFrame
 	// (HardwareMode) rebuilds the cached static geometry only when one of
 	// them actually moved — a live door in its open-wait, a strobe light,
 	// etc. must not trigger a rebuild.
 	geomHeights []int16
 	dbgHWFrames int // rate-limits the hardware-path dynamic-light diagnostic
+	// dbgSimMS/dbgBuildMS/dbgDrawMS are smoothed (same EMA as fps below)
+	// per-stage frame times the hardware path logs alongside dbgHWFrames'
+	// existing diagnostics — see renderFrame's timing block. Splitting the
+	// frame into "CPU sim," "CPU geometry prep," and "DrawWorld" (command
+	// recording + vkQueueSubmit, plus whatever fence wait it hits catching
+	// up to the GPU) is what tells a report of "fast on Linux, slow on
+	// Windows" apart: a big gap concentrated in dbgDrawMS with the other two
+	// staying small points at Vulkan driver/submission overhead (the
+	// well-documented RADV-vs-Windows-AMD-driver gap), not at anything this
+	// engine's own CPU-side code is doing differently between OSes.
+	dbgSimMS, dbgBuildMS, dbgDrawMS float64
 	// lightScale / ambientLight / exposure are config lightScale /
 	// ambientLight / exposure, forwarded into every render.Frame (buildFrame)
 	// for the enhanced pipeline. lightScale and ambientLight are also handed
@@ -416,11 +442,17 @@ type Game struct {
 	// 35Hz. secInterpSaved holds the authoritative heights displaced during
 	// one frame's geometry build, restored immediately after. sectorInterp
 	// Active reports that some sector was mid-travel this frame (forces a
-	// static-geometry rebuild). Presentation only — the sim reads the real
-	// Level.Sectors heights.
+	// static-geometry rebuild, gated further by lastRenderedSecH below).
+	// Presentation only — the sim reads the real Level.Sectors heights.
 	prevSectorH        []int16
 	secInterpSaved     []savedSecH
 	sectorInterpActive bool
+	// lastRenderedSecH is every sector's floor/ceiling height (interleaved)
+	// as of the last frame's static-geometry build — see
+	// renderedSectorHeightsChanged's doc comment (interp.go) on why a
+	// sectorInterpActive frame still needs this second check before paying
+	// for a full-level Invalidate + blocking GPU re-upload.
+	lastRenderedSecH []int16
 
 	// pickupPrev* is the player's position at the previous checkItemPickups
 	// call. The check only runs at the 35Hz tic rate while the camera moves
@@ -563,6 +595,22 @@ func (g *Game) AddSystem(s System) {
 	g.systems = append(g.systems, s)
 }
 
+// AdvanceSimulation runs one frame's worth of gameplay — every registered
+// System, the fixed-35Hz simulation tic(s) dt has accumulated, the FPS
+// smoothing average, and the animated-surface clock — without any
+// rendering. Factored out of Run so an alternate front end with its own
+// render loop entirely (cmd/isoengine, which doesn't use package raster or
+// renderFrame's CPU-rasterize-then-present shape at all) can still drive
+// the same simulation: physics, monster AI, sector specials, combat.
+func (g *Game) AdvanceSimulation(dt float32) {
+	for _, s := range g.systems {
+		s.Update(g, dt)
+	}
+	g.stepSimulation(dt)
+	g.updateFPS(dt)
+	g.renderClock += float64(dt) // animated-surface clock (water ripple)
+}
+
 // Run drives the main loop until the window is closed. Each frame: poll
 // input, run every System, step the fixed-rate simulation, rasterize on the
 // CPU, and present via the GPU renderer. Returns cleanly on window close.
@@ -577,12 +625,9 @@ func (g *Game) Run() error {
 		}
 
 		g.pollInput()
-		for _, s := range g.systems {
-			s.Update(g, dt)
-		}
-		g.stepSimulation(dt)
-		g.updateFPS(dt)
-		g.renderClock += float64(dt) // animated-surface clock (water ripple)
+		simStart := time.Now()
+		g.AdvanceSimulation(dt)
+		g.dbgSimMS = emaMS(g.dbgSimMS, time.Since(simStart))
 		if err := g.renderFrame(); err != nil {
 			return err
 		}
@@ -640,6 +685,18 @@ func (g *Game) updateFPS(dt float32) {
 	g.fps = g.fps*smoothing + (1/dt)*(1-smoothing)
 }
 
+// emaMS folds duration d (in milliseconds) into prev with updateFPS's same
+// exponential smoothing — used for the hardware path's dbgSimMS/dbgBuildMS/
+// dbgDrawMS per-stage frame-timing diagnostic (see their doc comment).
+func emaMS(prev float64, d time.Duration) float64 {
+	const smoothing = 0.9
+	ms := float64(d) / float64(time.Millisecond)
+	if prev == 0 {
+		return ms
+	}
+	return prev*smoothing + ms*(1-smoothing)
+}
+
 // renderFrame rasterizes the world on the CPU, overlays the in-flight
 // projectiles, map objects, viewmodel and HUD, then hands the result to the
 // GPU backend: the enhanced path uploads a G-buffer plus a separate crisp
@@ -677,8 +734,9 @@ func (g *Game) renderFrame() error {
 		// The held weapon dims with the sector the player is standing in,
 		// the way vanilla shades a psprite (the muzzle flash stays full
 		// bright).
+		bobX, bobY, bobScale := g.weaponBob()
 		g.Raster.DrawWeapon(def.SpritePrefix, gunFrame, def.FlashPrefix, flashFrame, hasFlash, g.Weapon.Offset,
-			g.weaponBobX(), g.weaponBobY(), g.weaponBobScale(), g.spriteSectorLight(g.Camera.X, g.Camera.Y))
+			bobX, bobY, bobScale, g.spriteSectorLight(g.Camera.X, g.Camera.Y))
 		if g.Crosshair != "" && g.Crosshair != "off" {
 			g.Raster.DrawCrosshair(g.Crosshair, g.CrosshairSize)
 		}
@@ -697,6 +755,7 @@ func (g *Game) renderFrame() error {
 		// rasterise + shade it. The 2D overlay draws above (weapon / HUD /
 		// crosshair) landed in the crisp overlay plane, which the GPU blends
 		// over the world.
+		buildStart := time.Now()
 		fov := g.Camera.FOVDeg
 		if fov <= 0 {
 			fov = 90
@@ -704,9 +763,19 @@ func (g *Game) renderFrame() error {
 		geomChanged := g.worldGeomChanged() // reads authoritative (pre-interp) heights
 		animChanged := g.animFrameChanged() // an animated flat/texture stepped a frame
 		restoreSecH := g.applySectorInterp()
-		if geomChanged || g.sectorInterpActive || animChanged {
-			// A mover changed a sector height between tics, one is mid-glide
-			// this frame, or an animated flat/wall texture advanced — rebuild
+		// heightsChanged must run every frame (its snapshot update is a side
+		// effect other frames' comparisons depend on) even though it's only
+		// consulted when sectorInterpActive — see its own doc comment on why
+		// that check exists at all: a mid-glide mover reinterpolates every
+		// render frame, but most of those frames round to the exact same
+		// int16 height as the one before, and rebuilding for one of those
+		// would be a full-level Invalidate + a blocking GPU re-upload for no
+		// visual difference.
+		heightsChanged := g.renderedSectorHeightsChanged()
+		if geomChanged || animChanged || (g.sectorInterpActive && heightsChanged) {
+			// A mover changed a sector height between tics, an animated
+			// flat/wall texture advanced, or one is mid-glide this frame AND
+			// actually moved since the last frame we rebuilt for — rebuild
 			// the static geometry (its texture bindings are baked in, and the
 			// height version needs to track interpolation, not 35Hz).
 			g.WorldBuilder.Invalidate()
@@ -760,15 +829,28 @@ func (g *Game) renderFrame() error {
 		// what's out of view. Must run every frame (not just the debug-log
 		// window below): it's the actual cull now, not only a diagnostic.
 		visD, totD, visV, totV := g.WorldBuilder.UpdateVisibility(wc)
+		g.dbgBuildMS = emaMS(g.dbgBuildMS, time.Since(buildStart))
+		drawStart := time.Now()
+		err := g.Renderer.DrawWorld(geom, wc, g.Raster.Width, g.Raster.Height, g.Raster.Overlay(), lights)
+		g.dbgDrawMS = emaMS(g.dbgDrawMS, time.Since(drawStart))
 		if g.dbgHWFrames < 5400 {
 			g.dbgHWFrames++
 			if g.dbgHWFrames <= 3 || g.dbgHWFrames%1800 == 0 {
 				log.Printf("engine: [hw] frame %d — collectLights -> %d light(s) to DrawWorld", g.dbgHWFrames, len(lights))
 				log.Printf("engine: [hw] frame %d — visibility grid: %d/%d draws, %d/%d verts drawn (culled %.0f%%)",
 					g.dbgHWFrames, visD, totD, visV, totV, 100*(1-float64(visD)/float64(max(totD, 1))))
+				// Per-stage smoothed frame time: sim = every System +
+				// stepSimulation (CPU gameplay), build = BSP walk/geometry
+				// prep/visibility culling above (CPU, this engine's own
+				// code), draw = DrawWorld's command recording + submit +
+				// whatever fence wait it hits (Vulkan driver/GPU territory —
+				// see dbgDrawMS's own doc comment on why this is the number
+				// to compare across OSes/drivers).
+				log.Printf("engine: [hw] frame %d — timing: sim=%.2fms build=%.2fms draw=%.2fms (fps %.0f)",
+					g.dbgHWFrames, g.dbgSimMS, g.dbgBuildMS, g.dbgDrawMS, g.fps)
 			}
 		}
-		if err := g.Renderer.DrawWorld(geom, wc, g.Raster.Width, g.Raster.Height, g.Raster.Overlay(), lights); err != nil {
+		if err != nil {
 			return fmt.Errorf("engine: draw world: %w", err)
 		}
 		return nil

@@ -613,6 +613,26 @@ func (r *Renderer) uploadWorldFrame(sl *worldSlot, g *worldgeo.Geometry, cam wor
 // a descriptor.
 func (r *Renderer) rewriteSlotVertexBinding(*worldSlot) {}
 
+// camBasis is the camera-space projection basis both the ambient pass
+// (worldambient.go's recordAmbientTerm) and the present blit's push
+// constants need to reconstruct a world point from (screen pixel, sampled
+// depth) — computed once per frame in recordWorldCommandBuffer and passed
+// into both instead of each independently re-deriving the same
+// FocalFor/Sin/Cos/Tan calls from the same cam.
+type camBasis struct {
+	focal, sin, cos, horizon float64
+}
+
+func computeCamBasis(cam worldgeo.Camera, h int) camBasis {
+	focal := worldgeo.FocalFor(cam, h)
+	return camBasis{
+		focal:   focal,
+		sin:     math.Sin(cam.Angle),
+		cos:     math.Cos(cam.Angle),
+		horizon: float64(h)*0.5 + math.Tan(cam.Pitch)*focal,
+	}
+}
+
 func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uint32, frame int, g *worldgeo.Geometry, cam worldgeo.Camera) error {
 	wr := r.wr
 	sl := &wr.slots[frame]
@@ -656,17 +676,37 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 	vk.CmdSetScissor(cmd, 0, 1, []vk.Rect2D{fullScissor(wr.w, wr.h)})
 
 	vp := worldgeo.ViewProj(cam, wr.w, wr.h)
+	basis := computeCamBasis(cam, wr.h)
 
 	// Depth pre-pass: rasterise the opaque static geometry to the depth
 	// buffer only (no fragment shading), so the colour pass's early-Z
 	// rejects every occluded wall/flat pixel before it runs the fade + light
 	// loop. Masked 2-sided middles (StaticTris[StaticOpaqueCount:]) are
 	// excluded — their holes must not write depth.
+	//
+	// This walks g.StaticDraws' opaque prefix (every entry's First is <
+	// StaticOpaqueCount, in the order Invalidate appended them — masked
+	// middles only start after it) one CmdDraw per run instead of the single
+	// CmdDraw over the whole StaticTris[:StaticOpaqueCount] range this used
+	// to be, so it can skip runs g.StaticDrawVisible has culled this frame
+	// exactly like the colour pass's drawRuns does just below. Without this,
+	// depth got written (and the colour pass's early-Z got to reject
+	// against) geometry the colour pass itself no longer even submits,
+	// undercutting part of the point of culling it there.
 	if wr.pipeDepth != nil && wr.staticVBO != nil && g.StaticOpaqueCount > 0 {
 		vk.CmdBindPipeline(cmd, vk.PipelineBindPointGraphics, wr.pipeDepth)
 		vk.CmdPushConstants(cmd, wr.plWorld, vk.ShaderStageFlags(vk.ShaderStageVertexBit), 0, 64, unsafe.Pointer(&vp[0]))
 		vk.CmdBindVertexBuffers(cmd, 0, 1, []vk.Buffer{wr.staticVBO}, []vk.DeviceSize{0})
-		vk.CmdDraw(cmd, uint32(g.StaticOpaqueCount), 1, 0, 0)
+		visible := g.StaticDrawVisible
+		for i, d := range g.StaticDraws {
+			if d.First >= g.StaticOpaqueCount || d.Count == 0 {
+				continue
+			}
+			if visible != nil && i < len(visible) && !visible[i] {
+				continue
+			}
+			vk.CmdDraw(cmd, uint32(d.Count), 1, uint32(d.First), 0)
+		}
 	}
 
 	vk.CmdBindPipeline(cmd, vk.PipelineBindPointGraphics, wr.pipeWorld)
@@ -690,11 +730,16 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 		// per texture into several — one per (texture, cell) — consecutive
 		// runs now share a texture far more often than before, and both
 		// rebinding the identical descriptor set AND re-doing the
-		// wr.texCache map lookup for it are pure waste. nil never matches a
-		// real *assets.RGBA (or the g.Sky substitution below), so the very
-		// first run always does both.
+		// wr.texCache map lookup for it are pure waste. haveLast (rather than
+		// comparing lastTex to nil) is what forces the very first run to
+		// always do both: tex itself can legitimately be nil (an unresolved
+		// sky run, g.Sky == nil), and that must still miss the cache instead
+		// of matching lastTex's own zero value and skipping straight to an
+		// unguarded CmdDraw with whatever descriptor set happened to be
+		// bound before this pass.
 		var lastTex *assets.RGBA
 		var lastWT *worldTex
+		haveLast := false
 		for i, d := range runs {
 			if d.Count == 0 {
 				continue
@@ -707,13 +752,13 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 				tex = g.Sky
 			}
 			wt := lastWT
-			if tex != lastTex {
+			if !haveLast || tex != lastTex {
 				wt = wr.texCache[tex]
 				if wt == nil {
 					continue // texture unresolved / not uploaded — skip the run
 				}
 				vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, wr.plWorld, 0, 1, []vk.DescriptorSet{wt.set}, 0, nil)
-				lastTex, lastWT = tex, wt
+				lastTex, lastWT, haveLast = tex, wt, true
 			}
 			vk.CmdDraw(cmd, uint32(d.Count), 1, uint32(d.First), 0)
 		}
@@ -731,7 +776,7 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 	// both a real perf win (SSAO's disc gather and god rays' march run at
 	// 1/16th the pixel count) and what makes the shadow edge soft, not any
 	// math in the shader itself.
-	r.recordAmbientTerm(cmd, frame, cam)
+	r.recordAmbientTerm(cmd, frame, cam, basis)
 
 	// (4) bloom: build the HDR mip pyramid -> bloom mip 0.
 	r.recordBloom(cmd, frame)
@@ -758,46 +803,35 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 	// worldblit.frag PC: tonemap params + the camera basis it needs to
 	// reconstruct a world point from (screen pixel, sampled depth) and march
 	// the depth buffer for the water SSR reflection. horizonY / focal match
-	// raster.horizonY and world.frag skyColorAt.
-	bFocal := worldgeo.FocalFor(cam, wr.h)
-	bSin := float32(math.Sin(cam.Angle))
-	bCos := float32(math.Cos(cam.Angle))
-	bHorizon := float32(wr.h)*0.5 + float32(math.Tan(cam.Pitch)*bFocal)
-	// worldblit.frag post-chain tuning still owned here (SSR/CAS/dither);
-	// aoStrength/aoRadius/aoBias/godrayStrength/sunDir moved to
-	// worldambient.go's own constants when SSAO/god rays joined the
-	// ambient pass (see the p3/p4/p5 slots below — the shader no longer
-	// reads most of them, but the Go array is still fixed-size).
+	// raster.horizonY and world.frag skyColorAt. basis (computed once above,
+	// shared with recordAmbientTerm) is the same derivation.
+	bFocal := basis.focal
+	bSin := float32(basis.sin)
+	bCos := float32(basis.cos)
+	bHorizon := float32(basis.horizon)
+	// worldblit.frag post-chain tuning still owned here (SSR/CAS/dither).
+	// aoStrength, aoRadius/aoBias, sunDir, and the dyn-light shadow march
+	// constants used to be threaded through here too, back when this
+	// shader ran SSAO/god-rays/shadows itself — now that they've moved to
+	// worldambient.go's own pass (see p3/p4 below), this array carries only
+	// what worldblit.frag still actually reads.
 	const (
 		ssrStrength     = 0.9
 		sharpenStrength = 0.35 // CAS 0..1
 		ditherStrength  = 1.0  // +/- 1 LSB triangular-PDF, kills 8-bit banding
 	)
-	blitPC := [32]float32{
+	blitPC := [24]float32{
 		wr.bloom.exposure, wr.bloom.strength, float32(cam.Time), float32(worldgeo.NearPlane),
 		bSin, bCos, float32(bFocal), float32(worldgeo.FarPlane),
 		float32(cam.X), float32(cam.Y), float32(cam.Z), bHorizon,
-		// p3.w (aoStrength) is vestigial: SSAO itself now runs in
-		// worldambient.go's pass; only godrayStrength below (p4.w) is
-		// still read here, to scale+tint the pre-marched god-ray luma
-		// worldblit.frag samples from the ambient buffer.
-		float32(wr.w), float32(wr.h), ssrStrength, ambAOStrength,
-		// p4: vestigial sunDir.xyz (god rays' own march moved to
-		// worldambient.go too) + the still-used godrayStrength.
-		ambSunX, ambSunY, ambSunZ, ambGodrayStrength,
-		// p5: vestigial aoRadius/aoBias (x/w) alongside the still-used
-		// sharpen/dither strengths (y/z).
-		ambAORadius, sharpenStrength, ditherStrength, ambAOBias,
-		// p6: vestigial — worldblit.frag's own shadow march was replaced by
-		// worldambient.go's quarter-res pass (recordAmbientTerm, which reads
-		// these same dynShadowStrength/March/Bias constants), so this slot
-		// is unused by the shader now. Left populated rather than reworking
-		// the fixed 8-vec4 push-constant layout for a purely cosmetic win.
-		float32(cam.ShadowCasterN), dynShadowStrength, dynShadowMarch, dynShadowBias,
-		// p7: full-frame sector-effect tint (rgb, amount; A<0 also = heat wobble)
+		// p3.w (godrayStrength) scales+tints the pre-marched god-ray luma
+		// worldblit.frag samples from worldambient.go's ambient buffer.
+		float32(wr.w), float32(wr.h), ssrStrength, ambGodrayStrength,
+		sharpenStrength, ditherStrength, 0, 0, // p4.zw unused (pad to a vec4)
+		// p5: full-frame sector-effect tint (rgb, amount; A<0 also = heat wobble)
 		cam.TintR, cam.TintG, cam.TintB, cam.TintA,
 	}
-	vk.CmdPushConstants(cmd, wr.plBlit, vk.ShaderStageFlags(vk.ShaderStageFragmentBit), 0, 128, unsafe.Pointer(&blitPC[0]))
+	vk.CmdPushConstants(cmd, wr.plBlit, vk.ShaderStageFlags(vk.ShaderStageFragmentBit), 0, 96, unsafe.Pointer(&blitPC[0]))
 	vk.CmdDraw(cmd, 3, 1, 0, 0)
 	vk.CmdEndRenderPass(cmd)
 

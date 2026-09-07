@@ -84,6 +84,23 @@ float hash12(vec2 p) {
     return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
 }
 
+// interleavedGradientNoise (Jorge Jimenez) — like hash12, a 2D-position ->
+// 0..1 dither source, but spatially structured instead of pure noise:
+// neighbouring pixels get smoothly-varying (not independently random)
+// values. ssao() below rotates its sample disc by this instead of hash12
+// specifically because the AO term is bilinearly upsampled 4x per axis
+// (this pass runs at quarter render resolution — see the file header); a
+// hash's neighbour-to-neighbour randomness survives that upsample as a
+// speckled grey noise baked into the final image (worst in corners, where
+// AO darkens the most and the same relative noise reads strongest) — this
+// is exactly what was reported as "transparent grey dots on walls, worst
+// in corners." IGN's spatial coherence means adjacent quarter-res texels'
+// differently-rotated sample discs average out under the same bilinear
+// upsample instead of amplifying into visible dots.
+float interleavedGradientNoise(vec2 p) {
+    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
 // ---- dynamic-light shadows ------------------------------------------------
 
 // For each of the first pc.q2.w lights (muzzle flash, in-flight shots,
@@ -177,7 +194,18 @@ float ssao(vec2 uv, vec3 P, vec3 N, float ez0) {
     float rUVy = (radius * focal / max(ez0, 1.0)) / h;
     vec3 Pb = P + N * pc.q4.y; // bias off the surface
 
-    float rot = hash12(uv * vec2(w, h)) * 6.2831853;
+    // gl_FragCoord.xy — this PASS's own (quarter-res) pixel coordinates,
+    // consecutive integers between neighbouring invocations — not uv*(w,h)
+    // (w/h here are the FULL render resolution; since this shader runs once
+    // per QUARTER-res pixel, that multiply strides by 4 between neighbours
+    // instead of by 1). A hash doesn't care about that: scrambled output
+    // looks equally random at any input spacing. IGN does: it's a
+    // structured gradient function meant to be sampled at consecutive
+    // integer pixels, and evaluating it at a stride-4 subset of its own
+    // domain aliases into a coarser, visible repeating pattern — exactly
+    // the "looks like a pattern, not noise" report after the hash->IGN
+    // swap. Sampling at this pass's native coordinates is the fix.
+    float rot = interleavedGradientNoise(gl_FragCoord.xy) * 6.2831853;
     const int K = 12;
     float occ = 0.0;
     for (int i = 0; i < K; ++i) {

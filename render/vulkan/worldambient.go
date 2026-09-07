@@ -3,7 +3,6 @@ package vulkan
 import (
 	_ "embed"
 	"fmt"
-	"math"
 	"unsafe"
 
 	vk "github.com/goki/vulkan"
@@ -36,6 +35,9 @@ import (
 
 //go:embed shaders/worldambient.frag.spv
 var worldAmbientFragSPV []byte
+
+//go:embed shaders/worldambientblur.frag.spv
+var worldAmbientBlurFragSPV []byte
 
 // dynShadowStrength/March/Bias are the shadow march's tuning constants, and
 // aoStrength/aoRadius/aoBias/godrayStrength/sunX/Y/Z are the SSAO/god-ray
@@ -80,6 +82,19 @@ type worldAmbient struct {
 
 	setSrc    [maxFramesInFlight]vk.DescriptorSet
 	setSample vk.DescriptorSet // one set: the image it points at never changes per slot
+
+	// AO denoise blur (worldambientblur.frag — see its own doc comment): a
+	// second small image/framebuffer sharing rp (same format/attachment
+	// layout, so no second VkRenderPass needed), read from img and written
+	// once per frame right after the generation pass above. setSample
+	// (worldblit.frag's input) points at imgBlur, not img, once this exists
+	// — see worldCreateAmbientPass.
+	imgBlur    litImage
+	fbBlur     vk.Framebuffer
+	dslBlurSrc vk.DescriptorSetLayout
+	setBlurSrc vk.DescriptorSet
+	plBlur     vk.PipelineLayout
+	pipeBlur   vk.Pipeline
 }
 
 func (r *Renderer) worldCreateAmbientPass() error {
@@ -158,6 +173,27 @@ func (r *Renderer) worldCreateAmbientPass() error {
 	}
 	wr.ambient.fb = fb
 
+	// Second image/framebuffer for the AO denoise blur (worldambientblur.frag)
+	// — same rp (format/attachment layout only, decoupled from any specific
+	// image), so no second VkRenderPass is needed, just a second framebuffer
+	// target.
+	wr.ambient.imgBlur, err = r.wMakeImage(w, h, sceneHDRFormat,
+		vk.ImageUsageFlags(vk.ImageUsageColorAttachmentBit)|vk.ImageUsageFlags(vk.ImageUsageSampledBit),
+		vk.ImageAspectFlags(vk.ImageAspectColorBit), 1)
+	if err != nil {
+		return err
+	}
+	fbBlurInfo := vk.FramebufferCreateInfo{
+		SType: vk.StructureTypeFramebufferCreateInfo, RenderPass: rp,
+		AttachmentCount: 1, PAttachments: []vk.ImageView{wr.ambient.imgBlur.view},
+		Width: uint32(w), Height: uint32(h), Layers: 1,
+	}
+	var fbBlur vk.Framebuffer
+	if res := vk.CreateFramebuffer(r.device, &fbBlurInfo, nil, &fbBlur); res != vk.Success {
+		return fmt.Errorf("vulkan: ambient blur framebuffer: %s", vk.Error(res))
+	}
+	wr.ambient.fbBlur = fbBlur
+
 	mk := func(bindings []vk.DescriptorSetLayoutBinding) (vk.DescriptorSetLayout, error) {
 		info := vk.DescriptorSetLayoutCreateInfo{
 			SType:        vk.StructureTypeDescriptorSetLayoutCreateInfo,
@@ -180,17 +216,21 @@ func (r *Renderer) worldCreateAmbientPass() error {
 	if wr.ambient.dslSample, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0)}); err != nil {
 		return err
 	}
+	if wr.ambient.dslBlurSrc, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0)}); err != nil {
+		return err
+	}
 
 	// One dedicated, fixed-size pool — sized once here and never grown or
 	// touched again, and kept entirely separate from worldCreateDescriptors'
 	// shared framePool so this pass can't perturb that pool's arithmetic.
 	poolInfo := vk.DescriptorPoolCreateInfo{
 		SType:         vk.StructureTypeDescriptorPoolCreateInfo,
-		MaxSets:       uint32(maxFramesInFlight + 1), // setSrc per slot + one shared setSample
+		MaxSets:       uint32(maxFramesInFlight + 2), // setSrc per slot + shared setSample + shared setBlurSrc
 		PoolSizeCount: 2,
 		PPoolSizes: []vk.DescriptorPoolSize{
-			// depth + scene samplers per setSrc, + one sampler for the shared setSample.
-			{Type: vk.DescriptorTypeCombinedImageSampler, DescriptorCount: uint32(2*maxFramesInFlight + 1)},
+			// depth + scene samplers per setSrc, + one sampler each for the
+			// shared setSample and setBlurSrc.
+			{Type: vk.DescriptorTypeCombinedImageSampler, DescriptorCount: uint32(2*maxFramesInFlight + 2)},
 			// World UBO per setSrc.
 			{Type: vk.DescriptorTypeUniformBuffer, DescriptorCount: uint32(maxFramesInFlight)},
 		},
@@ -243,6 +283,8 @@ func (r *Renderer) worldCreateAmbientPass() error {
 			},
 		)
 	}
+	// worldblit.frag samples the BLURRED buffer, not the raw generation
+	// pass's own output — see worldambientblur.frag's doc comment.
 	ss, err := alloc(wr.ambient.dslSample)
 	if err != nil {
 		return err
@@ -250,6 +292,19 @@ func (r *Renderer) worldCreateAmbientPass() error {
 	wr.ambient.setSample = ss
 	writes = append(writes, vk.WriteDescriptorSet{
 		SType: vk.StructureTypeWriteDescriptorSet, DstSet: ss, DstBinding: 0,
+		DescriptorCount: 1, DescriptorType: vk.DescriptorTypeCombinedImageSampler,
+		PImageInfo: []vk.DescriptorImageInfo{{
+			Sampler: wr.clampSampler, ImageView: wr.ambient.imgBlur.view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
+		}},
+	})
+
+	bs, err := alloc(wr.ambient.dslBlurSrc)
+	if err != nil {
+		return err
+	}
+	wr.ambient.setBlurSrc = bs
+	writes = append(writes, vk.WriteDescriptorSet{
+		SType: vk.StructureTypeWriteDescriptorSet, DstSet: bs, DstBinding: 0,
 		DescriptorCount: 1, DescriptorType: vk.DescriptorTypeCombinedImageSampler,
 		PImageInfo: []vk.DescriptorImageInfo{{
 			Sampler: wr.clampSampler, ImageView: wr.ambient.img.view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
@@ -263,26 +318,32 @@ func (r *Renderer) worldCreateAmbientPass() error {
 	if wr.ambient.pipeGen, err = r.litPipeline(worldAmbientFragSPV, wr.ambient.rp, wr.ambient.plGen); err != nil {
 		return err
 	}
+	if wr.ambient.plBlur, err = r.litPipelineLayout(wr.ambient.dslBlurSrc, 16); err != nil {
+		return err
+	}
+	if wr.ambient.pipeBlur, err = r.litPipeline(worldAmbientBlurFragSPV, wr.ambient.rp, wr.ambient.plBlur); err != nil {
+		return err
+	}
 	return nil
 }
 
 // recordAmbientTerm draws the quarter-res shadow/AO/god-ray buffer for this
 // slot. Called from recordWorldCommandBuffer right after the world pass
-// ends and before the bloom pass — cam gives it the camera basis needed to
-// reconstruct a world point from (screen pixel, sampled depth), the same
-// derivation the present blit pass makes for its own push constants (kept
-// separate here rather than threading it through as a parameter, so this
-// function stays self-contained).
-func (r *Renderer) recordAmbientTerm(cmd vk.CommandBuffer, frame int, cam worldgeo.Camera) {
+// ends and before the bloom pass — basis is the camera projection basis
+// needed to reconstruct a world point from (screen pixel, sampled depth),
+// computed once by the caller (computeCamBasis, world.go) and shared with
+// the present blit pass's own push constants rather than each independently
+// re-deriving it from cam.
+func (r *Renderer) recordAmbientTerm(cmd vk.CommandBuffer, frame int, cam worldgeo.Camera, basis camBasis) {
 	wr := r.wr
 	am := &wr.ambient
 	if am.pipeGen == nil {
 		return
 	}
-	bFocal := worldgeo.FocalFor(cam, wr.h)
-	bSin := float32(math.Sin(cam.Angle))
-	bCos := float32(math.Cos(cam.Angle))
-	bHorizon := float32(wr.h)*0.5 + float32(math.Tan(cam.Pitch)*bFocal)
+	bFocal := basis.focal
+	bSin := float32(basis.sin)
+	bCos := float32(basis.cos)
+	bHorizon := float32(basis.horizon)
 
 	vk.CmdBeginRenderPass(cmd, &vk.RenderPassBeginInfo{
 		SType: vk.StructureTypeRenderPassBeginInfo, RenderPass: am.rp, Framebuffer: am.fb,
@@ -305,6 +366,30 @@ func (r *Renderer) recordAmbientTerm(cmd vk.CommandBuffer, frame int, cam worldg
 	vk.CmdPushConstants(cmd, am.plGen, vk.ShaderStageFlags(vk.ShaderStageFragmentBit), 0, 96, unsafe.Pointer(&push[0]))
 	vk.CmdDraw(cmd, 3, 1, 0, 0)
 	vk.CmdEndRenderPass(cmd)
+
+	// AO denoise blur (worldambientblur.frag) — reads the buffer just
+	// written above (am.img, still bound as setBlurSrc's sampler) and
+	// writes am.imgBlur, which worldblit.frag actually samples (setSample
+	// points there — see worldCreateAmbientPass). Safe to read am.img
+	// immediately: rp's own external subpass dependency (the same one that
+	// already orders a later frame's write against a previous frame's read)
+	// equally covers this same-frame, immediately-following read.
+	if am.pipeBlur == nil {
+		return
+	}
+	vk.CmdBeginRenderPass(cmd, &vk.RenderPassBeginInfo{
+		SType: vk.StructureTypeRenderPassBeginInfo, RenderPass: am.rp, Framebuffer: am.fbBlur,
+		RenderArea:      vk.Rect2D{Extent: vk.Extent2D{Width: uint32(am.w), Height: uint32(am.h)}},
+		ClearValueCount: 1, PClearValues: []vk.ClearValue{vk.NewClearValue([]float32{1, 1, 0, 1})},
+	}, vk.SubpassContentsInline)
+	vk.CmdBindPipeline(cmd, vk.PipelineBindPointGraphics, am.pipeBlur)
+	vk.CmdSetViewport(cmd, 0, 1, []vk.Viewport{fullViewport(am.w, am.h)})
+	vk.CmdSetScissor(cmd, 0, 1, []vk.Rect2D{fullScissor(am.w, am.h)})
+	vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, am.plBlur, 0, 1, []vk.DescriptorSet{am.setBlurSrc}, 0, nil)
+	blurPush := [4]float32{1 / float32(am.w), 1 / float32(am.h), 1.5, 0} // offset: 1.5 quarter-res texels
+	vk.CmdPushConstants(cmd, am.plBlur, vk.ShaderStageFlags(vk.ShaderStageFragmentBit), 0, 16, unsafe.Pointer(&blurPush[0]))
+	vk.CmdDraw(cmd, 3, 1, 0, 0)
+	vk.CmdEndRenderPass(cmd)
 }
 
 func (r *Renderer) destroyAmbientPass() {
@@ -320,6 +405,12 @@ func (r *Renderer) destroyAmbientPass() {
 	if am.plGen != nil {
 		vk.DestroyPipelineLayout(dev, am.plGen, nil)
 	}
+	if am.pipeBlur != nil {
+		vk.DestroyPipeline(dev, am.pipeBlur, nil)
+	}
+	if am.plBlur != nil {
+		vk.DestroyPipelineLayout(dev, am.plBlur, nil)
+	}
 	if am.pool != nil {
 		vk.DestroyDescriptorPool(dev, am.pool, nil)
 	}
@@ -329,12 +420,19 @@ func (r *Renderer) destroyAmbientPass() {
 	if am.dslSample != nil {
 		vk.DestroyDescriptorSetLayout(dev, am.dslSample, nil)
 	}
+	if am.dslBlurSrc != nil {
+		vk.DestroyDescriptorSetLayout(dev, am.dslBlurSrc, nil)
+	}
 	if am.fb != nil {
 		vk.DestroyFramebuffer(dev, am.fb, nil)
+	}
+	if am.fbBlur != nil {
+		vk.DestroyFramebuffer(dev, am.fbBlur, nil)
 	}
 	if am.rp != nil {
 		vk.DestroyRenderPass(dev, am.rp, nil)
 	}
 	freeLitImage(dev, am.img)
+	freeLitImage(dev, am.imgBlur)
 	*am = worldAmbient{}
 }

@@ -44,15 +44,20 @@ layout(set = 0, binding = 3) uniform sampler2D uDepth;   // world pass D32 depth
 // math in this shader.
 layout(set = 1, binding = 0) uniform sampler2D uAmbientTerm;
 
+// SSAO, god-ray sun direction, and the dyn-light shadow march all moved to
+// worldambient.frag's quarter-res pass (see the file header) — this layout
+// only keeps what worldblit.frag itself still reads (godrayStrength, to
+// scale+tint the pre-marched god-ray luma sampled from uAmbientTerm); it
+// used to carry those passes' own now-unread constants too (aoStrength,
+// sunDir.xyz, aoRadius/aoBias, and a whole vestigial p6 vec4) rather than
+// repacking when they moved out.
 layout(push_constant) uniform PC {
     vec4 p0; // exposure, bloomStrength, waterClock, nearPlane
     vec4 p1; // sinA, cosA, focal(px), farPlane
     vec4 p2; // camX, camY, camZ, horizonY(px, pitch-sheared)
-    vec4 p3; // width, height, ssrStrength, aoStrength (vestigial — SSAO moved to worldambient.frag)
-    vec4 p4; // sunDir.xyz (vestigial — god rays moved to worldambient.frag), godrayStrength
-    vec4 p5; // aoRadius(vestigial), sharpenStrength(0..1), ditherStrength(LSBs), aoBias(vestigial)
-    vec4 p6; // vestigial — the dyn-light shadow march moved to worldambient.frag
-    vec4 p7; // screen tint: rgb, amount (0 = none; amount < 0 also = heat wobble)
+    vec4 p3; // width, height, ssrStrength, godrayStrength
+    vec4 p4; // sharpenStrength(0..1), ditherStrength(LSBs), unused, unused
+    vec4 p5; // screen tint: rgb, amount (0 = none; amount < 0 also = heat wobble)
 } pc;
 
 // ---- shared helpers -------------------------------------------------------
@@ -222,7 +227,7 @@ vec3 cas(vec2 uv, vec3 e) {
     vec3 mn = min(e, min(min(n, s), min(wv, ev)));
     vec3 mx = max(e, max(max(n, s), max(wv, ev)));
     vec3 amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, 1e-4), 0.0, 1.0));
-    float peak = -1.0 / mix(8.0, 5.0, clamp(pc.p5.y, 0.0, 1.0));
+    float peak = -1.0 / mix(8.0, 5.0, clamp(pc.p4.x, 0.0, 1.0));
     vec3 wgt = amp * peak;                    // negative -> subtract neighbours
     vec3 res = (e + (n + s + wv + ev) * wgt) / (1.0 + 4.0 * wgt);
     return clamp(res, 0.0, 1.0);
@@ -258,8 +263,8 @@ void main() {
     if (!isWater && !isSky && ez0 < 20000.0) {
         hdr *= amb.g; // SSAO
     }
-    if (pc.p4.w > 0.0) {
-        hdr += amb.b * pc.p4.w * vec3(1.06, 1.0, 0.88); // god rays
+    if (pc.p3.w > 0.0) {
+        hdr += amb.b * pc.p3.w * vec3(1.06, 1.0, 0.88); // god rays
     }
     if (!isWater && !isSky && ez0 < 20000.0) {
         hdr *= amb.r; // dynamic-light shadows
@@ -274,21 +279,21 @@ void main() {
     // edges against sky are still cleaned from the geometry side.
     if (!isWater && !isSky) {
         mapped = fxaa(uv, mapped);
-        if (pc.p5.y > 0.0) mapped = cas(uv, mapped);
+        if (pc.p4.x > 0.0) mapped = cas(uv, mapped);
     }
 
     // 6. sector-effect screen tint (lava / nukage / blood) — after tonemap,
     // before the HUD so the overlay stays true-colour. A negative amount also
     // asks for a slow heat wobble + brightness breathing (lava).
-    float tintAmt = abs(pc.p7.w);
+    float tintAmt = abs(pc.p5.w);
     if (tintAmt > 0.0) {
-        if (pc.p7.w < 0.0) {
+        if (pc.p5.w < 0.0) {
             vec2 warp = vec2(sin(uv.y * 42.0 + pc.p0.z * 3.1),
                              cos(uv.x * 39.0 + pc.p0.z * 2.7)) * 0.0016;
             mapped = mix(mapped, mappedAt(clamp(uv + warp, 0.0, 1.0)), 0.55);
             mapped *= 1.0 + 0.05 * sin(pc.p0.z * 2.0);
         }
-        mapped = mix(mapped, pc.p7.rgb, clamp(tintAmt, 0.0, 0.85));
+        mapped = mix(mapped, pc.p5.rgb, clamp(tintAmt, 0.0, 0.85));
     }
 
     // 7. overlay (crisp, unsharpened) + triangular-PDF dither
@@ -297,7 +302,7 @@ void main() {
 
     float r1 = hash12(gl_FragCoord.xy);
     float r2 = hash12(gl_FragCoord.xy + 17.3);
-    col += vec3((r1 + r2 - 1.0) * pc.p5.z / 255.0);
+    col += vec3((r1 + r2 - 1.0) * pc.p4.y / 255.0);
 
     outColor = vec4(clamp(col, 0.0, 1.0), 1.0);
 }
