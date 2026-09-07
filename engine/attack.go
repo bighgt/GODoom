@@ -175,15 +175,11 @@ const (
 // bfgSprayHalfFanAngle either side of its facing) — id's A_BFGSpray.
 func (g *Game) aBFGSpray(shooter *Mobj) {
 	hit := func(mo *Mobj) {
-		if mo == nil || mo == shooter || mo.removed || mo.Flags&MF_SHOOTABLE == 0 || mo.Health <= 0 {
+		if mo == nil || mo == shooter {
 			return
 		}
-		dx, dy := mo.X-shooter.X, mo.Y-shooter.Y
-		dist := math.Hypot(dx, dy)
-		if dist <= 0 || dist > missileRange {
-			return
-		}
-		if math.Abs(normAngle(math.Atan2(dy, dx)-shooter.Angle)) > bfgSprayHalfFanAngle {
+		dist, ok := shootableInCone(mo, shooter.X, shooter.Y, shooter.Angle, missileRange, bfgSprayHalfFanAngle)
+		if !ok || dist <= 0 {
 			return
 		}
 		if !g.pCheckSight(shooter, mo) {

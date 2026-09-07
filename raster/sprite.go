@@ -237,7 +237,7 @@ func (r *Renderer) DrawThing(cam Camera, wx, wy, wz, thingAngle float64, sectorL
 }
 
 func (r *Renderer) drawThing(cam Camera, wx, wy, wz, thingAngle float64, sectorLight int16, fullBright bool, prefix string, frame int, band draw2DCtx) {
-	rot := spriteRotation(cam.X, cam.Y, wx, wy, thingAngle)
+	rot := SpriteRotation(cam.X, cam.Y, wx, wy, thingAngle)
 	sp, flip, ok := r.textures.SpriteFrame(prefix, frame, rot)
 	if !ok {
 		return
@@ -272,7 +272,7 @@ func (r *Renderer) drawThingSprite(cam Camera, t *SceneThing, band draw2DCtx) {
 // resolution. ok is false when the frame has no art. The hardware-geometry
 // path (render/worldgeo.AddSprites) uses this so its billboards match.
 func (r *Renderer) ThingSprite(cam Camera, wx, wy, thingAngle float64, prefix string, frame int) (sp *assets.RGBA, flip bool, lift float64, ok bool) {
-	rot := spriteRotation(cam.X, cam.Y, wx, wy, thingAngle)
+	rot := SpriteRotation(cam.X, cam.Y, wx, wy, thingAngle)
 	sp, flip, ok = r.textures.SpriteFrame(prefix, frame, rot)
 	if !ok || sp == nil {
 		return nil, false, 0, false
@@ -285,11 +285,13 @@ func (r *Renderer) ThingSprite(cam Camera, wx, wy, thingAngle float64, prefix st
 	return sp, flip, lift, true
 }
 
-// spriteRotation picks the 0..7 sprite rotation to show for a thing at
+// SpriteRotation picks the 0..7 sprite rotation to show for a thing at
 // (tx, ty) facing thingAngle (radians), seen from (vx, vy) — id's
 // R_ProjectSprite quantisation: rotation 0 is the thing facing the viewer,
-// 4 is facing away, increasing counter-clockwise.
-func spriteRotation(vx, vy, tx, ty, thingAngle float64) int {
+// 4 is facing away, increasing counter-clockwise. Exported (beyond this
+// package's own ThingSprite) for a caller like cmd/isoengine that resolves
+// a thing's billboard sprite without a live raster.Renderer.
+func SpriteRotation(vx, vy, tx, ty, thingAngle float64) int {
 	rel := math.Atan2(ty-vy, tx-vx) - thingAngle
 	deg := math.Mod(rel*180/math.Pi, 360)
 	if deg < 0 {

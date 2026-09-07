@@ -211,6 +211,18 @@ type Builder struct {
 	buckets map[uint16]map[int32][]Vert // opaque static: per texture slot (SkyTex for sky), per grid cell
 	masked  map[uint16]map[int32][]Vert // static KindMasked (2-sided middles): per texture slot, per grid cell
 	sprites map[uint16][]Vert           // per texture slot, AddSprites billboards — reused across calls
+
+	// SkipCeilings, when true, omits every ceiling flat from the static
+	// geometry (floors, walls, and sky are unaffected) — a top-down/
+	// isometric viewer that never wants a room's roof occluding its own
+	// interior sets this instead of emitting ceiling geometry it would then
+	// need separate per-frame visibility logic to hide. false (what New
+	// leaves it at) keeps cmd/engine's existing behaviour: every FPS-path
+	// caller renders ceilings normally. New already calls Invalidate once
+	// before returning, so a caller wanting this set must do so and call
+	// Invalidate again itself: `b := New(...); b.SkipCeilings = true;
+	// b.Invalidate()`.
+	SkipCeilings bool
 }
 
 // New binds a builder to a level. tex resolves texture / flat names to the
@@ -590,7 +602,9 @@ func (b *Builder) emitSubsectorIdx(idx int) {
 	b.curCell = b.grid.cellOf(cx, cy)
 
 	b.emitFlat(poly, frontSec, false) // floor, faces up
-	b.emitFlat(poly, frontSec, true)  // ceiling, faces down
+	if !b.SkipCeilings {
+		b.emitFlat(poly, frontSec, true) // ceiling, faces down
+	}
 
 	for _, s := range segs {
 		b.emitSegWalls(s)

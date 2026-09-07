@@ -50,10 +50,18 @@ type Renderer struct {
 	// world.go). Built by NewWorld instead of New; mutually exclusive with
 	// lit / vanilla. DrawWorld errors unless this is set, and DrawFrame /
 	// DrawFrameLit error when it is.
-	hw    bool
-	wr    *worldResources
+	hw bool
+	wr *worldResources
+	// iso selects the isometric-viewer path (see isosetup.go/isoworld.go) —
+	// also render/worldgeo geometry, but an orthographic top-down camera and
+	// a much simpler pipeline (no bloom/ambient/voxel passes). Built by
+	// NewIso instead of New/NewWorld; mutually exclusive with hw / lit /
+	// vanilla. DrawIso errors unless this is set, and DrawFrame / DrawFrameLit
+	// / DrawWorld error when it is.
+	iso bool
+	ir  *isoResources
 	// maxAnisotropy is the device's advertised MaxSamplerAnisotropy when the
-	// samplerAnisotropy feature was enabled (hw path), else 0.
+	// samplerAnisotropy feature was enabled (hw or iso path), else 0.
 	maxAnisotropy float32
 
 	// DeviceName/DeviceTypeName identify the physical GPU New selected
@@ -193,6 +201,7 @@ func (r *Renderer) Destroy() {
 	r.waitIdle()
 
 	r.destroyWorldResources()
+	r.destroyIsoResources()
 	r.destroyLitResources()
 	r.destroyPipeline()
 	r.destroyDescriptors()

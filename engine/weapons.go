@@ -321,6 +321,23 @@ func (g *Game) moveSpeedFrac() float64 {
 	return f
 }
 
+// weaponBob computes all three per-frame weapon-bob values together,
+// sharing the one moveSpeedFrac() call and the one sin/cos of 2*bobPhase
+// (math.Sincos) that weaponBobX/Y/Scale used to each independently redo —
+// they're always read back-to-back for the same frame (see game.go's
+// renderFrame), so three passes over the same handful of trig calls was
+// pure waste. weaponBobX/Y/Scale remain as the named per-axis accessors
+// (kept for their own doc comments and so existing single-value callers/
+// tests don't need to change) but now just read one field of this.
+func (g *Game) weaponBob() (x, y, scale float64) {
+	frac := g.moveSpeedFrac()
+	sin2, cos2 := math.Sincos(2 * g.Weapon.bobPhase)
+	x = weaponBobMaxX * frac * math.Sin(g.Weapon.bobPhase)
+	y = weaponBobMaxY * frac * math.Abs(sin2)
+	scale = 1 + weaponBobDepth*frac*cos2
+	return x, y, scale
+}
+
 // weaponBobX is the current horizontal sway offset (HUD pixels,
 // raster/weapon.go's 320x200 space): a sine wave whose amplitude scales
 // with moveSpeedFrac, so the gun sits dead still at rest and sways with
@@ -329,18 +346,14 @@ func (g *Game) moveSpeedFrac() float64 {
 // speeds up right along with it — standing still freezes the phase as well
 // as zeroing the amplitude, rather than a silent sine wave ticking away at
 // full speed underneath a 0-width sway.
-func (g *Game) weaponBobX() float64 {
-	return weaponBobMaxX * g.moveSpeedFrac() * math.Sin(g.Weapon.bobPhase)
-}
+func (g *Game) weaponBobX() float64 { x, _, _ := g.weaponBob(); return x }
 
 // weaponBobY is the current vertical bob offset (same HUD pixel space,
 // positive = risen above rest — see raster.DrawWeapon): abs(sin(2*phase))
 // so it rises and settles twice per horizontal sway cycle (once per
 // footfall) and never dips below the weapon's resting position, scaled by
 // the same moveSpeedFrac as weaponBobX.
-func (g *Game) weaponBobY() float64 {
-	return weaponBobMaxY * g.moveSpeedFrac() * math.Abs(math.Sin(2*g.Weapon.bobPhase))
-}
+func (g *Game) weaponBobY() float64 { _, y, _ := g.weaponBob(); return y }
 
 // weaponBobScale is the current toward/away-from-camera size multiplier
 // (1 = normal, raster.DrawWeapon's bobScale): cos(2*phase) so the gun is
@@ -349,9 +362,7 @@ func (g *Game) weaponBobY() float64 {
 // arc described above rather than a flat left-right slide. Scaled by
 // moveSpeedFrac like the other two, so it's exactly 1 (no size change) at
 // rest.
-func (g *Game) weaponBobScale() float64 {
-	return 1 + weaponBobDepth*g.moveSpeedFrac()*math.Cos(2*g.Weapon.bobPhase)
-}
+func (g *Game) weaponBobScale() float64 { _, _, s := g.weaponBob(); return s }
 
 type weaponPhase int
 
@@ -516,6 +527,22 @@ func (g *Game) beginFire() bool {
 	return true
 }
 
+// hitscanSpread is bulletSpread, except it returns 0 while the isometric
+// front end has the crosshair snapped onto a specific target
+// (Game.IsoAimLocked — see its own doc comment): playerMobj.Angle is
+// already the exact angle to that target's centre, so dropping the random
+// deviation this shot would otherwise get turns "aimed precisely" into "hits
+// whatever's there," modulo an actual wall or another mobj blocking the
+// line — which still correctly blocks it, since this only removes the
+// random-spread term, not pLineAttack's own trace. Unused by the
+// first-person front end (IsoAimLocked is always false there).
+func (g *Game) hitscanSpread() float64 {
+	if g.IsoAimLocked {
+		return 0
+	}
+	return bulletSpread()
+}
+
 // fireMelee handles the two melee weapons — fist (A_Punch) and chainsaw
 // (A_Saw): one very short-range hit per fire frame, no ammo, id's damage of
 // 2*(P_Random%10+1), x10 for a berserk fist. The small angle jitter is
@@ -533,7 +560,7 @@ func (g *Game) fireMelee() {
 	} else {
 		rng = meleeRange + 1 // A_Saw reaches one unit further
 	}
-	ang := g.playerMobj.Angle + bulletSpread()/4
+	ang := g.playerMobj.Angle + g.hitscanSpread()/4
 	g.pLineAttack(g.playerMobj, ang, g.playerAimSlope(), rng, damage)
 }
 
@@ -557,8 +584,11 @@ func (g *Game) fireHitscan(weapon int) {
 
 	if weapon == wpSuperShotgun {
 		for i := 0; i < 20; i++ {
-			ang := g.playerMobj.Angle + bulletSpread()/2
-			slope := baseSlope + float64(pRandomSpread())/2048.0
+			ang := g.playerMobj.Angle + g.hitscanSpread()/2
+			slope := baseSlope
+			if !g.IsoAimLocked {
+				slope += float64(pRandomSpread()) / 2048.0
+			}
 			g.pLineAttack(g.playerMobj, ang, slope, missileRange, dmg())
 		}
 		return
@@ -574,10 +604,34 @@ func (g *Game) fireHitscan(weapon int) {
 	for i := 0; i < shots; i++ {
 		ang := g.playerMobj.Angle
 		if spread || i > 0 {
-			ang += bulletSpread() / 4
+			ang += g.hitscanSpread() / 4
 		}
 		g.pLineAttack(g.playerMobj, ang, baseSlope, missileRange, dmg())
 	}
+}
+
+// shootableInCone reports whether mo is a live, shootable target within
+// maxDist of (x,y) and within halfAngle of angle — the target-acquisition
+// shape playerAimSlope and aBFGSpray (attack.go) both need (shootable/alive,
+// range, facing cone), factored out so the two can't drift apart on how a
+// candidate target is filtered. Each caller still layers its own extra
+// condition on top: playerAimSlope wants the closest match (so it passes
+// its shrinking best-so-far as maxDist and still re-checks d against it
+// strictly), aBFGSpray excludes the shooter itself and requires a clear
+// line of sight before it counts as hit.
+func shootableInCone(mo *Mobj, x, y, angle, maxDist, halfAngle float64) (dist float64, ok bool) {
+	if mo == nil || mo.removed || mo.Flags&MF_SHOOTABLE == 0 || mo.Health <= 0 {
+		return 0, false
+	}
+	dx, dy := mo.X-x, mo.Y-y
+	d := math.Hypot(dx, dy)
+	if d > maxDist {
+		return 0, false
+	}
+	if math.Abs(normAngle(math.Atan2(dy, dx)-angle)) > halfAngle {
+		return 0, false
+	}
+	return d, true
 }
 
 // playerAimSlope is a lightweight auto-aim: if a shootable thing sits
@@ -588,14 +642,8 @@ func (g *Game) playerAimSlope() float64 {
 	var best *Mobj
 	bestDist := missileRange
 	for _, mo := range g.mobjs {
-		if mo.removed || mo.Flags&MF_SHOOTABLE == 0 || mo.Health <= 0 {
-			continue
-		}
-		d := math.Hypot(mo.X-pm.X, mo.Y-pm.Y)
-		if d >= bestDist {
-			continue
-		}
-		if math.Abs(normAngle(math.Atan2(mo.Y-pm.Y, mo.X-pm.X)-pm.Angle)) > 6*math.Pi/180 {
+		d, ok := shootableInCone(mo, pm.X, pm.Y, pm.Angle, bestDist, 6*math.Pi/180)
+		if !ok || d >= bestDist {
 			continue
 		}
 		best, bestDist = mo, d

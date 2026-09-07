@@ -205,3 +205,21 @@ func (w *WAD) ListMaps() []string {
 	}
 	return maps
 }
+
+// PreferredStartMap picks the conventional first level of whichever format
+// maps (as returned by ListMaps) uses — "E1M1" for Doom/Ultimate Doom,
+// "MAP01" for Doom II and most PWADs — falling back to whatever map is
+// listed first. maps must be non-empty. Shared by cmd/engine's own
+// chooseStartMap and the launcher's WAD picker (launcher.pickDefaultMap),
+// which layer their own "keep the current selection if it's still valid"
+// check on top of this.
+func PreferredStartMap(maps []string) string {
+	for _, want := range []string{"E1M1", "MAP01"} {
+		for _, m := range maps {
+			if m == want {
+				return want
+			}
+		}
+	}
+	return maps[0]
+}

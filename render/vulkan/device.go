@@ -160,12 +160,12 @@ func (r *Renderer) createLogicalDevice() error {
 	}
 	extensions := nzAll(extNames)
 	features := []vk.PhysicalDeviceFeatures{{}}
-	// The hardware-geometry path samples mip-mapped wall/flat textures; turn
-	// on anisotropic filtering when the device offers it so minified,
-	// oblique surfaces stay sharp (the software path's textureQuality knob,
-	// done in fixed-function hardware here). Inert for the vanilla / lit
-	// blit paths.
-	if r.hw {
+	// The hardware-geometry and isometric-viewer paths both sample mip-mapped
+	// wall/flat textures; turn on anisotropic filtering when the device
+	// offers it so minified, oblique surfaces stay sharp (the software
+	// path's textureQuality knob, done in fixed-function hardware here).
+	// Inert for the vanilla / lit blit paths.
+	if r.hw || r.iso {
 		var supported vk.PhysicalDeviceFeatures
 		vk.GetPhysicalDeviceFeatures(r.physicalDevice, &supported)
 		supported.Deref()

@@ -59,3 +59,10 @@ func (g *Game) drawHUD() {
 		// nothing
 	}
 }
+
+// DrawHUD is drawHUD, exported for a front end that doesn't go through
+// renderFrame at all (cmd/isoengine): draws the currently-selected HUD
+// style (config hudStyle / the F1 cycle — health, armour, ammo, keys, and
+// which weapon is up) onto Raster's overlay plane. Call after
+// Raster.BeginOverlayFrame, before reading Raster.Overlay().
+func (g *Game) DrawHUD() { g.drawHUD() }

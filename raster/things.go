@@ -46,7 +46,7 @@ func (r *Renderer) DrawThings(cam Camera, list []SceneThing) (voxels, sprites in
 			voxels++
 			continue
 		}
-		rot := spriteRotation(cam.X, cam.Y, t.X, t.Y, t.Angle)
+		rot := SpriteRotation(cam.X, cam.Y, t.X, t.Y, t.Angle)
 		sp, flip, ok := r.textures.SpriteFrame(t.Prefix, t.Frame, rot)
 		if !ok {
 			continue // no such sprite — nothing to draw for this thing

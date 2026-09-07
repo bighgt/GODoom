@@ -26,7 +26,7 @@ func TestSpriteRotation(t *testing.T) {
 		{225, 3},
 	}
 	for _, c := range cases {
-		if got := spriteRotation(100, 0, 0, 0, c.facingDeg*d2r); got != c.want {
+		if got := SpriteRotation(100, 0, 0, 0, c.facingDeg*d2r); got != c.want {
 			t.Errorf("facing %g deg: rotation %d, want %d", c.facingDeg, got, c.want)
 		}
 	}
