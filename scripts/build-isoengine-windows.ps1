@@ -1,12 +1,13 @@
-# Build the isometric viewer as bin\iso_engine.exe (native, on Windows).
+# Build the isometric engine as bin\windows_isoengine.exe (native, on
+# Windows) — naming matches build-windows.ps1's <os>_<program> scheme
+# (windows_engine.exe alongside windows_isoengine.exe).
 #
 # Same toolchain requirement as build-windows.ps1 (cgo + MinGW-w64 UCRT —
 # see that script's own comment for why): cmd/isoengine pulls in the same
-# go-gl/glfw + goki/vulkan cgo dependencies via render/vulkan and window.
-#
-# This is Phase 1 of the isometric renderer plan: a standalone WAD/map
-# viewer (no monsters/physics/combat), so unlike build-windows.ps1 there's
-# no audio/soundfont story here at all.
+# go-gl/glfw + goki/vulkan + oto/FluidSynth cgo dependencies via
+# render/vulkan, window, and audio as the first-person engine — it runs the
+# same engine.Game simulation and the same pre-game launcher, just with a
+# top-down camera and screen-relative controls instead of first-person.
 
 $ErrorActionPreference = 'Stop'
 Set-Location (Join-Path $PSScriptRoot '..')
@@ -18,7 +19,7 @@ if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
 }
 
 $env:CGO_ENABLED = '1'
-$out = if ($args.Count -ge 1) { $args[0] } else { 'bin\iso_engine.exe' }
+$out = if ($args.Count -ge 1) { $args[0] } else { 'bin\windows_isoengine.exe' }
 New-Item -ItemType Directory -Force -Path (Split-Path $out) | Out-Null
 
 go build -trimpath -ldflags '-s -w' -o $out .\cmd\isoengine

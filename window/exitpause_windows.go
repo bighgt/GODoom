@@ -1,4 +1,4 @@
-package main
+package window
 
 import (
 	"bufio"
@@ -9,7 +9,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// holdConsoleOpen keeps the debug console readable after the game window has
+// HoldConsoleOpen keeps the debug console readable after the game window has
 // gone away. When the engine is launched by double-clicking the .exe (or any
 // other way where it is the only process attached to a freshly-spawned
 // console), Windows tears that console down the instant main returns, so
@@ -18,8 +18,10 @@ import (
 // engine was started from an existing shell (PowerShell, cmd, a terminal in
 // the editor) the console outlives the process on its own, so don't pause.
 //
-// Set TPF_NO_PAUSE=1 to skip the wait unconditionally.
-func holdConsoleOpen(hadError bool) {
+// Set TPF_NO_PAUSE=1 to skip the wait unconditionally. Shared by
+// cmd/engine and cmd/isoengine — both are console/GUI hybrids with the
+// same double-click problem.
+func HoldConsoleOpen(hadError bool) {
 	if os.Getenv("TPF_NO_PAUSE") != "" {
 		return
 	}

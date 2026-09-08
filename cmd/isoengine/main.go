@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -41,8 +42,16 @@ func init() {
 }
 
 func main() {
-	if err := run(); err != nil {
-		log.Fatalf("isoengine: %v", err)
+	err := run()
+	if err != nil {
+		log.Printf("isoengine: %v", err)
+	}
+	// Keep the debug console readable after the window is gone (see
+	// window.HoldConsoleOpen) before letting the process — and, if we own
+	// it, the console — exit.
+	window.HoldConsoleOpen(err != nil)
+	if err != nil {
+		os.Exit(1)
 	}
 }
 
@@ -70,14 +79,9 @@ func run() error {
 		return runHeadless(headless, *cameraMode)
 	}
 
-	// Sound effects and music are process-wide resources (audio.Device/
-	// MusicPlayer both join one shared, lazily-created mixer/output stream —
-	// see audio/mixer.go's sharedAudio — and NewMusicPlayer's FluidSynth
-	// setup on Linux is real, non-instant work), so they're stood up once
-	// here and handed to every play session rather than recreated — and, for
-	// MusicPlayer, torn down (Stop) — on each trip through the launcher: see
-	// cmd/engine's identical setupAudio call for why.
-	dev, music := setupAudio()
+	// Sound effects and music are process-wide resources — see audio.Setup's
+	// doc comment — stood up once here and handed to every play session.
+	dev, music := audio.Setup("isoengine")
 	if music != nil {
 		defer music.Stop()
 	}
@@ -134,7 +138,7 @@ func runHeadless(path, cameraMode string) error {
 	}
 	log.Printf("isoengine: found %d map(s), loading %s", len(maps), mapName)
 
-	dev, music := setupAudio()
+	dev, music := audio.Setup("isoengine")
 	if music != nil {
 		defer music.Stop()
 	}
@@ -144,7 +148,7 @@ func runHeadless(path, cameraMode string) error {
 // playSession loads mapName from w and runs one full game session — every
 // window, GPU, and CPU-rasterizer resource it creates is torn down (its
 // defers run) when this returns, whether that's a normal game-window close
-// or an error. dev/music are the process-wide audio resources setupAudio
+// or an error. dev/music are the process-wide audio resources audio.Setup
 // created; cfg.Music still gates whether THIS session actually starts a
 // track — mirrors cmd/engine's own playSession exactly (see its doc
 // comment).
@@ -194,7 +198,7 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 	// separate scale step.
 	ras := raster.New(textures, rw, rh)
 
-	cam := startCamera(level, tree)
+	cam := engine.StartCamera(level, tree)
 	game := engine.NewGame(win, renderer, ras, w, level, tree, cam, cfg)
 	game.AudioDevice = dev
 	game.HardwareMode = true
@@ -209,10 +213,10 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 		// SkipCeilings to false; reapply it and rebuild once more.
 		game.WorldBuilder.SkipCeilings = true
 		game.WorldBuilder.Invalidate()
-		playLevelMusic(w, music, game.MapMusicLump(next), next)
+		audio.PlayLevelMusic(w, music, game.MapMusicLump(next), next, "isoengine")
 	}
 	if cfg.Music && music != nil {
-		playLevelMusic(w, music, game.MapMusicLump(mapName), mapName)
+		audio.PlayLevelMusic(w, music, game.MapMusicLump(mapName), mapName, "isoengine")
 	}
 	loadVoxels(game, mapName, cfg)
 
@@ -333,52 +337,6 @@ func loadVoxels(game *engine.Game, mapName string, cfg config.Config) {
 	log.Printf("isoengine: voxel models active — %s, %d sprite frames", pk3, vs.Frames())
 }
 
-// setupAudio mirrors cmd/engine/main.go's own — see its doc comment for why
-// these are process-wide, not per-session.
-func setupAudio() (*audio.Device, *audio.MusicPlayer) {
-	dev, err := audio.NewDevice()
-	if err != nil {
-		log.Printf("isoengine: sound effects unavailable: %v", err)
-		dev = nil
-	}
-	music, err := audio.NewMusicPlayer()
-	if err != nil {
-		log.Printf("isoengine: music unavailable: %v", err)
-		music = nil
-	}
-	return dev, music
-}
-
-// playLevelMusic mirrors cmd/engine/main.go's own (see its doc comment):
-// tries the UMAPINFO override, then the conventional lump name, then
-// "D_"+mapname, then silences whatever was playing. Play(nil) (not Stop) is
-// the safe way to silence a shared MusicPlayer mid-process — see
-// audio.MusicPlayer.Stop's doc comment on why Stop is a one-way teardown.
-func playLevelMusic(w *wad.WAD, music *audio.MusicPlayer, override, mapName string) {
-	if music == nil {
-		return
-	}
-	candidates := []string{override, wad.MusicLumpName(mapName), "D_" + mapName}
-	for _, lumpName := range candidates {
-		if lumpName == "" {
-			continue
-		}
-		raw, ok := w.Find(lumpName)
-		if !ok {
-			continue
-		}
-		events, err := wad.DecodeMus(raw)
-		if err != nil {
-			log.Printf("isoengine: decode music %q: %v", lumpName, err)
-			music.Play(nil)
-			return
-		}
-		music.Play(events)
-		return
-	}
-	music.Play(nil)
-}
-
 // playerViewerDist mirrors engine.isoViewerDist: how far along -camAzimuth
 // the virtual viewpoint playerSprite builds sits when picking the player's
 // own rotation frame, far enough that raster.SpriteRotation's quantisation
@@ -462,22 +420,3 @@ func nearestAimTarget(game *engine.Game, cam worldgeo.IsoCamera, w, h int, mx, m
 	return x, y, ok
 }
 
-// startCamera mirrors cmd/engine/main.go's own startCamera: the level's
-// Player 1 start Thing (falling back to the map origin, facing east, if
-// none is present), eye height resolved from whichever Sector the BSP tree
-// says that point is in.
-func startCamera(level *wad.Level, tree bsp.Node) raster.Camera {
-	const player1Start = 1
-	x, y, angleDeg := 0.0, 0.0, 0.0
-	for _, t := range level.Things {
-		if t.Type == player1Start {
-			x, y, angleDeg = float64(t.X), float64(t.Y), float64(t.Angle)
-			break
-		}
-	}
-	z := engine.EyeHeight
-	if sec := bsp.PointSector(tree, level, float32(x), float32(y)); sec != nil {
-		z = float64(sec.FloorHeight) + engine.EyeHeight
-	}
-	return raster.Camera{X: x, Y: y, Z: z, Angle: angleDeg * math.Pi / 180, FOVDeg: 90}
-}

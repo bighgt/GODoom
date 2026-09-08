@@ -43,9 +43,9 @@ func main() {
 		log.Printf("engine: %v", err)
 	}
 	// Keep the debug console readable after the window is gone (see
-	// holdConsoleOpen) before letting the process — and, if we own it, the
-	// console — exit.
-	holdConsoleOpen(err != nil)
+	// window.HoldConsoleOpen) before letting the process — and, if we own
+	// it, the console — exit.
+	window.HoldConsoleOpen(err != nil)
 	if err != nil {
 		os.Exit(1)
 	}
@@ -79,16 +79,9 @@ func run() error {
 		return runHeadless(headless)
 	}
 
-	// Sound effects and music are process-wide resources (audio.Device/
-	// MusicPlayer both join one shared, lazily-created mixer/output stream
-	// — see audio/mixer.go's sharedAudio — and NewMusicPlayer's FluidSynth
-	// setup on Linux is real, non-instant work), so they're stood up once
-	// here and handed to every play session rather than recreated — and,
-	// for MusicPlayer, torn down (Stop) — on each trip through the
-	// launcher: MusicPlayer.Stop() deletes the underlying FluidSynth synth
-	// outright (not a pause), so it must not run until the process is
-	// actually exiting.
-	dev, music := setupAudio()
+	// Sound effects and music are process-wide resources — see audio.Setup's
+	// doc comment — stood up once here and handed to every play session.
+	dev, music := audio.Setup("engine")
 	if music != nil {
 		defer music.Stop()
 	}
@@ -147,39 +140,19 @@ func runHeadless(path string) error {
 	mapName := chooseStartMap(maps, cfg.Map)
 	log.Printf("engine: found %d map(s), loading %s", len(maps), mapName)
 
-	dev, music := setupAudio()
+	dev, music := audio.Setup("engine")
 	if music != nil {
 		defer music.Stop()
 	}
 	return playSession(path, mapName, cfg, w, dev, music)
 }
 
-// setupAudio brings up the shared sound-effect device and music player once
-// — see run()'s doc comment on why these are process-wide rather than
-// per-session. A nil return for either just means that subsystem is
-// unavailable (already logged here); playSession treats a nil dev/music
-// exactly like the original single-session code treated NewDevice/
-// NewMusicPlayer failing.
-func setupAudio() (*audio.Device, *audio.MusicPlayer) {
-	dev, err := audio.NewDevice()
-	if err != nil {
-		log.Printf("engine: sound effects unavailable: %v", err)
-		dev = nil
-	}
-	music, err := audio.NewMusicPlayer()
-	if err != nil {
-		log.Printf("engine: music unavailable: %v", err)
-		music = nil
-	}
-	return dev, music
-}
-
 // playSession loads mapName from w and runs one full game session — every
 // window, GPU, and CPU-rasterizer resource it creates is torn down (its
 // defers run) when this returns, whether that's a normal game-window close
-// or an error. dev/music are the process-wide audio resources setupAudio
+// or an error. dev/music are the process-wide audio resources audio.Setup
 // created; cfg.Music still gates whether THIS session actually starts a
-// track (see setupAudio's doc comment on why the player itself isn't
+// track (see audio.Setup's doc comment on why the player itself isn't
 // recreated per session).
 func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio.Device, music *audio.MusicPlayer) error {
 	// From here on the window (once created below) is up but the game isn't
@@ -228,7 +201,7 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 		cfg.InvertMouseY, cfg.MouseSensitivity, cfg.TurnSpeed, runMode, cfg.Skill, cfg.DamageScale, cfg.Music, cfg.WeaponVolume, cfg.WorldVolume, cfg.ShowDebugInfo, cfg.HUDStyle, cfg.Crosshair, cfg.CrosshairSize,
 		cfg.Voxels, cfg.VoxelScale, cfg.Quake1Textures)
 
-	cam := startCamera(level, tree)
+	cam := engine.StartCamera(level, tree)
 	cam.FOVDeg = cfg.FOVDegrees
 	log.Printf("engine: player start at (%.0f, %.0f, %.0f), facing %.0f°", cam.X, cam.Y, cam.Z, cam.Angle*180/math.Pi)
 
@@ -410,68 +383,34 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 		}
 	}
 
-	game.AudioDevice = dev // nil is fine — see setupAudio's doc comment
+	game.AudioDevice = dev // nil is fine — see audio.Setup's doc comment
 
 	if !cfg.Music || music == nil {
 		if !cfg.Music {
 			log.Println("engine: music disabled (config.json)")
 			// music is shared across trips through the launcher↔game loop
-			// (setupAudio runs once, outside this per-session function), so
+			// (audio.Setup runs once, outside this per-session function), so
 			// a previous session's track needs to be silenced explicitly —
 			// there's no fresh player this time to start silent instead.
 			// Play(nil) is musicLoop.restart's documented no-op-events path:
 			// it halts (and all-notes-offs) whatever was playing without
 			// touching the backend device/synth, unlike Stop() (which is a
-			// one-way teardown — see playLevelMusic's doc comment).
+			// one-way teardown — see audio.PlayLevelMusic's doc comment).
 			if music != nil {
 				music.Play(nil)
 			}
 		}
 	} else {
-		playLevelMusic(w, music, game.MapMusicLump(mapName), mapName)
+		audio.PlayLevelMusic(w, music, game.MapMusicLump(mapName), mapName, "engine")
 		// Restart music when the engine advances to the next level, and when
 		// the idmus cheat asks for a specific map's track.
-		game.OnLevelChange = func(m string) { playLevelMusic(w, music, game.MapMusicLump(m), m) }
-		game.OnMusicChange = func(m string) { playLevelMusic(w, music, game.MapMusicLump(m), m) }
+		game.OnLevelChange = func(m string) { audio.PlayLevelMusic(w, music, game.MapMusicLump(m), m, "engine") }
+		game.OnMusicChange = func(m string) { audio.PlayLevelMusic(w, music, game.MapMusicLump(m), m, "engine") }
 	}
 
 	log.Printf("engine: [load] total (map chosen -> first frame): %s", time.Since(loadStart).Round(time.Millisecond))
 	log.Println("engine: entering main loop (WASD/mouse to move+look, Space to jump, E to use doors/switches, 1-7 weapons, left click to fire, F1 cycles HUD, Esc to quit)")
 	return game.Run()
-}
-
-// playLevelMusic finds the level's music lump, decodes it, and starts it
-// looping. A UMAPINFO music lump (override) is tried first; then the
-// conventional name for the map's format (wad.MusicLumpName — "D_E1M1" for
-// ExMy, "D_RUNNIN"-style for Doom II MAPxx), then "D_"+mapname as a fallback
-// (some PWADs name Doom II music that way), then it silences whatever was
-// playing and gives up quietly. That last step matters because music is a
-// single player shared across level changes and across whole launcher↔game
-// sessions (see setupAudio) — without it, a map/WAD with no track of its own
-// would just let the previous one keep playing underneath it. It silences
-// via Play(nil), not Stop(): Stop is a one-way teardown of the backend
-// device/synth (see e.g. audio's fluidsynth_windows.go/midi_linux.go doc
-// comments) meant to run once at process exit, not something safe to call
-// and then keep playing through for the rest of the session.
-func playLevelMusic(w *wad.WAD, music *audio.MusicPlayer, override, mapName string) {
-	candidates := []string{override, wad.MusicLumpName(mapName), "D_" + mapName}
-	for _, lumpName := range candidates {
-		raw, ok := w.Find(lumpName)
-		if !ok {
-			continue
-		}
-		events, err := wad.DecodeMus(raw)
-		if err != nil {
-			log.Printf("engine: decode music %q: %v", lumpName, err)
-			music.Play(nil)
-			return
-		}
-		log.Printf("engine: playing music %s (%d events)", lumpName, len(events))
-		music.Play(events)
-		return
-	}
-	log.Printf("engine: no music lump found for %s (tried %v)", mapName, candidates)
-	music.Play(nil)
 }
 
 // pickStartMap prefers the conventional first level of whichever format the
@@ -584,25 +523,3 @@ func resolveMapChoice(line string, maps []string, def string) (chosen, msg strin
 	return "", fmt.Sprintf("%q is not one of the maps", s)
 }
 
-// startCamera builds the initial raster.Camera from the level's Player 1
-// start Thing (falling back to the map origin, facing east, if none is
-// present), with its eye height resolved from whichever Sector the BSP tree
-// says that point is actually in.
-func startCamera(level *wad.Level, tree bsp.Node) raster.Camera {
-	const player1Start = 1
-
-	x, y, angleDeg := 0.0, 0.0, 0.0
-	for _, t := range level.Things {
-		if t.Type == player1Start {
-			x, y, angleDeg = float64(t.X), float64(t.Y), float64(t.Angle)
-			break
-		}
-	}
-
-	z := engine.EyeHeight
-	if sec := bsp.PointSector(tree, level, float32(x), float32(y)); sec != nil {
-		z = float64(sec.FloorHeight) + engine.EyeHeight
-	}
-
-	return raster.Camera{X: x, Y: y, Z: z, Angle: angleDeg * math.Pi / 180, FOVDeg: 90}
-}
