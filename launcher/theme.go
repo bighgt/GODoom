@@ -62,12 +62,12 @@ var theme = struct {
 const (
 	rowHeight     = 28
 	rowGap        = 6
-	sectionGap    = 18
 	panelPad      = 14
+	tabBarH       = 34  // the settings-tab strip along the top of the panel
 	labelWidth    = 220 // fixed left column for a row's label, control fills the rest
 	scrollbarW    = 10
 	windowW       = 900
 	windowH       = 700
-	topBarH       = 96
+	topBarH       = 154
 	bottomBarH    = 56
 )

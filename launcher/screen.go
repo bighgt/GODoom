@@ -89,7 +89,8 @@ func drawTopBar(ui *UI, m *Model) {
 			label += "  [+ " + filepath.Base(m.IWADPath) + "]"
 		}
 	}
-	ui.Label(Rect{16, y + chipH + 6, windowW - 32, 16}, label, true)
+	labelY := y + chipH + 6
+	ui.Label(Rect{16, labelY, windowW - 32, 16}, label, true)
 
 	mapOptions := m.Maps
 	mapCurrent := m.MapName
@@ -97,12 +98,23 @@ func drawTopBar(ui *UI, m *Model) {
 		mapOptions = []string{"(choose a WAD first)"}
 		mapCurrent = mapOptions[0]
 	}
-	mapRow := Rect{16, y + chipH + 26, windowW - 32, rowHeight}
+	mapY := labelY + 16 + 8
+	mapRow := Rect{16, mapY, windowW - 32, rowHeight}
 	ui.Options("mapSelect", mapRow, "Level", mapCurrent, choices(mapOptions), func(sel string) {
 		if len(m.Maps) > 0 {
 			m.MapName = sel
 		}
 	})
+
+	// Cartoon shading gets its own row up here rather than a line buried in
+	// the scrollable settings list below: it's a whole-scene visual style
+	// switch (see render/vulkan/shaders/worldblit.frag's outline pass), the
+	// kind of choice worth seeing before you scroll past it, not after.
+	cartoonRow := Rect{16, mapY + rowHeight + 8, windowW - 32, rowHeight}
+	ui.Checkbox("cartoonShading", cartoonRow, "Cartoon Shading", &m.Cfg.CartoonShading)
+	if m.Cfg.Renderer != config.RendererHardware {
+		ui.Label(Rect{16 + labelWidth + 28, cartoonRow.Y, windowW - 32 - labelWidth - 28, rowHeight}, "(needs Renderer: Hardware, below)", true)
+	}
 }
 
 func drawBottomBar(ui *UI, m *Model) {
@@ -127,41 +139,65 @@ func drawBottomBar(ui *UI, m *Model) {
 	}
 }
 
-// layoutSettings is the settings panel's one layout computation — every
-// section's header and each of its rows, in order, at the Y each would sit
-// starting from y0 — advancing by the same header/row/gap constants
-// regardless of whether draw is given. drawSettingsPanel calls it once
-// with draw == nil just to measure the total content height (for scroll
-// clamping) and once more to actually draw, so the two can no longer drift
-// apart the way a separately hand-maintained settingsContentHeight used to
-// risk: there is only one place this math is written.
-func layoutSettings(y0 int, draw func(y int, sec string, f *field)) int {
+// layoutTab is the settings panel's one layout computation for the rows of
+// a single tab: each field of section, in order, at the Y it would sit
+// starting from y0, advancing by the same row/gap constants regardless of
+// whether draw is given. drawSettingsPanel calls it once with draw == nil
+// just to measure content height (for scroll clamping) and once more to
+// actually draw, so the two can't drift apart — there is only one place
+// this math is written.
+func layoutTab(y0 int, section string, draw func(y int, f *field)) int {
 	y := y0
-	for _, sec := range sectionOrder {
-		rows := fieldsInSection(sec)
-		if len(rows) == 0 {
-			continue
-		}
+	rows := fieldsInSection(section)
+	for i := range rows {
 		if draw != nil {
-			draw(y, sec, nil)
+			draw(y, &rows[i])
 		}
-		y += 24 + rowGap
-		for i := range rows {
-			if draw != nil {
-				draw(y, sec, &rows[i])
-			}
-			y += rowHeight + rowGap
-		}
-		y += sectionGap
+		y += rowHeight + rowGap
 	}
 	return y - y0
 }
 
-func drawSettingsPanel(ui *UI, m *Model) {
-	viewport := Rect{0, topBarH, windowW, windowH - topBarH - bottomBarH}
-	total := layoutSettings(0, nil)
+// drawTabStrip draws the row of tab buttons across r and applies a click:
+// switching tab resets the per-tab scroll offset.
+func drawTabStrip(ui *UI, m *Model, r Rect) {
+	c := ui.C
+	c.FillRect(r, theme.Panel)
+	c.FillRect(Rect{r.X, r.Y + r.H - 1, r.W, 1}, theme.Border)
 
-	maxScroll := float64(max(total-viewport.H, 0))
+	n := len(sectionOrder)
+	const gap = 4
+	tabW := (r.W - 2*panelPad - gap*(n-1)) / n
+	x := r.X + panelPad
+	y := r.Y + 5
+	h := r.H - 10
+	for i, sec := range sectionOrder {
+		style := ButtonNormal
+		if i == m.ActiveTab {
+			style = ButtonSelected
+		}
+		if ui.Button(Rect{x, y, tabW, h}, tabTitles[sec], style) && m.ActiveTab != i {
+			m.ActiveTab = i
+			m.ScrollY = 0
+		}
+		x += tabW + gap
+	}
+}
+
+func drawSettingsPanel(ui *UI, m *Model) {
+	panel := Rect{0, topBarH, windowW, windowH - topBarH - bottomBarH}
+
+	drawTabStrip(ui, m, Rect{panel.X, panel.Y, panel.W, tabBarH})
+
+	if m.ActiveTab < 0 || m.ActiveTab >= len(sectionOrder) {
+		m.ActiveTab = 0
+	}
+	section := sectionOrder[m.ActiveTab]
+
+	viewport := Rect{panel.X, panel.Y + tabBarH, panel.W, panel.H - tabBarH}
+	total := layoutTab(0, section, nil)
+
+	maxScroll := float64(max(total-(viewport.H-rowGap), 0))
 	if viewport.Contains(int(ui.In.MouseX), int(ui.In.MouseY)) && ui.In.ScrollY != 0 {
 		m.ScrollY -= ui.In.ScrollY * scrollSpeed
 	}
@@ -173,13 +209,14 @@ func drawSettingsPanel(ui *UI, m *Model) {
 	}
 
 	prevClip := ui.C.Clip(viewport)
-	layoutSettings(viewport.Y-int(m.ScrollY), func(y int, sec string, f *field) {
-		if f == nil {
-			ui.SectionHeader(Rect{panelPad, y, viewport.W - 2*panelPad, 24}, sec)
-			return
-		}
+	layoutTab(viewport.Y+rowGap-int(m.ScrollY), section, func(y int, f *field) {
 		r := Rect{panelPad, y, viewport.W - 2*panelPad - scrollbarW, rowHeight}
 		drawField(ui, r, *f, &m.Cfg)
+		// Only offer the hint for a row actually inside the viewport — a row
+		// scrolled up under the tab strip mustn't tooltip on a tab-strip hover.
+		if f.hint != "" && y >= viewport.Y && y+rowHeight <= viewport.Y+viewport.H {
+			ui.Hint(r, f.hint)
+		}
 	})
 	ui.C.SetClip(prevClip)
 

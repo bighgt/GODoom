@@ -95,8 +95,21 @@ type Config struct {
 	// to [1, 100000].
 	DamageScale int `json:"damageScale"`
 	// Music enables loading and playing each level's background track.
-	// Default true. (Windows-only regardless — see package audio.)
+	// Default true. The pre-game launcher has no checkbox for it — the Music
+	// Volume slider is the on/off, and launcher.Run sets this from it
+	// (musicVolume > 0). A hand-edited config.json can still set it directly;
+	// it stays the engine's real gate.
 	Music bool `json:"music"`
+	// MusicVolume scales the loudness of the level's background music
+	// relative to the sound effects. 1.0 (the default) leaves it at the
+	// mixer's normal music level; 0.5 halves it, 2.0 doubles it. Clamped to
+	// [MinMusicVolume, MaxMusicVolume]; like the other scalar knobs a literal
+	// 0 means "unset" and falls back to the default — to actually silence
+	// music set Music false (the launcher's slider-at-0 does exactly that),
+	// or use a small value (0.02) for near-silent. No effect when Music is
+	// off, or on the winmm fallback synth (Windows without a soundfont),
+	// which plays on its own output rather than through the mixer.
+	MusicVolume float64 `json:"musicVolume"`
 	// WeaponVolume scales the loudness of weapon sounds — every gun's fire
 	// and reload noise and the chainsaw's idle whir — relative to the rest
 	// of the sound effects. 1.0 (the default) leaves them at full volume;
@@ -233,6 +246,24 @@ type Config struct {
 	// voxels but reads as a plain dark ellipse up close, so it's OFF by
 	// default — set true to enable.
 	GroundShadows bool `json:"groundShadows"`
+	// CartoonShading gives the hardware (GPU-geometry) renderer a cel-
+	// shaded look: lighting is quantized into a handful of flat bands
+	// instead of a smooth gradient, and a screen-space pass darkens pixels
+	// where depth jumps sharply (silhouettes, corners, and geometry seen
+	// against the sky) into black outlines. Hardware-renderer only — the
+	// software vanilla/enhanced pipelines are unaffected. Default false.
+	CartoonShading bool `json:"cartoonShading"`
+	// SwitchWeapons swaps the two games' arsenals: a Doom WAD is then played
+	// with Heretic's weapons (Elven Wand, Ethereal Crossbow, Dragon Claw,
+	// Hellstaff, Phoenix Rod, Firemace) and a Heretic WAD with Doom's
+	// (pistol, shotgun, chaingun, rocket launcher, plasma gun, BFG). The
+	// weapon-pickup THINGS grant by slot so they adapt automatically, and
+	// ammo pickups feed whichever weapon now holds that slot. The other
+	// game's weapon / projectile sprites and fire sounds are pulled from its
+	// IWAD if one can be found next to the WAD being played (the same search
+	// used for a PWAD's base IWAD); missing it, the arsenal still swaps but
+	// the new guns draw/sound blank. Default false.
+	SwitchWeapons bool `json:"switchWeapons"`
 	// FogColor is the distance-fog colour as a hex "RRGGBB" string (a
 	// leading '#' is allowed). Empty (the default) disables fog. Works in
 	// all three render paths.
@@ -329,6 +360,12 @@ const (
 	MaxAmbientLight = 1.0
 )
 
+// MusicVolume bounds (a linear multiplier on background-music loudness).
+const (
+	MinMusicVolume = 0.0
+	MaxMusicVolume = 2.0
+)
+
 // WeaponVolume bounds (a linear multiplier on weapon sound loudness).
 const (
 	MinWeaponVolume = 0.0
@@ -375,6 +412,7 @@ func Default() Config {
 		Skill:                3,
 		DamageScale:          100,
 		Music:                true,
+		MusicVolume:          1.0,
 		WeaponVolume:         1.0,
 		WorldVolume:          0.5,
 		ShowDebugInfo:        true,
@@ -393,6 +431,8 @@ func Default() Config {
 		Exposure:             1.0,
 		Shadows:              true,
 		GroundShadows:        false,
+		CartoonShading:       false,
+		SwitchWeapons:        false,
 		FogColor:             "",
 		FogDensity:           0,
 		Crosshair:            CrosshairDot,
@@ -664,6 +704,15 @@ func (c Config) repaired() Config {
 	if c.DamageScale < 1 || c.DamageScale > 100000 {
 		log.Printf("config: damageScale %d out of [1, 100000], using %d", c.DamageScale, d.DamageScale)
 		c.DamageScale = d.DamageScale
+	}
+
+	if c.MusicVolume == 0 {
+		c.MusicVolume = d.MusicVolume
+	}
+	if c.MusicVolume < MinMusicVolume || c.MusicVolume > MaxMusicVolume {
+		log.Printf("config: musicVolume %.2f out of [%.2f, %.2f], using %.2f",
+			c.MusicVolume, MinMusicVolume, MaxMusicVolume, d.MusicVolume)
+		c.MusicVolume = d.MusicVolume
 	}
 
 	if c.WeaponVolume == 0 {

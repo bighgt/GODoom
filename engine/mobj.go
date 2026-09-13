@@ -42,6 +42,30 @@ type Mobj struct {
 	Frame      int
 	Fullbright bool
 
+	// spriteOverride, when non-empty, is the 4-letter sprite name the
+	// renderer draws instead of spriteNames[Sprite] — used for Heretic map
+	// objects (engine/heretic.go), whose sprites aren't in Doom's table.
+	// overrideFrames>1 cycles Frame 0..overrideFrames-1 every overrideTics
+	// tics (torches, chandeliers, braziers). See mobjSpriteName / mobjTick.
+	spriteOverride string
+	overrideFrames int
+	overrideTics   int
+	// hereticGift is what a MF_SPECIAL Heretic pickup grants on touch
+	// (pTouchSpecialThing); hgNone for a plain decoration.
+	hereticGift hereticGift
+
+	// Heretic monster FSM (engine/heretic_actors.go). hact non-nil marks a
+	// Heretic actor: hereticActorTick drives movement + the phase animation
+	// (hPhase / hFrameIdx / hFrameTic). hDamage is a Heretic projectile's
+	// per-shot base damage (mo.Info is the shared MT_HERETIC template).
+	hact      *hereticActorDef
+	hPhase    hPhase
+	hFrameIdx int
+	hFrameTic int
+	hDamage   int
+	hMissile  *hMissileDef // set on a Heretic monster projectile — its impact anim
+	hExpireIn int          // >0: a dying MT_HERETIC effect mobj, removed when it hits 0
+
 	// AI bookkeeping.
 	Target       *Mobj
 	MoveDir      int
@@ -129,6 +153,14 @@ func (g *Game) P_SpawnMobj(x, y, z float64, typ mobjType) *Mobj {
 // sprite/frame/tics, run its action, and chase through any 0-tic states.
 // Returns false (and removes the mobj) if the chain reaches S_NULL.
 func (g *Game) setMobjState(mo *Mobj, st stateNum) bool {
+	// A Heretic actor's synthesized MobjInfo points its state links at the
+	// S_HERETIC_* sentinels; the ported Doom AI calls setMobjState(mo,
+	// mo.Info.SeeState) etc. unchanged, and this routes it into the
+	// data-driven Heretic FSM instead (engine/heretic_actors.go).
+	if mo.hact != nil && st >= S_HERETIC && st <= S_HERETIC_XDEATH {
+		g.hSetPhase(mo, hPhaseForSentinel(st))
+		return !mo.removed
+	}
 	for {
 		if st == S_NULL {
 			mo.stateDef = &states[S_NULL]
@@ -173,11 +205,31 @@ func (g *Game) mobjTick(mo *Mobj) {
 		mo.TeleportFreeze--
 	}
 
+	// A dying Heretic effect mobj (a missile playing its impact anim).
+	if mo.hExpireIn > 0 {
+		if mo.hExpireIn--; mo.hExpireIn <= 0 {
+			g.removeMobj(mo)
+			return
+		}
+	}
+
+	// Heretic decorations with an animated sprite (torch/brazier/chandelier)
+	// just cycle their frame off the level clock — no state machine.
+	if mo.overrideFrames > 1 {
+		tics := mo.overrideTics
+		if tics < 1 {
+			tics = 1
+		}
+		mo.Frame = (g.levelTime / tics) % mo.overrideFrames
+	}
+
 	switch {
 	case mo.Flags&MF_MISSILE != 0:
 		g.moveMissile(mo)
 	case mo.Flags&MF_SKULLFLY != 0:
 		g.moveSkull(mo)
+	case mo.hact != nil:
+		g.hereticActorTick(mo) // data-driven Heretic monster FSM (movement + frames)
 	default:
 		g.mobjZClip(mo)
 	}
@@ -185,6 +237,9 @@ func (g *Game) mobjTick(mo *Mobj) {
 		return
 	}
 
+	if mo.hact != nil {
+		return // Heretic actor — hereticActorTick owns the frame timer, not mo.Tics
+	}
 	if mo.Tics == -1 {
 		return // frozen frame (idle decoration, ready pickup, settled corpse)
 	}
@@ -212,11 +267,47 @@ func (g *Game) mobjZClip(mo *Mobj) {
 	mo.FloorZ, mo.CeilingZ = floor, ceil
 	mo.Z = floor
 	// A ceiling that has dropped below the thing's head (a crusher, or a
-	// door shutting on a corpse) pushes it back down under the ceiling.
+	// door shutting on a corpse) pushes it back down under the ceiling —
+	// and grinds it, id's PIT_ChangeSector crush branch.
 	if mo.Z+mo.Height > ceil {
 		if mo.Z = ceil - mo.Height; mo.Z < floor {
 			mo.Z = floor
 		}
+		g.crushMobj(mo)
+	}
+}
+
+// crushMobj is what a descending ceiling does to a thing pinned under it,
+// for everything EXCEPT the player (whose crush is always-lethal
+// checkPlayerCrush). A live shootable thing takes 10 damage every 4 tics
+// with a blood spurt; once it (or an already-dead corpse) is being ground,
+// it flattens to a smear and stops — the MF_CORPSE "stop grinding" rule.
+func (g *Game) crushMobj(mo *Mobj) {
+	if mo == g.playerMobj || mo.removed {
+		return
+	}
+	if mo.Flags&MF_CORPSE != 0 || mo.Health <= 0 {
+		if mo.Height > 0 { // flatten once
+			mo.Height = 0
+			mo.Radius = 0
+			mo.Flags &^= MF_SOLID
+			g.spawnAttackBlood(mo.X, mo.Y, mo.Z)
+		}
+		return
+	}
+	if mo.Flags&MF_SHOOTABLE == 0 {
+		return // décor / items are just shoved down, not damaged
+	}
+	if g.levelTime&3 != 0 {
+		return
+	}
+	g.pDamageMobj(mo, nil, nil, 10)
+	if mo.Health > 0 && mo.Flags&MF_NOBLOOD == 0 {
+		g.spawnAttackBlood(
+			mo.X+float64(pRandomSpread())/64,
+			mo.Y+float64(pRandomSpread())/64,
+			mo.Z+mo.Height/2,
+		)
 	}
 }
 
@@ -231,8 +322,11 @@ func (g *Game) moveMissile(mo *Mobj) {
 		return
 	}
 	if hit := g.missileThingHit(mo, nx, ny, nz, true); hit != nil {
-		dmg := (pRandom()%8 + 1) * mo.Info.Damage
-		g.pDamageMobj(hit, mo, mo.Target, dmg)
+		base := mo.Info.Damage
+		if mo.hDamage > 0 { // Heretic monster projectile (engine/heretic_actors.go)
+			base = mo.hDamage
+		}
+		g.pDamageMobj(hit, mo, mo.Target, (pRandom()%8+1)*base)
 		g.explodeMissile(mo)
 		return
 	}
@@ -261,6 +355,26 @@ func (g *Game) moveSkull(mo *Mobj) {
 }
 
 func (g *Game) explodeMissile(mo *Mobj) {
+	// Heretic monster projectiles are MT_HERETIC: freeze in place and play a
+	// short impact animation (engine/heretic_actors.go), else just vanish.
+	if mo.Type == MT_HERETIC {
+		if md := mo.hMissile; md != nil {
+			spr, frames, tics := md.deathSprite, md.deathFrames, md.deathTics
+			if spr == "" { // default: replay the flight sprite a few times as a puff
+				spr, frames, tics = md.sprite, 3, 3
+			}
+			mo.Flags &^= MF_MISSILE
+			mo.MomX, mo.MomY, mo.MomZ = 0, 0, 0
+			mo.spriteOverride = spr
+			mo.overrideFrames, mo.overrideTics = frames, tics
+			mo.Frame = 0
+			mo.hExpireIn = frames * tics
+			hPlay(g, md.deathSound)
+			return
+		}
+		g.removeMobj(mo)
+		return
+	}
 	mo.MomX, mo.MomY, mo.MomZ = 0, 0, 0
 	mo.Flags &^= MF_MISSILE
 	if mo.Info.DeathSound != "" {
@@ -349,6 +463,12 @@ func (g *Game) runTic() {
 		p.Z = g.PlayerZ // feet; independent of the eye's landing dip / ceiling clamp
 		p.Angle = g.Camera.Angle
 		p.Health = g.Player.Health
+		// The player mobj isn't in g.mobjs, so mobjTick never runs for it —
+		// count its post-teleport immunity down here, or evTeleport refuses
+		// every crossing after the first and the pad only works once.
+		if p.TeleportFreeze > 0 {
+			p.TeleportFreeze--
+		}
 	}
 
 	g.updatePowers()
@@ -357,6 +477,9 @@ func (g *Game) runTic() {
 	g.animateWalls()
 	g.checkPlayerCrush()
 	g.playerInSpecialSector()
+	if g.heretic {
+		g.tickTimeBombs()
+	}
 
 	for _, mo := range g.mobjs {
 		g.mobjTick(mo)
@@ -412,11 +535,15 @@ func (g *Game) drawMobjs() {
 		if (mo.X-cx)*fdx+(mo.Y-cy)*fdy < -160 {
 			continue // behind the view plane (160u margin covers the largest radius)
 		}
-		name := spriteNames[mo.Sprite]
+		name := mobjSpriteName(mo)
 		ix, iy, iz, iang := mo.renderState(frac)
+		lit := g.spriteSectorLight(ix, iy)
+		if mo.Flags&MF_SHADOW != 0 {
+			lit /= 3 // Heretic ghosts / spectres — no fuzz, but draw them dim & shadowy
+		}
 		t := raster.SceneThing{
 			X: ix, Y: iy, Z: iz, Angle: iang,
-			Light: g.spriteSectorLight(ix, iy), FullBright: mo.Fullbright,
+			Light: lit, FullBright: mo.Fullbright,
 			Prefix: name, Frame: mo.Frame,
 		}
 		if g.Voxels != nil {
@@ -426,6 +553,24 @@ func (g *Game) drawMobjs() {
 			}
 		}
 		things = append(things, t)
+		if g.heretic && t.Model != nil {
+			if f, ok := g.hereticFlameFor(name, t.Model, ix, iy, iz, g.VoxelScale, g.renderClock); ok {
+				// SceneThing.ModelScale is a multiplier ON TOP of the
+				// renderer's voxelScale; f.Scale is absolute, so divide it
+				// back out.
+				ms := 1.0
+				if g.VoxelScale > 0 {
+					ms = float64(f.Scale) / g.VoxelScale
+				}
+				things = append(things, raster.SceneThing{
+					X: float64(f.X), Y: float64(f.Y), Z: float64(f.Z),
+					Angle:      float64(f.Yaw) * 180 / math.Pi,
+					Light:      int16(f.Light * 255),
+					FullBright: f.FullBright,
+					Model:      f.Model, ModelScale: ms,
+				})
+			}
+		}
 	}
 	g.thingScratch = things
 
@@ -497,7 +642,7 @@ func (g *Game) collectWorldObjects() ([]worldgeo.Sprite, []worldgeo.VoxelInstanc
 		if (mo.X-cx)*fdx+(mo.Y-cy)*fdy < -160 {
 			continue // behind the view plane (160u margin covers the largest radius)
 		}
-		name := spriteNames[mo.Sprite]
+		name := mobjSpriteName(mo)
 		ix, iy, iz, iang := mo.renderState(frac)
 		if g.Voxels != nil {
 			if model, angOff, mscale, ok := g.Voxels.Model(name, mo.Frame); ok && model != nil {
@@ -512,6 +657,11 @@ func (g *Game) collectWorldObjects() ([]worldgeo.Sprite, []worldgeo.VoxelInstanc
 					Light:      float32(g.spriteSectorLight(ix, iy)) / 255,
 					FullBright: mo.Fullbright,
 				})
+				if g.heretic {
+					if f, ok := g.hereticFlameFor(name, model, ix, iy, iz, vscale*mscale, g.renderClock); ok {
+						voxels = append(voxels, f)
+					}
+				}
 				continue // the voxel model replaces the billboard
 			}
 		}

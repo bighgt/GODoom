@@ -21,6 +21,61 @@ func openDropdown(ui *UI, id string, row Rect, current string, options []string)
 	return ui.deferred
 }
 
+// TestOpenDropdownListSwallowsClicksBeneathIt is a regression test for the
+// reported bug: on the Graphics tab the Renderer dropdown's first option
+// ("Software") sits exactly over the Lighting Mode dropdown's control box,
+// so clicking Software was toggling Lighting Mode open — and, processed
+// first, that stole the openDropdown slot — and the Renderer choice was
+// lost. Hardware (the second option) landed on a slider's dead zone, so it
+// worked, which is why only "swap to Software" was broken. An open
+// dropdown's overlay list must swallow clicks aimed at its options.
+func TestOpenDropdownListSwallowsClicksBeneathIt(t *testing.T) {
+	ui := NewUI(NewCanvas(windowW, windowH))
+	rowA := Rect{panelPad, 194, 600, rowHeight}                      // "renderer"
+	rowB := Rect{panelPad, 194 + rowHeight + rowGap, 600, rowHeight} // "lightingMode"
+	optsA := []choice{{"software", "Software"}, {"hardware", "Hardware"}}
+	optsB := []choice{{"enhanced", "Enhanced"}, {"vanilla", "Vanilla"}}
+	var selA, selB string
+	drawBoth := func() bool {
+		ui.Options("renderer", rowA, "Renderer", "hardware", optsA, func(s string) { selA = s })
+		ui.Options("lightingMode", rowB, "Lighting", "enhanced", optsB, func(s string) { selB = s })
+		return ui.End()
+	}
+	mouse := func(x, y int, click bool) Input {
+		return Input{MouseX: float64(x), MouseY: float64(y), MouseLeftClicked: click, Keys: map[window.MenuKey]bool{}}
+	}
+
+	// Frame 1: click rowA's control box to open the Renderer dropdown.
+	ui.Begin(mouse(rowA.X+labelWidth+5, rowA.Y+5, true))
+	drawBoth()
+	if ui.openDropdown != "renderer" {
+		t.Fatalf("frame 1: openDropdown = %q, want renderer", ui.openDropdown)
+	}
+
+	// Frame 2: click the first option ("Software"). Its Y also falls inside
+	// rowB's (Lighting Mode's) control box — the whole point of the bug.
+	listTop := rowA.Y + rowA.H
+	clickY := listTop + rowHeight/2
+	if clickY < rowB.Y || clickY >= rowB.Y+rowB.H {
+		t.Fatalf("setup: option-0 click y=%d not over rowB %v — overlap assumption is wrong", clickY, rowB)
+	}
+	ui.Begin(mouse(rowA.X+labelWidth+5, clickY, true))
+	changed := drawBoth()
+
+	if selB != "" {
+		t.Errorf("Lighting Mode changed to %q — the open Renderer list should have swallowed the click", selB)
+	}
+	if selA != "software" {
+		t.Errorf("Renderer selection = %q, want software", selA)
+	}
+	if !changed {
+		t.Errorf("End() reported no change on a valid option click")
+	}
+	if ui.openDropdown != "" {
+		t.Errorf("openDropdown = %q, want closed after the selection", ui.openDropdown)
+	}
+}
+
 // TestDropdownRowsStayFullHeightWithManyOptions is a regression test for the
 // reported bug: with a WAD carrying a lot of maps, the level dropdown
 // "squished" every row into a fixed-height box instead of showing a capped

@@ -71,6 +71,16 @@ type WeaponDef struct {
 	// short-range repeated hit (id's A_Saw). Mutually exclusive with
 	// Projectile.
 	Melee bool
+
+	// Powered is used instead of Projectile while a Heretic Tome of Power is
+	// active (engine/heretic_weapons.go). PoweredHitscanShots > 1 gives a
+	// hitscan weapon (the Elven Wand) that many shots while empowered;
+	// PoweredMeleeMul multiplies a melee weapon's damage (Staff / Gauntlets)
+	// and, if PoweredLeech, heals the player for a quarter of it.
+	Powered            *ProjectileDef
+	PoweredHitscanShots int
+	PoweredMeleeMul     int
+	PoweredLeech        bool
 }
 
 // ProjectileDef is a weapon's true traveling projectile (id's "missile"
@@ -100,10 +110,24 @@ type ProjectileDef struct {
 	// Damage (so 8x the base at most), then, if ExplodeRadius > 0 or Spray
 	// is set, the blast/spray on top. 0 = a purely cosmetic projectile.
 	Damage int
+	// Shots > 1 fires a fan of that many projectiles, SpreadRad radians
+	// apart, centred on the aim — the Ethereal Crossbow's triple bolt and
+	// several Tome-of-Power modes (engine/heretic_weapons.go). 0/1 = single.
+	Shots     int
+	SpreadRad float64
 }
 
+// numAmmoTypes sizes PlayerStats.Ammo/MaxAmmo. Doom uses 0..3 (bullets,
+// shells, cells, rockets); Heretic adds 4 = phoenix flame orbs, 5 = mace
+// spheres (see engine/heretic_weapons.go). A Doom session simply never
+// touches 4/5.
+const numAmmoTypes = 6
+
 // Weapon indices — id's weapontype_t order exactly, so Weapons[] and
-// PlayerStats.Weapons[] can be indexed by these directly.
+// PlayerStats.Weapons[] can be indexed by these directly. In a Heretic
+// session applyHereticWeapons overwrites each slot's WeaponDef in place
+// (staff/wand/crossbow/dragon-claw/hellstaff/phoenix/gauntlets/firemace) —
+// see engine/heretic_weapons.go.
 const (
 	wpFist = iota
 	wpPistol
@@ -516,9 +540,16 @@ func (g *Game) beginFire() bool {
 	// id's P_FireWeapon: the shot's noise floods the surrounding sectors and
 	// wakes any monster there, seen or not (noise.go).
 	g.pNoiseAlert(g.playerMobj)
+
+	// Heretic Tome of Power: swap in the powered projectile / behaviour.
+	tome := g.heretic && g.Player.Powers[pwTome] > 0
+	proj := def.Projectile
+	if tome && def.Powered != nil {
+		proj = def.Powered
+	}
 	switch {
-	case def.Projectile != nil:
-		g.spawnProjectile(def.Projectile)
+	case proj != nil:
+		g.spawnProjectile(proj)
 	case def.Melee:
 		g.fireMelee()
 	default:
@@ -551,6 +582,7 @@ func (g *Game) fireMelee() {
 	if g.playerMobj == nil {
 		return
 	}
+	def := Weapons[g.Weapon.Current]
 	damage := 2 * (pRandom()%10 + 1)
 	rng := meleeRange
 	if g.Weapon.Current == wpFist {
@@ -560,8 +592,30 @@ func (g *Game) fireMelee() {
 	} else {
 		rng = meleeRange + 1 // A_Saw reaches one unit further
 	}
+	// Heretic Tome of Power: the Staff / Gauntlets hit harder and reach
+	// further while empowered, and the Gauntlets leech a little life on any
+	// swing that lands on a monster.
+	leech := false
+	if g.heretic && g.Player.Powers[pwTome] > 0 && def.PoweredMeleeMul > 0 {
+		damage *= def.PoweredMeleeMul
+		rng += 32
+		leech = def.PoweredLeech
+	}
+	// Heretic melee spark: green for the Gauntlets, the tan staff spark
+	// otherwise. Ignored outside a Heretic session.
+	hpuff := "PUF3"
+	if g.Weapon.Current == wpChainsaw {
+		hpuff = "PUF1"
+	}
 	ang := g.playerMobj.Angle + g.hitscanSpread()/4
-	g.pLineAttack(g.playerMobj, ang, g.playerAimSlope(), rng, damage)
+	g.pLineAttack(g.playerMobj, ang, g.playerAimSlope(), rng, damage, hpuff)
+	if leech && g.aimTargetInFront(rng+16) != nil && g.Player.Health < g.dm().maxHealth {
+		g.Player.Health += 2 // powered Gauntlets drink life
+		if g.Player.Health > g.dm().maxHealth {
+			g.Player.Health = g.dm().maxHealth
+		}
+		g.syncPlayerMobjHealth()
+	}
 }
 
 // fireHitscan resolves a bullet weapon. Damage per pellet is id's
@@ -581,6 +635,20 @@ func (g *Game) fireHitscan(weapon int) {
 	}
 	baseSlope := g.playerAimSlope()
 	dmg := func() int { return 5 * (pRandom()%3 + 1) }
+	// In Heretic every hitscan weapon here is the Elven Wand — its impact
+	// spark is the little yellow flame (PUF2). Ignored for Doom.
+	hpuff := "PUF2"
+
+	// Heretic Tome of Power — the Elven Wand fires a wide horizontal fan.
+	if g.heretic && g.Player.Powers[pwTome] > 0 {
+		if n := Weapons[weapon].PoweredHitscanShots; n > 1 {
+			for i := 0; i < n; i++ {
+				ang := g.playerMobj.Angle + (float64(i)-float64(n-1)/2)*(6*math.Pi/180)
+				g.pLineAttack(g.playerMobj, ang, baseSlope, missileRange, dmg(), hpuff)
+			}
+			return
+		}
+	}
 
 	if weapon == wpSuperShotgun {
 		for i := 0; i < 20; i++ {
@@ -589,7 +657,7 @@ func (g *Game) fireHitscan(weapon int) {
 			if !g.IsoAimLocked {
 				slope += float64(pRandomSpread()) / 2048.0
 			}
-			g.pLineAttack(g.playerMobj, ang, slope, missileRange, dmg())
+			g.pLineAttack(g.playerMobj, ang, slope, missileRange, dmg(), hpuff)
 		}
 		return
 	}
@@ -606,7 +674,7 @@ func (g *Game) fireHitscan(weapon int) {
 		if spread || i > 0 {
 			ang += g.hitscanSpread() / 4
 		}
-		g.pLineAttack(g.playerMobj, ang, baseSlope, missileRange, dmg())
+		g.pLineAttack(g.playerMobj, ang, baseSlope, missileRange, dmg(), hpuff)
 	}
 }
 

@@ -62,6 +62,9 @@ type Renderer struct {
 	// missing / failed to decode) falls buildSkyTable back to the WAD's own
 	// sky, picked per map the way PrBoom does — see skyTextureForMap.
 	skybox *assets.RGBA
+	// preferWADSky forces the WAD's own sky even when skybox loaded (Heretic
+	// — see SetPreferWADSky).
+	preferWADSky bool
 
 	// strips partitions the framebuffer into vertical column bands, one per
 	// render worker. Each strip carries its own ceiling/floor occlusion
@@ -415,10 +418,21 @@ func (r *Renderer) SetFog(fr, fg, fb float32, density float64) {
 	r.fogR, r.fogG, r.fogB, r.fogDensity = fr, fg, fb, density
 }
 
+// SetPreferWADSky makes buildSkyTable ignore the external skybox panorama
+// (assets/skybox/mars_sky.png) and use the WAD's own sky texture instead —
+// set for Heretic, whose fantasy skies suit the game far better than a
+// photoreal Mars panorama.
+func (r *Renderer) SetPreferWADSky(v bool) {
+	if r.preferWADSky != v {
+		r.preferWADSky = v
+		r.skyWADTex, r.skyWADFor = nil, ""
+	}
+}
+
 // SetSkyName forces the WAD sky texture buildSkyTable uses, overriding the
 // per-episode default (skyTextureForMap) — for a UMAPINFO `skytexture` key.
 // "" restores the default. An external skybox panorama (assets/skybox) still
-// wins over both. Call on level load.
+// wins over both unless SetPreferWADSky(true). Call on level load.
 func (r *Renderer) SetSkyName(name string) {
 	if name == r.skyNameOverride {
 		return
@@ -702,12 +716,13 @@ const (
 const matWater = 40 // 40/255 ≈ 0.157
 
 func classifyFloorLiquid(name string) uint8 {
+	has := func(p string) bool { return len(name) >= len(p) && name[:len(p)] == p }
 	switch {
-	case len(name) >= 6 && name[:6] == "FWATER":
+	case has("FWATER"), has("FLTWAWA"), has("FLTFLWW"): // Doom / Heretic water
 		return liquidWater
-	case (len(name) >= 4 && name[:4] == "LAVA") || name == "FIRELAVA":
+	case has("LAVA") || name == "FIRELAVA" || has("FLTLAVA"): // Doom / Heretic lava
 		return liquidLava
-	case (len(name) >= 6 && name[:6] == "NUKAGE") || (len(name) >= 5 && name[:5] == "SLIME"):
+	case has("NUKAGE"), has("SLIME"), has("FLTSLUD"): // Doom / Heretic toxic sludge
 		return liquidNukage
 	}
 	return liquidNone

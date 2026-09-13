@@ -57,6 +57,22 @@ func (g *Game) spawnMapThings() {
 			}
 		}
 
+		// Heretic THINGS resolve through the Heretic tables first (their
+		// doomednums mostly collide with different Doom things): monsters
+		// (heretic_actors.go), then decorations / keys / items / weapons
+		// (heretic.go). Anything not covered falls through to the Doom table.
+		if g.heretic {
+			if g.spawnHereticMonster(int(t.Type), float64(t.X), float64(t.Y),
+				float64(t.Angle), t.Flags&mtfAmbush != 0) {
+				spawned++
+				continue
+			}
+			if g.spawnHereticThing(t) {
+				spawned++
+				continue
+			}
+		}
+
 		typ, ok := doomedNumToType[int(t.Type)]
 		if !ok {
 			continue // an unsupported thing type — silently skip for now
@@ -70,6 +86,9 @@ func (g *Game) spawnMapThings() {
 		mo.Angle = float64(t.Angle) * math.Pi / 180
 		if t.Flags&mtfAmbush != 0 {
 			mo.Flags |= MF_AMBUSH
+		}
+		if g.swapWeapons {
+			g.swapDoomPickupSprite(mo, typ) // switchWeapons: show the Heretic pickup
 		}
 		spawned++
 	}

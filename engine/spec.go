@@ -103,6 +103,16 @@ func (g *Game) activateLine(lineIdx int, mo *Mobj, trig lineTrigger) bool {
 	if num == 0 {
 		return false
 	}
+
+	// Heretic reuses several Doom "switch" numbers for passive wall
+	// scrollers, not triggers. 99 (scroll wall texture) is the common one —
+	// its lines are one-sided impassable walls with no tag, and Doom's 99
+	// ("SR blue-key blazing door") would have activateLine fling every
+	// untagged sector open the instant the player pressed Space near one.
+	// spawnSpecials registers it as a scroller; here it's a no-op.
+	if g.heretic && num == 99 {
+		return false
+	}
 	tag := ld.SectorTag
 	byPlayer := mo == g.playerMobj
 

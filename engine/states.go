@@ -651,6 +651,22 @@ const (
 	S_BURNBARREL2
 	S_BURNBARREL3
 
+	// S_HERETIC and the S_HERETIC_* sentinels below stand in for a Heretic
+	// map object / actor's animation FSM (engine/heretic.go,
+	// engine/heretic_actors.go). They carry no real animation — the
+	// sprite/frame come from Mobj.spriteOverride and the data-driven
+	// hereticActorDef — but a Heretic monster's synthesized MobjInfo points
+	// its SpawnState/SeeState/... at these values so the ported Doom AI
+	// (aLook, aChase, pDamageMobj, pKillMobj) drives it unchanged:
+	// setMobjState intercepts a sentinel and switches the actor's hPhase.
+	S_HERETIC // spawn / idle
+	S_HERETIC_SEE
+	S_HERETIC_MELEE
+	S_HERETIC_MISSILE
+	S_HERETIC_PAIN
+	S_HERETIC_DEATH
+	S_HERETIC_XDEATH
+
 	S_NUMSTATES
 )
 
@@ -667,7 +683,14 @@ var states [S_NUMSTATES]State
 
 func init() {
 	states = [S_NUMSTATES]State{
-		S_NULL: {SPR_TROO, 0, -1, nil, S_NULL, false},
+		S_NULL:            {SPR_TROO, 0, -1, nil, S_NULL, false},
+		S_HERETIC:         {SPR_TROO, 0, -1, nil, S_HERETIC, false},
+		S_HERETIC_SEE:     {SPR_TROO, 0, -1, nil, S_HERETIC_SEE, false},
+		S_HERETIC_MELEE:   {SPR_TROO, 0, -1, nil, S_HERETIC_MELEE, false},
+		S_HERETIC_MISSILE: {SPR_TROO, 0, -1, nil, S_HERETIC_MISSILE, false},
+		S_HERETIC_PAIN:    {SPR_TROO, 0, -1, nil, S_HERETIC_PAIN, false},
+		S_HERETIC_DEATH:   {SPR_TROO, 0, -1, nil, S_HERETIC_DEATH, false},
+		S_HERETIC_XDEATH:  {SPR_TROO, 0, -1, nil, S_HERETIC_XDEATH, false},
 
 		S_PLAY: {SPR_PLAY, 0, -1, nil, S_PLAY, false},
 

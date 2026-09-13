@@ -29,9 +29,14 @@ GPU that can't stand the enhanced pipeline up. Either way, a global
 lightScale (config) dims or brightens the whole map; the default is
 deliberately moodier than id's.
 
-The engine ships no game data. The user picks a WAD at startup through a
-native file-open dialog: the freely redistributable shareware DOOM1.WAD, a
-retail IWAD, or a PWAD (merged with a base IWAD automatically — section 2).
+The engine ships no game data. A pre-game launcher (section 22) picks the
+WAD and level and edits every setting: the freely redistributable shareware
+DOOM1.WAD, a retail IWAD, or a PWAD (merged with a base IWAD automatically
+— section 2). A companion executable, cmd/isoengine, renders the same
+simulation as a top-down isometric game (section 23). A second companion,
+cmd/editor, is a dual 2D/3D level editor built on this same stack — it
+renders a map's live geometry through the same software rasterizer the
+game uses, and saves a PWAD the engine loads straight back (section 25).
 
 Module `twopointfive`, Go 1.26. Windows and Linux (X11, RADV/Mesa) are both
 exercised; macOS is untested. Only the MUS/MIDI music path is Windows-
@@ -55,35 +60,64 @@ From the repo root:
     go vet ./...
     go test ./...                     (needs cgo — engine imports window/audio)
     go build -ldflags="-s -w" -o bin\engine.exe ./cmd/engine
+    go build -ldflags="-s -w" -o bin\isoengine.exe ./cmd/isoengine
     bin\engine.exe
+
+Two commands share the tree: cmd/engine is the first-person game (this
+document's default subject); cmd/isoengine is a standalone isometric
+top-down mode over the same engine.Game simulation (section 23). Both wire
+their process entry point — audio setup, the launcher loop, one play
+session — through the same helper shape, de-duplicated between them.
 
 `-ldflags="-s -w"` strips the symbol table and DWARF: harmless for a
 release build, roughly halves the binary. Section 18 has the size picture.
 
-Running the engine opens a native "Select a Doom-engine WAD file" dialog
-(unless a WAD path is given up front — a *.wad command-line argument or
-$TPF_WAD — in which case the dialog is skipped).
-After a .wad is chosen, if it holds more than one map you pick the start
-level (chooseStartMap):
+Running the engine opens the pre-game launcher (package launcher, section
+22): a small fixed-size window — its own GLFW window and a plain
+vulkan.New(...) blit renderer, both torn down before the game's own window
+opens (launcher.Run) — with a WAD quick-pick list (every *.wad beside the
+discovered wad/ directory, launcher.ListWADs), a "Browse..." button (the
+OS-native file-open dialog, window.PickWADFile), a level dropdown, and a
+scrolling editor for every config.json setting. Play loads the chosen
+level; Quit (or closing the window) exits. The launcher does the WAD load +
+IWAD merge itself (wad.LoadWithIWAD) to build its map list, and on Play
+writes the edited settings — plus the chosen WAD path (config key wadPath)
+and map — back to config.json (config.SaveMerge) before handing back a
+launcher.Result for cmd/engine to run.
+
+cmd/engine then loops the launcher and a play session: ending a session
+(Escape, or the game window's close button) returns to the launcher rather
+than exiting the process, so picking another WAD/level or changing a
+setting never means relaunching the exe. Only Quit in the launcher (or
+closing its window) ends the process.
+
+The launcher is skipped entirely when a WAD path is given up front — a
+*.wad command-line argument or $TPF_WAD (window.WADFromCommandLine). That
+"headless" route (cmd/engine's runHeadless) is the pre-launcher flow, kept
+for scripts, the package's own tests and ad-hoc diagnostics: it loads the
+WAD directly and, for a multi-map WAD, picks the start level via
+chooseStartMap —
   - config "map" key names one -> start there, no prompt;
   - launched from a terminal -> a numbered console menu on stdin (a number,
     a map name, or Enter for the conventional first level);
-  - launched with NO console (double-click, desktop launcher, IDE — stdin
-    is /dev/null, detected by window.StdinInteractive via a TIOCGWINSZ
-    ioctl) -> a graphical list dialog of every map (window.PickMap, zenity
-    --list / kdialog --menu; Cancel or no desktop session -> the default);
+  - launched with NO console (stdin is /dev/null, detected by
+    window.StdinInteractive via a TIOCGWINSZ ioctl) -> a graphical list
+    dialog of every map (window.PickMap, zenity --list / kdialog --menu;
+    Cancel or no desktop session -> the default);
   - input already queued on a non-tty stdin (`printf MAP07 | engine`, test
     harnesses) is honoured before either dialog.
-The conventional first level is E1M1 for Doom / Ultimate Doom-format, MAP01
-for Doom II-format, else the first marker. A single-map WAD always skips
-straight to it.
-Then the game opens borderless fullscreen on the primary monitor and that
-level starts.
+The conventional first level (wad.PreferredStartMap) is E1M1 for Doom /
+Ultimate Doom-format, MAP01 for Doom II-format, else the first marker. A
+single-map WAD always skips straight to it.
+Either way, the game then opens borderless fullscreen on the primary
+monitor and that level starts.
 
 The pick may be a standalone IWAD or a PWAD. A PWAD (magic "PWAD", or any
-WAD with no PLAYPAL) carries only the mod's own lumps, so cmd/engine finds
-a base IWAD and merges the two, load order IWAD-then-PWAD, exactly like
-Doom's -file (wad.Merge). The base IWAD is located by: the `iwad` config
+WAD with no PLAYPAL) carries only the mod's own lumps, so the loader
+(wad.LoadWithIWAD, wrapping wad.Merge — used by both the launcher and the
+headless path) finds a base IWAD and merges the two, load order
+IWAD-then-PWAD, exactly like Doom's -file. The base IWAD is located by: the
+`iwad` config
 key if set; otherwise a format guess from the PWAD's map names (E#M# ->
 Doom, MAPxx -> Doom II) followed by a scan for the stock IWAD filenames
 (DOOM.WAD / DOOM2.WAD / TNT.WAD / PLUTONIA.WAD / freedoom*, any case)
@@ -92,10 +126,12 @@ beside the exe — each also checked under wad/, wads/, IWADs/, iwads/ and
 testdata/. If none is found the game exits with an error naming the `iwad`
 key.
 
-Exit: pressing Escape asks the window to close; the loop returns cleanly
-and the renderer and window tear down. Then, if the process owns its
-console (double-clicked, so Windows spawned a console that would vanish
-with it), cmd/engine prints a prompt and waits for Enter so the debug log
+Exit: pressing Escape asks the window to close; the game loop returns
+cleanly and that session's renderer and window tear down, then cmd/engine
+shows the launcher again (the loop above) — Quit there is what actually
+ends the process. On process exit, if it owns its console (double-clicked,
+so Windows spawned a console that would vanish with it),
+window.HoldConsoleOpen prints a prompt and waits for Enter so the debug log
 stays readable (cmd/engine/exitpause_windows.go). Launched from a shell,
 the console outlives the process and there is no pause. TPF_NO_PAUSE=1
 skips the wait unconditionally; off Windows the whole thing is a no-op.
@@ -146,15 +182,39 @@ rather than embedding is deliberate — section 18.
     raster/          CPU software rasterizer — the actual 3D renderer,
                      multithreaded across vertical screen strips
     render/          backend-agnostic Renderer interface + Frame/Light types
-    render/vulkan/   Vulkan: GPU upload + fullscreen blit, and the optional
-                     deferred-lighting chain
-    window/          GLFW window/input + the WAD picker
+    render/worldgeo/ BSP walk -> static triangle list for the GPU-geometry
+                     renderer(s); ViewProj + the isometric IsoCamera/
+                     IsoViewProj/IsoUnprojectToGround math (camera_iso.go)
+    render/vulkan/   Vulkan: GPU upload + fullscreen blit, the optional
+                     deferred-lighting chain, the hardware world path, and
+                     the isometric world path (isosetup.go / isoworld.go)
+    window/          GLFW window/input + the WAD picker + the launcher's
+                     menu-key / raw-typed-char plumbing
     audio/           one PrBoom-style software mixer (oto) for effects +
                      pull-mode MUS/MIDI music (libfluidsynth on Windows &
-                     Linux, winmm fallback on Windows, no-op elsewhere)
+                     Linux, winmm fallback on Windows, no-op elsewhere);
+                     audio.Setup wires the process-wide device + music once
     engine/          game loop, per-frame Systems, movement, collision,
-                     doors, weapons, projectiles, mobjs, AI, pickups, specials
-    cmd/engine/      main() — wires everything together
+                     doors, weapons, projectiles, mobjs, AI, pickups,
+                     specials; the isometric front-end hooks
+                     (movement_iso.go / use_iso.go / iso_render.go); the
+                     Heretic compatibility layer (heretic.go +
+                     heretic_actors.go, section 24)
+    launcher/        the pre-game menu: WAD/level picker + config.json
+                     settings editor, immediate-mode UI on a CPU RGBA
+                     canvas (section 22)
+    cmd/engine/      main() for the first-person game — wires it together
+    cmd/isoengine/   main() for the isometric top-down mode (section 23);
+                     shares the launcher + play-session shape with cmd/engine
+    imkit/           the level editor's immediate-mode UI kit (canvas, input,
+                     widgets, splitter/tabs/menu/thumbnail-grid/drag-drop) —
+                     a sibling of launcher/'s, not (yet) shared with it
+    nodebuild/       builds a BSP (NODES/SSECTORS/SEGS + BLOCKMAP/REJECT) from
+                     raw LINEDEFS/SIDEDEFS/VERTEXES/SECTORS, for the editor's
+                     live 3D preview and for saving an edited/new map
+    editor/          the level editor's app/doc/2D-view/3D-view/panel code
+                     (section 25)
+    cmd/editor/      main() for the level editor (section 25)
     tools/gensky/    Mars skybox PNG generator
     tools/gentex/    hi-res wall/flat/sprite texture generator
     tools/genbright/ procedural brightmap-mask generator (self-lit texels)
@@ -164,22 +224,42 @@ rather than embedding is deliberate — section 18.
 
 4. ARCHITECTURE & DATA FLOW
 -----------------------------
-    window.PickWADFile()
-      -> config.Load()                    optional config.json (section 17)
-      -> wad.Load(path)                   parse the picked WAD's directory
-      -> wad.Merge(iwad, picked)          only when the pick is a PWAD
-      -> chooseStartMap(maps, cfg.Map)    config key, else console menu (tty)
-                                         or window.PickMap GUI list (no tty)
+cmd/engine's run() loop, once per launcher visit (audio.Setup ran first,
+process-wide):
+    launcher.Run(config.Load())          section 22 — the pre-game menu:
+                                          its own window + blit renderer,
+                                          wad.LoadWithIWAD (parse + PWAD
+                                          merge), map choice, then on Play
+                                          config.SaveMerge writes config.json
+                                          and it returns a launcher.Result
+                                          {WAD, WADPath, MapName, Config}
+      -> playSession(res...)             one game session; its defers tear
+                                          down every window/GPU/CPU resource
+                                          when it returns (Escape / close ->
+                                          back to launcher.Run)
+
+playSession(path, mapName, cfg, wad, dev, music):
       -> wad.LoadLevel(mapName)           assemble one map's lumps
       -> bsp.Build(level)                 reconstruct the BSP tree
       -> assets.New(wad)                  palette + texture/flat/sprite resolver
       -> window.New(w,h,title,fullscreen) open the GLFW/Vulkan window
       -> raster.New(textures, rw, rh)     CPU rasterizer + disk skybox, at the
                                           resolved render resolution
-      -> vulkan.New(window, rw, rh, ...)  GPU instance/device/swapchain/pipeline
+      -> vulkan.New / NewWorld(...)       GPU instance/device/swapchain/pipeline
+                                          (NewWorld for renderer "hardware")
       -> engine.NewGame(...)              wire it into a Game
       -> assets.LoadVoxelPackDir(...)     Doom1/Doom2 voxel models, optional
-      -> game.Run()                       main loop until the window closes
+      -> game.Run()                       main loop until the window closes;
+                                          each startup stage is timed
+                                          (stageTimer) so a slow load is
+                                          diagnosable rather than "hung"
+
+The headless path ($TPF_WAD / a *.wad argument) skips the launcher:
+runHeadless does the config.Load + wad.LoadWithIWAD + chooseStartMap itself
+and calls the same playSession. cmd/isoengine (section 23) mirrors this
+whole structure — same launcher, same playSession shape — with its own
+window, its own vulkan.NewIso renderer, and IsoMovementSystem/IsoUseSystem
+swapped into the Game.
 
 Per frame, engine.Game.Run (a short loop over pollInput / stepSimulation /
 updateFPS / renderFrame / capFrameRate):
@@ -642,6 +722,25 @@ HD-weapon-pack frame (section 11, TexelsPerUnit 2) has the same logical
 footprint as the 1x original and drops in with no layout change — it just
 carries more pixels for the GPU upscale.
 
+Weapon bob (engine/weapons.go — g.weaponBob() returns all three per frame,
+passed into DrawWeapon). One shared free-running angle WeaponState.bobPhase
+advances at dt * bobCycleHz (0.7) * 2pi * g.moveSpeedFrac() — 0 standing,
+full at moveTopSpeed — so all three motions freeze at rest and widen with
+actual speed, and all read as one arc rather than independent wobbles:
+  X  weaponBobMaxX (12 px) * frac * sin(phase)      — side to side.
+  Y  weaponBobMaxY (5 px)  * frac * |sin(2*phase)|  — rises once per
+     footfall, never dips below rest (SUBTRACTED from gunY, so positive is
+     up).
+  scale  1 + weaponBobDepth (0.06) * frac * cos(2*phase) — a small
+     toward/away size swing (closest at the sway's dead centre, farthest at
+     each extreme), so the return half of each swing reads as the gun
+     coming back toward the camera. raster.blit takes a `scale` param for
+     this; DrawWeapon scales the footprint before centering so it stays
+     anchored. weaponBottomOverlap (20 px) hangs the resting gun just past
+     the screen's bottom edge (clipped by blit's off-screen check) so a
+     sprite that doesn't fill its own bottom rows, plus the Y lift, can't
+     crack a gap open underneath.
+
 The 2D overlay: weapon viewmodel, status bar and debug HUD all draw into a
 separate full-render-resolution RGBA buffer (r.overlay). Each draw calls
 markOverlay with its row span, so Render can clear only last frame's
@@ -715,13 +814,38 @@ prev + (cur-prev)*renderLerp() into g.Level.Sectors for that frame's
 geometry build and restores the authoritative values right after — so a
 door/lift glides at display rate instead of stepping at 35Hz. A per-tic
 change bigger than 48 units is taken to be an instant snap and not lerped.
-Presentation only; the sim always reads the real heights. Per frame the CPU
+Presentation only; the sim always reads the real heights. A mid-glide frame
+only actually Invalidate()s (which walks every subsector and blocks on a
+full static-vertex-buffer re-upload) when the interpolated height rounds to
+a DIFFERENT int16 than last frame — renderedSectorHeightsChanged (interp.go)
+gates it, since most mid-glide frames land on the same rounded height and
+were forcing a needless rebuild + GPU stall every frame. Per frame the CPU
 only appends the sprite/voxel-billboard quads. render/worldgeo.ViewProj (byte-matched to
 raster's projection) is pushed as a mat4. Each frame the world pass runs a
 depth pre-pass over the opaque static geometry (positions only, no colour)
 so the colour pass's early-Z rejects occluded wall/flat pixels before the
 fade + dynamic light loop, then shades walls/flats/sky, the alpha-tested
 2-sided middles, the sprite billboards and the voxel models.
+
+Static-geometry visibility culling (render/worldgeo/visgrid.go, mirroring
+engine/collisiongrid.go). Builder buckets its static draws by (texture,
+512-unit cell) instead of texture alone — a subsector is bucketed atomically
+by its centroid (cellOf), so a cell is only a batching key, never the cull
+test. Invalidate records each Draw's REAL vertex bounding box
+(Draw.MinX/MinY/MaxX/MaxY); Builder.UpdateVisibility runs a per-frame
+camera-vs-box test each frame (camera-inside, or the box's bounding-circle
+angular span overlaps the FOV cone + a 15-degree margin — an angular-span
+test, not a 4-corner one, so a big box crossing a narrow cone edge-on isn't
+wrongly dropped) and fills Geometry.StaticDrawVisible. world.go's colour
+pass skips a non-visible Draw and, since per-(texture,cell) runs share a
+texture back-to-back more often, caches the last-bound texture + resolved
+worldTex to skip the descriptor rebind and texCache lookup. The depth
+pre-pass is deliberately left unculled (it draws one contiguous vertex
+range, not per-Draw). Testing against the grid cell's nominal square rather
+than the draw's real box once black-holed wide outdoor subsectors near
+their far edge (fixed in 7c09f19, TestUpdateVisibilityUsesDrawBoundsNot
+NominalCell).
+
 world.vert/world.frag: one draw call per texture (a bound set-0 per Draw,
 plain Vulkan 1.0 — no bindless), wall/flat/sprite images uploaded once as
 device-local mip chains (GPU blit chain) sampled with an anisotropic REPEAT
@@ -733,11 +857,21 @@ brightmap mask (worldgeo.Draw.Bright, resolved once per texture like Tex; a
 1x1 black dummy when it has none); world.frag lights a masked texel to
 max(sectorFade, luma(uBright)) + a small bloom kicker so a lit panel /
 light / EXIT sign stays lit regardless of sector light — the hardware match
-for the software path's LightParam.g model. A faint hemisphere AMBIENT
-floor (scaled by 1-lit) keeps a fully-shadowed pixel from crushing to pure
-black: world.frag's hemisphereAmbient() mixes a sky-tinted colour (up-facing
-= floors) with a darker hue-kept version (down-facing = ceilings) by
-vNormal.z, all times a strength scalar. The tint (W.amb.rgb) is THIS level's
+for the software path's LightParam.g model. Two separate ambient terms keep
+a shadowed pixel legible. First, a brightness FLOOR (config ambientLight,
+W.light.w — default 0.2, section 17): litAmt is raised to at least
+ambientLight * sectorAmbientFrac(), i.e. scaled by how bright THIS sector is
+authored, undiminished by camera distance — so a monster across a lit room
+stays detailed instead of fading to near-black by mid-room, while one in a
+genuinely dark sector gets almost no lift and needs a real light. 0
+reproduces the old crush-to-black in every sector. light.frag (enhanced
+software) applies the same via S.spotCosInner.y; the vanilla path has its
+own non-configurable colormap floor. Second, on top of that, a faint
+hemisphere AMBIENT tint (scaled by 1-lit) keeps a fully-shadowed pixel from
+crushing to pure black: world.frag's hemisphereAmbient() mixes a sky-tinted
+colour (up-facing = floors) with a darker hue-kept version (down-facing =
+ceilings) by vNormal.z, all times a strength scalar. The tint (W.amb.rgb)
+is THIS level's
 sky bitmap averaged, hue-boosted and scaled ~0.09, computed once and cached
 by pointer in worldResources (hemisphereAmbient in world.go) — so a shadowed
 corner in a hell map goes murky-warm and one under an open sky goes cool
@@ -774,6 +908,29 @@ a stale voxel header had been reading one vec4 short since fog was added.
 The camera world position rides in the spare header slots (cam.w = camX,
 nLights.zw = camY,camZ — CAM_POS in the shader) for the water reflection,
 fog height and contact-shadow reconstruction.
+
+The head-mounted flashlight (config flashlight, section 14) is a spot term
+the point-light arrays can't carry — a beam needs a direction and a cone.
+The World UBO gains a Spot* block (pos + 1/radius^2, unit direction,
+cos(outer), rgb + intensity, cos(inner); SpotIntensity <= 0 = off) filled
+from worldgeo.Camera's Spot* fields, which engine.Game.flashlightSpot
+recomputes per frame off the live camera with a handheld sway and a battery
+flicker. world.frag adds it as a real Lambert + smooth cone falloff on top
+of the sector fade, using the same per-pixel bumpedNormal() the point
+lights do. light.frag (enhanced software) reads the same fields off
+render.Frame. The vanilla path has no spot — flashlightSystem there just
+raises raster.ExtraLight.
+
+Cartoon shading (config cartoonShading, hardware only) rides in a repurposed
+UBO pad float (CartoonBands, alongside the Spot block): when > 0, world.frag
+/ voxel.frag's fade() posterizes its 0..1 brightness to the nearest 1/N
+(cartoonLightBands = 4) instead of the smooth gradient. The matching
+outline is a worldblit.frag post-chain stage — p4.w carries cartoonOutline
+Strength (0.85), and the stage darkens toward black where the world-pass
+depth buffer jumps sharply between neighbouring pixels (a silhouette, a
+corner, geometry against the sky). Both constants live in render/vulkan/
+world.go, deliberately not player knobs.
+
 A floor whose flat is a liquid gets its own vert kind (worldgeo.liquidKind
 OfFlat: KindLiquidWater / KindLiquidLava / KindLiquidNukage) and world.frag
 shades it to match the software path's shadeLiquid — water: the FWATER
@@ -804,7 +961,7 @@ Fresnel-weighted (0.03 + 0.32*(1-|V.z|)^5) * edge-fade * ssrStrength (0.9).
 Rays leaving frame / hitting nothing keep the baked sky reflection. The blit
 push constant carries the camera basis for this (p0 exposure,bloomStrength,
 waterClock,near; p1 sinA,cosA,focal,far; p2 camX,camY,camZ,horizonY; p3 w,h,
-ssrStrength,_ — 64 B; worldgeo.NearPlane/FarPlane exported for the
+ssrStrength,godrayStrength; worldgeo.NearPlane/FarPlane exported for the
 linearise). SSR runs pre-tonemap and does NOT feed bloom (bloom is the
 pre-SSR scene). Enhanced-software still has its own light.frag ssr() off the
 R32F linear-depth buffer.
@@ -846,56 +1003,81 @@ shared mip images (which, like the old ping-pong bloom, are reused across
 frames-in-flight). The finished bloom is in mip 0, which the present blit
 samples. SetHDR bloom strength 0.85.
 
-worldblit.frag then runs the whole post chain in one fullscreen pass (no
-extra render targets — it samples only uScene, uBloom, uOverlay and the
-world-pass depth uDepth; each stage gated by a strength push-constant, 0 =
-skip). world.frag writes a material tag in the scene alpha: 0 = water,
-0.5 = sky, 1 = everything else. Order:
+worldambient.frag (worldambient.go — renamed from worldshadow.frag/.go when
+it grew past dynamic-light shadows alone). One QUARTER-resolution pass
+(wr.w/4 x wr.h/4, one shared image reused every frame like worldbloom.go's
+mips) that pre-computes three inherently low-frequency terms into an RGBA
+buffer — r = dynamic-light shadow (1 = unshadowed), g = SSAO (1 = no
+occlusion), b = god-ray glow luma — which worldblit.frag then samples once
+at full res through a plain linear sampler. Running SSAO's 12-tap disc
+gather and the 24-step god-ray march at 1/16 the pixel count is the real
+win; the bilinear upscale from quarter-res IS the soft blur on all three
+(no math in worldblit for it). It binds a PREFIX of the real World UBO,
+declaring the flashlight Spot* vec4s explicitly even though it only reads
+lightPos[] — std140 has no "skip", and the pre-move copy in worldblit.frag
+had silently been reading the spot fields as dynamic lights 0..3 (a latent
+field-offset bug carried forward fixed).
+  - Shadows (dynShadowStrength 0.6, March 320 u, Bias 2 u): for the first
+    shadowCasterCount lights (the leading dynamic emitters + up to two
+    nearest torches) march uDepth from the pixel toward the light; on-screen
+    geometry between them dims that light's falloff-weighted share. Screen-
+    space only — an off-screen occluder casts nothing; the shadow-map-atlas
+    upgrade is still open.
+  - SSAO (ambAOStrength 0.40, Radius 48 u, Bias 1.5 u): reconstruct
+    position + a depth-discontinuity-aware normal from uDepth, gather a
+    12-sample disc rotated by interleaved gradient noise sampled at this
+    pass's OWN quarter-res gl_FragCoord (sampling it at full-res UV strode
+    IGN by 4 and aliased into a coarse pattern — a fix chased from a
+    grey-speckle report). Then worldambientblur.frag, a 3x3 box denoise on
+    the AO channel only (shadow/god-ray pass through — already soft), writes
+    the buffer worldblit actually samples: a real blur is what production
+    SSAO uses, no dither pattern substitutes for it.
+  - God rays (ambGodrayStrength 0.35; ambSunX/Y/Z a fixed ~60-degree world
+    sun): project the sun to a screen point, radial-march 24 taps of uScene
+    toward it gathering sky (alpha ~0.5) + HDR luma with exponential decay.
+    The march's start phase is jittered per pixel (same hash as the AO disc)
+    and the contribution is capped — an un-jittered march banded along lines
+    toward the sun and could spike the tonemap to flat white on a fast turn.
+
+worldblit.frag then runs the present + post chain in one fullscreen pass,
+sampling uScene, uBloom, uOverlay, the world-pass depth uDepth (set 0) and
+uAmbientTerm (set 1 — its own dedicated descriptor pool, never touching
+worldsetup.go's shared framePool). world.frag writes a material tag in the
+scene alpha: 0 = water, 0.5 = sky, 1 = everything else. Order:
   1. water SSR (section above) for alpha-0 pixels.
-  2. SSAO — reconstruct position + a depth-discontinuity-aware normal from
-     uDepth, gather a per-pixel-rotated 12-sample disc (world radius scaled
-     to screen by depth), darken creases. World pixels only; multiplies the
-     final HDR (clamped so the deepest crease darkens ~aoStrength).
-  3. God rays — project a fixed world-space sun direction to a screen point;
-     radial-march 24 taps of uScene toward it, gathering sky (alpha ~0.5)
-     and bright (HDR luma) with exponential decay; add the warm-tinted
-     result. Fades out as the sun leaves the screen / goes behind camera.
-  3b. Dynamic-light shadows (dynShadow) — for each of the first p6.x lights
-     (every dynamic emitter: muzzle flash / in-flight shots / monster
-     attacks, then up to two of the nearest map emitters = torches), march
-     uDepth from the pixel's world point toward that light; if on-screen
-     geometry sits between, the pixel loses that light's falloff-weighted
-     share (Σ over occluded lights, clamped, x p6.y strength). The blit
-     reads lightPos[0..N) from the world UBO (bound here as binding 4 — no
-     new buffer). Screen-space only: an occluder the camera can't see casts
-     nothing. World pixels only. p6 = (count, strength, marchDist, bias);
-     strength 0 disables. The true shadow-map-atlas upgrade (off-screen
-     occluders, PCF) is still open.
-  4. Tonemap — ACES filmic (Narkowicz fit) of (scene+bloom)*exposure,
-     replacing the old softKnee (kept in the shader as a one-line fallback).
-     Output is display-linear; the *_SRGB swapchain applies the OETF.
-  5. FXAA — console-variant edge AA on the tonemapped image (taps re-tonemap
-     scene+bloom, skipping SSAO/GR/SSR — low-frequency, so it doesn't
-     matter). Skipped on water/sky.
-  6. CAS — FidelityFX RCAS-shape contrast-adaptive sharpen, restores
-     crispness the letterbox upscale costs. Skipped on water/sky.
-  6b. Screen tint — a full-frame colour wash while the player stands in a
+  2. ambient — one bilinear sample of uAmbientTerm; hdr *= AO (g), then
+     hdr += godray(b) * p3.w * a fixed warm tint, then hdr *= shadow (r),
+     so a shadowed pixel also dims its own god-ray share (order kept from
+     when these ran inline). AO + shadow are world-pixels-only.
+  3. Tonemap — ACES filmic (Narkowicz fit) of (scene+bloom)*exposure. The
+     old softKnee is kept as a one-line fallback. Output is display-linear;
+     the *_SRGB swapchain applies the OETF.
+  4. FXAA — console-variant edge AA on the tonemapped image, primary blend
+     only (the secondary rgbB min/max-reject refinement was dropped —
+     measurable cost, marginal gain). Skipped on water/sky.
+  5. CAS — FidelityFX RCAS-shape contrast-adaptive sharpen (p4.x).
+     Skipped on water/sky.
+  6. Cartoon outline (config cartoonShading, p4.w) — darkens toward black
+     where uDepth jumps sharply against its 4 neighbours; runs on
+     everything, sky included (a roofline against sky is exactly the
+     silhouette a cel look wants). See "Cartoon shading" above.
+  7. Screen tint — a full-frame colour wash while the player stands in a
      damaging liquid (engine.hwLiquidTint: lava orange + a slow heat
-     wobble, nukage green, blood red), applied after tonemap, before the
-     HUD so the overlay stays true-colour.
-  7. Composite the crisp LDR overlay, then a +/-1 LSB triangular-PDF dither
+     wobble, nukage green, blood red), after tonemap, before the HUD so the
+     overlay stays true-colour.
+  8. Composite the crisp LDR overlay, then a +/-1 LSB triangular-PDF dither
      to kill 8-bit gradient/fog banding.
-The blit push constant is 8 vec4 (128 B, the guaranteed maxPushConstantsSize
-floor): camera basis (SSR/SSAO/GR/shadow reconstruction), sun direction,
-per-stage strengths, the dynamic-shadow params (count/strength/march/bias),
-and the screen tint. The blit descriptor set also binds the world UBO
-(binding 4) for the shadow loop's light positions. Tuning consts live in
+The blit push constant is 6 vec4 (96 B): p0..p2 the camera basis (SSR
+reconstruction), p3 (w, h, ssrStrength, godrayStrength), p4 (sharpen,
+dither, ·, cartoonOutlineStrength), p5 the screen tint. The now-vestigial
+p6 (dyn-shadow params) and the aoStrength / sunDir / aoRadius fields went
+with those effects into worldambient.frag; worldblit no longer binds the
+world UBO at all. Tuning consts live in worldambient.go +
 recordWorldCommandBuffer; ShadowCasterN + tint come from worldgeo.Camera
-each frame. So a coloured torch tints and
-glows with a moving glint over the wall relief, a muzzle flash blooms and
-casts shadows, corners sink into soft shade, things sit in contact-shadow
-blobs, a doorway onto the sky throws light shafts, and wading into lava
-washes the screen orange.
+each frame. So a coloured torch tints and glows with a moving glint over
+the wall relief, a muzzle flash blooms and casts shadows, corners sink into
+soft shade, things sit in contact-shadow blobs, a doorway onto the sky
+throws light shafts, and wading into lava washes the screen orange.
 Per frame: world.vert/frag render into a per-in-flight-slot offscreen
 RGBA16F HDR colour image (+ a D32 depth buffer, now StoreOp-Store so the
 blit can sample it for water SSR) at render resolution, then worldblit.frag
@@ -910,7 +1092,12 @@ model into a static vertex-coloured cube-face mesh (cached per model as a
 device-local VBO), drawn by a dedicated voxel.vert/frag pipeline inside the
 world pass, depth-sorted, per-instance transform+shading in a push
 constant; a thing without a model in the pack stays a billboard. Ground
-shadows aren't in this path yet.
+shadows aren't in this path yet. renderer.WarmVoxels meshes the whole pack
+up front so no first-sight stall hits the loop — BuildVoxelMesh is a pure
+per-model function, so the CPU meshing runs on a GOMAXPROCS worker pool
+(buffer creation + the one staging upload stay on the caller); on an E1M2
+load with voxels that cut the mesh step ~5.7s -> 1.9s. cmd/isoengine's iso
+path instead meshes lazily on first sight (section 23).
 bsp.SubsectorPolygons (the flat outlines) clips a map box by every ancestor
 partition + seg front line, then hulls with the exact seg endpoints —
 236/237 E1M1 subsectors get a flat. If NewWorld fails to stand up,
@@ -1152,20 +1339,40 @@ Quake 1 texture pack (config's quake1Textures, off by default). A Quake map
 uses none of Doom's texture names, so a Quake pack can't just be dropped in
 the way a DHTP-style Doom pack can — the two games' art has to be paired up
 by hand. tools/importquake does that conversion offline: it reads a curated
-Doom-lump -> Quake-file table (tools/importquake/mapping.txt, ~420 rows over
-the DOOM1 + Doom II set), pulls each named .tga out of the pack
-(assets/import/Quake1_Textures.pk3), decodes it (a small 24/32-bit,
-raw-or-RLE Targa reader — tools/importquake/tga.go), optionally caps the
-long edge (default 1024, Catmull-Rom), and writes it as
-assets/textures/quake1/walls|flats/<DOOM_LUMP>.png. That is a fourth
-override directory, indexed by indexQuakeWalls/indexQuakeFlats exactly like
-the hi-res set. WallTexture/Flat consult it ONLY when SetQuake1Textures(true)
+Doom-lump -> Quake-file table (tools/importquake/mapping.txt, ~426 rows over
+the full vanilla DOOM1 + Doom II wall + flat set), pulls each named .tga
+out of the pack (assets/import/Quake1_Textures.pk3), decodes it (a small
+24/32-bit, raw-or-RLE Targa reader — tools/importquake/tga.go), optionally
+caps the long edge (default 1024, Catmull-Rom), and writes it as
+assets/textures/quake1/walls|flats/<DOOM_LUMP>.png. Notably the GATE1..4
+teleporter-pad flats map to the pack's swirling teleport-vortex textures
+(#RTeleport15 / #teleport0), so a pad's animation cycle reads as a pulsing
+sci-fi effect rather than a flat colour swap. That is a fourth override
+directory, indexed by indexQuakeWalls/indexQuakeFlats exactly like the
+hi-res set. WallTexture/Flat consult it ONLY when SetQuake1Textures(true)
 has been called (cmd/engine passes config's quake1Textures), and then it
 wins over the assets/textures/walls|flats hi-res PNG for any name the table
 covers; every other name is untouched, so the pack layers on top of the
 existing hi-res set rather than replacing it. The importer never writes into
 assets/textures/walls|flats, and .gitignore excludes both /assets/import/
 (the raw pack) and /assets/textures/ (the converted output).
+
+Heretic HD texture pack (assets/textures/heretic/, Heretic sessions only —
+section 24). A community Heretic HD/PBR pack ships its base-colour PNGs
+already named by Heretic lump name (a Doomsday jHeretic tree), so unlike the
+Quake pack it needs no pairing table. tools/importhereticpbr reads the .pk3
+and routes Data/jHeretic/Textures/*.png -> assets/textures/heretic/walls/,
+Data/jHeretic/Flats/*.png -> .../flats/ (a byte copy; -max downscales via
+Catmull-Rom and re-encodes). It ignores the PBR maps (normal / specular /
+metallic / roughness / displacement / AO — this renderer has no use for
+them), the 32-frame liquid animations (never referenced by name), and
+SKY1..3 (raster/sky.go's job). Textures.SetHeretic(true) — cmd/engine calls
+it when w.IsHeretic() — makes WallTexture/Flat consult hereticWalls/
+hereticFlats AHEAD of the Quake pack, the generic hi-res set and the WAD;
+the directory is separate precisely because the pack's Doom-name collisions
+(SW1OFF, DOORSTON, ...) must not touch a Doom session. loadHiresOverride
+derives each file's density from pngWidth/def.Width as usual. Names the pack
+doesn't cover fall straight through to heretic.wad's own composed texture.
 
 HD weapon viewmodels (assets/weapons/*.pk3, assets/weapons.go): a separate
 override just for the first-person weapon sprites, because the interesting
@@ -1203,15 +1410,23 @@ units.
 GLFW-backed (ClientAPI = NoAPI, since Vulkan owns the GPU). window.Window
 is the engine's only dependency on GLFW — every other package talks to this
 package's small API, so a future non-GLFW backend is a reimplementation of
-this one file. window.PickWADFile (picker.go) resolves the WAD before any
-window or renderer exists: an explicit path wins first — $TPF_WAD or a
-*.wad command-line argument, which is what makes the engine usable headless
-or from a script — otherwise it opens the OS's native file-open dialog via
-the unexported pickWAD, filtered to *.wad. pickWAD is the one build-tagged
-seam: picker_dialog.go (windows || darwin) uses github.com/sqweek/dialog
-(Win32 GetOpenFileName / Cocoa NSOpenPanel); picker_unix.go (everything
-else) shells out to zenity/qarma/matedialog/kdialog, deliberately keeping
-Linux off a compile-time GTK dependency. See section 21.
+this one file. window.WADFromCommandLine returns an explicit WAD path —
+$TPF_WAD or a *.wad command-line argument — which is what makes the engine
+usable headless or from a script and bypasses the launcher entirely
+(section 2). window.PickWADFile (picker.go) is the OS's native file-open
+dialog, filtered to *.wad — now the "Browse..." button inside the launcher
+(section 22) rather than the first thing at startup. pickWAD is the one
+build-tagged seam: picker_dialog.go (windows || darwin) uses
+github.com/sqweek/dialog (Win32 GetOpenFileName / Cocoa NSOpenPanel);
+picker_unix.go (everything else) shells out to
+zenity/qarma/matedialog/kdialog, deliberately keeping Linux off a
+compile-time GTK dependency. See section 21.
+window.NewFixed(w, h, title) is window.New's sibling for the launcher: a
+fixed-size (non-fullscreen, non-resizable) window with a GLFW lifecycle
+that survives being created and destroyed before the game's own window,
+which window.New alone did not. window.MenuKey* / MenuKeyDown / TakeTyped
+Raw are the launcher's text-editing and navigation key plumbing (section
+22), unused by the game itself.
 window.PickMap(maps, def) is the companion for the start-level choice when
 there's no console, one build-tagged file per OS: zenity --list /
 kdialog --menu on Unix (picker_unix.go; needs $DISPLAY / $WAYLAND_DISPLAY),
@@ -1276,7 +1491,14 @@ soundDuration reads a cached lump's length in seconds.
 audio.MusicPlayer streams a decoded MUS event stream to a MIDI synth,
 looping indefinitely. The MUS timing loop and the wait-for-the-previous-
 goroutine track-switch discipline are shared (musicloop.go, all
-platforms); each backend supplies only send/silence/reset. FluidSynth is
+platforms); each backend supplies only send/silence/reset.
+MusicPlayer.SetVolume(v) (audio.go, all platforms) sets the config
+musicVolume knob: it scales mixer.musicVol on top of the TPF_MUSIC_GAIN
+master, so it only affects a synth rendered THROUGH the mixer (FluidSynth,
+Linux and Windows) — a no-op on the winmm fallback and the stub player.
+cmd/engine / cmd/isoengine call it once, with cfg.MusicVolume, when they
+start a session's music; the value rides the shared mixer across launcher
+trips. FluidSynth is
 driven in PULL mode on both Linux and Windows — it opens no audio device
 of its own; the mixer calls fluid_synth_write_s16 from its output callback
 and sums the block with the effects, the way PrBoom renders its MIDI
@@ -1300,8 +1522,13 @@ Switching tracks or calling Stop waits for the previous playback goroutine
 to exit (a done channel) and then drops the mixer's render hook under the
 mixer lock, so the synth is never torn down while the audio thread or a
 goroutine might still be using it. The music is driven entirely from
-cmd/engine (playLevelMusic on load, OnLevelChange on a transition); the
-engine core holds no music handle.
+cmd/engine (audio.PlayLevelMusic on load, OnLevelChange / OnMusicChange on a
+transition); the engine core holds no music handle. audio.Setup builds the
+device + player ONCE per process, outside the launcher<->session loop
+(section 2), so a session opened with config music:false silences the
+previous session's track with Play(nil) — a documented no-op-events restart
+that halts and all-notes-offs the current track without touching the
+backend — rather than Stop(), which is a one-way teardown.
 
 
 14. PACKAGE engine — GAME LOOP & CORE SYSTEMS
@@ -1334,7 +1561,33 @@ Registered in NewGame, order load-bearing:
                   idmusXY, idchoppers, idmypos (cheats.go). A testing aid,
                   always on, no config gate; every hit logs "engine: cheat:".
                   No-op without a window (tests).
+  flashlightSystem  toggles the head-mounted flashlight on F (edge-
+                  triggered) and, in the vanilla path, drives its flat
+                  raster.ExtraLight brightness bump (flashlight.go). A no-op
+                  when config flashlight is false or there is no window. See
+                  "Flashlight" below.
 The sector effects those spawn are advanced on the 35 Hz tic, not here.
+
+An alternate front end (cmd/isoengine, section 23) keeps this whole system
+list but replaces slots 0 and 1 in place — game.ReplaceMovementSystem(engine
+.IsoMovementSystem{}) and game.ReplaceUseSystem(engine.IsoUseSystem{}) — so
+thrust is screen-relative to a top-down camera azimuth and "use" is a
+proximity search rather than a facing ray, while everything downstream
+(combat, cheats, flashlight, the 35 Hz sim) is untouched. That front end
+also drives the loop itself (Game.AdvanceSimulation per frame in
+game.Run's place), so ordering among the systems still holds.
+
+Flashlight (engine/flashlight.go). F is a persistent on/off toggle (no
+battery drain). In the enhanced and hardware tiers it is a real forward
+spot cone — Game.flashlightSpot builds a flashlightSpotLight each render
+from the live camera (with a sub-degree handheld sway and a subtle
+battery-flicker on flickerWobble), carried in render.Frame / worldgeo
+.Camera's Spot* fields and lit by light.frag / world.frag (SpotIntensity
+<= 0 = off). Its radius (1400 u) deliberately outreaches the muzzle flash
+so a monster reads as lit and detailed well before point-blank. In the
+vanilla path, which has no per-pixel dynamic lights, it is instead a flat
+raster.ExtraLight += 2 — id's own "extralight" lever, a uniform
+brightening with no beam shape.
 
 engine.Game owns the Window, the render.Renderer, the raster.Renderer, the
 loaded WAD/Level/BSP tree, the Camera, player movement state
@@ -1600,7 +1853,14 @@ calls killPlayer; pKillMobj bumps killCount. Missiles fly in mobjTick
 wall/opening/thing hit, dealing (P_Random%8+1)*damage; pRadiusAttack does
 the barrel/rocket blast. Every other (non-missile, non-charging) thing
 gets mobjZClip in the same mobjTick: its Z is re-seated on its current
-sector's floor, so a lift or crusher carries the things standing in it.
+sector's floor, so a lift or crusher carries the things standing in it —
+and when a ceiling has closed past a thing's head, crushMobj grinds it
+(id's PIT_ChangeSector crush branch): a live MF_SHOOTABLE thing takes 10
+damage every 4 tics with a blood spurt (so a crusher kills a monster, pops
+a barrel), and a corpse still under the ceiling flattens once to a smear
+(height 0, MF_SOLID cleared) then stops. Non-shootable décor is just shoved
+down. The player is exempt here — its crush is the always-lethal
+checkPlayerCrush below.
 The player's bullet weapons trace through pLineAttack with a light
 auto-aim. Randomness is a seeded PRNG stand-in for id's rndtable (no demo
 compatibility; engine/random.go).
@@ -1656,7 +1916,15 @@ non-repeatable ("1") special; changeSwitchTexture flips SW1<->SW2 in the
 live sidedef (the wall pass renders it flat, section 20) and schedules the
 flip-back for a repeatable switch. checkCrossedSpecials fires walkover
 lines the player steps over; a hitscan that hits a wall fires its gun
-special.
+special. evTeleport (specials 39/97/125/126) moves the mobj to the sector's
+MT_TELEPORTMAN and sets Mobj.TeleportFreeze = teleportFreezeTics (18, ~1/2
+s); while it's positive evTeleport refuses to move that mobj again, so a
+landing pad walled in by teleport lines can't fire you straight back before
+you walk clear — long enough to step off a cramped pad, short enough not to
+block a deliberate back-to-back chain. A monster's freeze counts down in
+mobjTick; the PLAYER's mobj isn't in g.mobjs, so runTic's player-sync block
+decrements it there — without that it stuck at 18 and a WR pad only ever
+worked once.
 spawnSpecials starts the always-on light thinkers and counts secret
 sectors; playerInSpecialSector applies damage floors (5/7/16/4/11) and
 secret discovery (9) each tic. Level exits (11/51/52/124 -> exitLevel)
@@ -1794,7 +2062,7 @@ the vanilla path ignores every render.Light. Two kinds:
   keys kept in Entry.Raw, a bad value reported but parsing continues) —
   turns it into name->*Entry. Wired: `levelname` (Game.levelDisplayName, the
   debug-HUD line + the "entered" log), `music` (Game.MapMusicLump, tried
-  first by cmd/engine's playLevelMusic), `skytexture` (Game.ApplyMapInfo ->
+  first by cmd/engine's audio.PlayLevelMusic call), `skytexture` (Game.ApplyMapInfo ->
   raster.SetSkyName + worldgeo.Builder.SetSkyName; an external skybox
   panorama still wins), `next` / `nextsecret` / `endgame` (nextMapName
   consults them before the ExMy/MAPxx default progression; a target not in
@@ -1882,10 +2150,24 @@ playWeaponSound / playWorldSound call, never set in a real run.
   Left mouse button     fire (held = auto-repeat at the weapon's own rate)
   E                     use (open/activate the nearest door/switch in range;
                         on the death screen, restart the level)
-  Space                 jump (from the ground; apex clears a ~24u step)
-  F1                    cycle the HUD: doom status bar -> Quake II HUD -> off
-  Esc                   close the game window; the process then pauses so
-                        the debug console stays readable when it owns it
+  F                     toggle the head-mounted flashlight (config
+                        flashlight, section 14)
+  Space                 jump (from the ground; apex clears a ~24u step);
+                        rise, while a Heretic Wings of Wrath is active
+  Enter, [ , ]          Heretic only: use / cycle the selected inventory
+                        artifact (section 24)
+  F1                    cycle the HUD: (Heretic) status bar -> Quake II HUD -> off
+  Esc                   end the session -> back to the launcher (section 2);
+                        the process pauses on exit if it owns the console
+
+cmd/isoengine (section 23) rebinds a few of these for the top-down view:
+WASD is screen-relative to the camera azimuth (not the player's facing);
+the mouse aims (the player faces and fires toward the cursor's ground
+point, with a crosshair snap onto a nearby target); E "uses" the nearest
+special line by proximity rather than a facing ray; Left/Right arrows
+rotate the camera (or step the 8 fixed angles), the right mouse button
+drags to rotate, the wheel zooms, and Tab toggles free-orbit vs. fixed-
+angle. Jump (Space) and the flashlight (F) are unchanged.
 
 
 16. KNOWN LIMITATIONS
@@ -1949,12 +2231,26 @@ built:
     on the GPU, which section 18 keeps off it). The optional ground-shadow
     blob (config groundShadows, default off) is a floor-only contact
     darkening, not a cast shadow. The shader loops up to activeLightBudget
-    (28) lights per pixel; a very torch-dense room still spends real GPU
+    (40) lights per pixel; a very torch-dense room still spends real GPU
     time. bloomStrength/threshold are fixed constants in lit.go
-    (lightScale, exposure, shadows, groundShadows are config).
+    (lightScale, ambientLight, exposure, shadows, groundShadows,
+    cartoonShading are config).
   - The COLORMAP lump is not read — its effect is reproduced in RGB
-    (section 8). ExtraLight (weapon-flash room brightening) has a wired
-    hook but nothing sets it in the vanilla path.
+    (section 8). The only thing that raises vanilla-path ExtraLight today is
+    the flashlight (section 14); a weapon-flash room-brightening hook is
+    wired but unused.
+  - cmd/isoengine (section 23) has no intermission flow of its own, reuses
+    cmd/engine's HUD styles as-is, uploads voxel meshes lazily (a brief
+    first-sight hitch, unlike cmd/engine's warm-up), and draws no ground
+    shadows. It shares every other engine limitation in this list.
+  - Heretic (section 24) is a full playable game — the monster roster (Doom
+    AI reused) incl. the three bosses, the eight weapons + Tome-of-Power
+    powered modes + six ammo types, the ten inventory artifacts (Enter
+    uses, [ / ] cycle), the status bar, wind sectors, decorations, keyed
+    doors, sky, liquids, sounds, music, voxels. Not modelled: a chicken-
+    morph PLAYER state, the bosses' signature moves (whirlwind / charge /
+    two-phase), the episode-end story screens; ghost monsters read as dim
+    rather than fuzzed.
   - Plasma Rifle / BFG9000 sprite and sound lump names are transcribed
     from documentation — the shareware IWAD has no Plasma/BFG assets to
     verify against. A few death/attack-chain tic counts are
@@ -1990,7 +2286,15 @@ writes one (config.DefaultJSON: Default() marshalled with every key; a
 test asserts it stays in sync with the struct). When a file IS loaded but
 missing keys, Load logs exactly which options are falling back to defaults
 and points at genconfig, so a newly-added option is visible rather than
-silent. The full key list:
+silent.
+
+The pre-game launcher (section 22) is the normal way to edit this file:
+every key below is one row of its settings panel, and Play writes the
+result with config.SaveMerge — a key-preserving merge that rewrites only
+the keys the launcher manages, leaving comments and any unknown keys in an
+existing config.json intact. launcher/fields.go is the launcher's table of
+these keys; a test asserts it covers every Config field, the same guard
+tools/genconfig has. The full key list:
 
   resolution     FULL-SCREEN render size — "540p" (960x540), "600p"
                  (800x600), "720p" (1280x720, default), "900p" (1600x900),
@@ -2033,8 +2337,11 @@ silent. The full key list:
                  "aniso2x/4x/8x/16x" = trilinear + up to N taps along the
                  footprint's major axis, so a wall/floor at a grazing
                  angle stays sharp. The filtered modes are CPU work in the
-                 span inner loops — ~5x the frame cost at "trilinear",
-                 ~8x at "aniso8x"/"aniso16x" (1080p) — so it is opt-in.
+                 span inner loops — roughly 3x the world-render cost at
+                 "trilinear" and 5x at "aniso16x" (1440p, after the
+                 fixed-point bilerp rework — texfilter.go's bilerpLevel is
+                 still ~half of a filtered frame) — so it is opt-in and
+                 punishing at high resolutions on the Software renderer.
                  Unknown -> "nearest". A spriteFilter / voxelFilter key in
                  config.json is warned about and ignored.
   lightingMode   "enhanced" (default) = the CPU emits a G-buffer and the
@@ -2055,6 +2362,16 @@ silent. The full key list:
   lightScale     multiplies every sector's light level before shading,
                  both pipelines; clamped [0.1, 2.0], default 0.75 (moodier
                  than vanilla Doom). 1.0 = the WAD's authored brightness.
+  ambientLight   brightness-FLOOR gain for the enhanced + hardware
+                 pipelines: after lightScale and every dynamic light are
+                 summed, a wall/flat/sprite never reads darker than
+                 ambientLight * that sector's OWN authored brightness,
+                 undiminished by camera distance — so a monster across a
+                 lit room stays legible instead of fading toward black,
+                 while a monster in a genuinely dark sector still needs a
+                 real light (torch, muzzle flash, the flashlight). Clamped
+                 [0, 1], default 0.2. 0 reproduces the old crush-to-black
+                 in every sector. Ignored by the vanilla pipeline.
   exposure       final multiply on the enhanced HDR colour before the
                  tonemap; clamped [0.1, 4.0], default 1.0. Ignored by the
                  vanilla pipeline.
@@ -2068,6 +2385,16 @@ silent. The full key list:
                  Grounds sprites/voxels but reads as a plain dark ellipse
                  up close, hence off unless you set it true. An explicit
                  true survives.
+  cartoonShading false (default) = the HARDWARE renderer only: world.frag's
+                 fade() posterizes its 0..1 brightness into cartoonLight
+                 Bands (4) flat steps instead of a smooth gradient, and
+                 worldblit.frag's post chain darkens pixels where the depth
+                 buffer jumps sharply — a silhouette, a corner, geometry
+                 against the sky — toward black (cartoonOutlineStrength
+                 0.85). Both are fixed constants in render/vulkan/world.go,
+                 not sub-knobs. The software vanilla/enhanced pipelines
+                 ignore it. In the launcher it sits in the top bar next to
+                 the WAD/level pickers, not the scrolling list.
   fogColor       distance-fog colour, hex "RRGGBB" (a leading '#' is
                  allowed). Empty (default) = no fog. An unparseable value
                  logs and disables fog.
@@ -2084,10 +2411,17 @@ silent. The full key list:
                  consulted when the picked WAD has no PLAYPAL of its own;
                  ignored for a standalone IWAD. Whitespace-trimmed.
   map            map marker to start on ("E1M5", "MAP07", ...),
-                 case-insensitive. Empty (default) = show the stdin map
-                 menu for a multi-map WAD, else the conventional first
-                 level. A name not in the loaded WAD is ignored with a
-                 warning. Whitespace-trimmed.
+                 case-insensitive. Empty (default) = the launcher's level
+                 dropdown (or, on the headless path, the stdin map menu for
+                 a multi-map WAD), else the conventional first level. A name
+                 not in the loaded WAD is ignored with a warning. The
+                 launcher rewrites this on Play; whitespace-trimmed.
+  wadPath        the last WAD chosen in the launcher — an absolute or
+                 launcher-relative path, written by config.SaveMerge on
+                 Play. Empty (default) = "ask". The launcher pre-selects it
+                 if the file still exists, so re-launching drops you back
+                 where you left off. Nothing outside the launcher reads it:
+                 $TPF_WAD and a *.wad argument still win (section 2).
 
   Input (consumed by Game via NewGame(cfg) -> handleMovement):
   invertMouseY      flip vertical mouse-look. Default false.
@@ -2103,6 +2437,20 @@ silent. The full key list:
   switchWeaponOnPickup  true (default) = picking up a weapon you didn't
                         own switches to it (id's behaviour); false = keep
                         the current weapon up and just add the new one.
+  switchWeapons         false (default). true = swap the two games'
+                        arsenals: a Doom WAD is played with Heretic's
+                        weapons, a Heretic WAD with Doom's (section 24).
+                        The pickup THINGS grant by slot so they adapt; the
+                        other game's weapon/projectile/puff sprites and
+                        fire sounds are pulled from its IWAD if one is
+                        found next to the WAD being played (same search as
+                        a PWAD's base IWAD — wad.OtherGameIWAD). Missing
+                        that IWAD, the arsenal still swaps, the new guns
+                        just draw/sound blank.
+  flashlight            true (default) = the F-key head-mounted flashlight
+                        is available (a forward spot cone in enhanced /
+                        hardware, a flat brightness bump in vanilla —
+                        section 14). false disables the F toggle entirely.
   skill                 which map THINGS spawn: 1-2 easy, 3 normal, 4-5
                         hard. Clamped [1, 5], default 3. Spawn counts only
                         — no ITYTD half-damage / Nightmare fast+respawn.
@@ -2113,6 +2461,22 @@ silent. The full key list:
                         (door/crusher/rising floor) ignores it and is
                         always lethal. Clamped [1, 100000].
   music                 true (default) = load and play each level's track.
+                        The launcher has no checkbox for it: the Music
+                        Volume slider is the on/off, and launcher.Run sets
+                        this = (musicVolume > 0) on Play. Still the engine's
+                        real gate, and a hand-edited config.json may set it
+                        directly.
+  musicVolume           loudness multiplier for the background music,
+                        relative to the SFX. 1.0 (default) is the mixer's
+                        normal music level; 0.5 halves it, 2.0 doubles it.
+                        Clamped [0, 2] — a literal 0 means "unset" and falls
+                        back to 1.0, so to actually silence music set music
+                        false (the launcher slider at 0 does exactly that)
+                        or use e.g. 0.02 for near-silent. No effect with
+                        music off, or on the winmm fallback synth (which
+                        plays on its own output, not the mixer). Applied via
+                        MusicPlayer.SetVolume -> mixer.musicVol, which
+                        persists across launcher trips.
   weaponVolume          loudness multiplier for weapon sounds (every gun's
                         fire/reload noise and the chainsaw idle whir),
                         relative to the rest of the SFX. 1.0 (default) is
@@ -2235,11 +2599,15 @@ mostly goes, by design (section 1). What is done about that:
     1440p in enhanced mode is several times the per-pixel cost of 720p —
     the resolution/renderScale knobs are the answer if the frame rate is
     low.
-  - config textureQuality gates the ONLY per-pixel float sampling in the
-    wall/flat path. "nearest" (the default) keeps the integer nearest
-    loop above; "trilinear" adds a mip chain + bilinear (~5x the frame
-    cost at 1080p), "aniso8x"/"16x" add up to N trilinear taps along the
-    footprint's major axis (~8x). The tap count self-limits: a face-on
+  - config textureQuality gates the heaviest sampling in the wall/flat
+    path. "nearest" (the default) keeps the integer nearest loop above;
+    "trilinear" adds a mip chain + bilinear (~3x the world-render cost),
+    "aniso8x"/"16x" add up to N mip taps along the footprint's major axis
+    (~5x at 1440p). bilerpLevel works in fixed point (8-bit weights,
+    integer MAC, one float convert) and skips the alpha channel on an
+    all-opaque texture; it is still ~half of a filtered frame, so at high
+    resolution the resolution/renderScale lever above matters more. The
+    tap count self-limits: a face-on
     surface's footprint is isotropic, so it collapses back to one
     trilinear tap — only genuinely oblique walls/floors pay the full
     price. Mip chains are built lazily, once, per texture (worldMipsCache).
@@ -2251,6 +2619,20 @@ pass; the enhanced light shader loops up to activeLightBudget lights per
 pixel with an inverse-square-distance cull (no per-light sqrt), and the CPU
 frustum-culls the light list before upload; and the staging memcpy of the
 four big G-buffer planes is fanned across goroutines.
+
+The hardware (GPU-geometry) path has its own three levers (section 9):
+static-geometry visibility culling (worldgeo/visgrid.go — the colour pass
+skips a static Draw whose real bounding box fails a per-frame camera-vs-FOV
+test, and shares more textures back-to-back for fewer descriptor rebinds);
+NOT re-Invalidate()ing the whole static vertex buffer on a mid-glide frame
+whose interpolated sector height rounds to the same int16 as last frame
+(renderedSectorHeightsChanged — it was forcing a full-level walk + a
+blocking GPU re-upload every frame a door moved); and moving SSAO's disc
+gather and the god-ray march off full-res pixels into one quarter-res
+worldambient.frag pass (1/16 the pixel count, plus a 3x3 AO denoise).
+engine/game.go + iso_render.go log a per-stage (sim / build / draw) smoothed
+frame-timing line alongside the visibility stats so the next stall is
+locatable.
 
 The CPU rasterizer's ARCHITECTURE is meant to be CPU-heavy — that is the
 point (section 1). Parallelising it across cores is fair game; moving the
@@ -2290,10 +2672,11 @@ GPU.
     quarter-coverage reads ~63 not a dark halo, bilinear hits texel
     centres and clamps to edge, trilinear blends level 0 and the
     coarsest). World texture filtering (texfilter.go: texMips alpha-
-    weighted box-halve, wrap-addressed bilinear, anisotropic taps average
-    across the major axis and collapse to trilinear when isotropic, every
-    textureQuality renders the test map without panic and byte-identical
-    serial vs. parallel at aniso8x). The lighting model (monotonic in distance and sector light,
+    weighted box-halve, fixed-point wrap-addressed bilerp with a fast
+    log2 for the LOD, anisotropic taps average across the major axis and
+    collapse to trilinear when isotropic, every textureQuality renders the
+    test map without panic and byte-identical serial vs. parallel at
+    aniso8x). The lighting model (monotonic in distance and sector light,
     full-bright / row-31 bounds, cells pinned against PrBoom's scalelight
     & zlight, fake-contrast direction, sprite/psprite shading). The
     enhanced G-buffer (SetGBuffer allocates the planes, a real render
@@ -2318,10 +2701,29 @@ GPU.
     above-monitor cap), that an explicit bool false survives, findFrom
     locating a repo-root config.json from bin\ / a deep subdir, and
     DefaultJSON carrying a key for every Config field (reflection over the
-    json tags) and round-tripping back to Default().
+    json tags) and round-tripping back to Default(). SaveMerge (the
+    launcher's writer, save_test.go): rewrites managed values while keeping
+    an existing file's comments and unknown keys, appends a key the file
+    was missing, and writes a full config when there's no file yet.
   - render: the world-position reconstruction the enhanced shader does
     from depth round-trips against raster's forward projection, and
     MaxLights stays in lockstep with the shader's fixed lights[] array.
+  - render/worldgeo: IsoViewProj at zero elevation degenerates to
+    ViewProj's own (right, up, forward) basis; IsoUnprojectToGround round-
+    trips against IsoProjectToScreen; IsoTrueElevation actually tilts the
+    view downward (camera_iso_test.go). Visibility culling (visgrid_test
+    .go): cellVisible passes a camera inside a cell and a cell in front but
+    not one behind; UpdateVisibility culls against a draw's real vertex
+    bounds, not its grid cell's nominal square (the 7c09f19 regression);
+    its stats counters and the StaticDrawVisible array agree.
+  - launcher: the fields table covers every Config field bar the documented
+    exclusions (fields_test.go — the guard against a new Config field
+    silently missing the settings screen), every dropdown option's label is
+    distinct from its raw config keyword, labelFor finds a label and falls
+    back to the raw value, and each field's accessor closure is wired to
+    the right *Config member. The dropdown widget keeps rows full-height
+    past dropdownMaxRows and scrolls, doesn't scroll a short list, and
+    scroll reveals later options (ui_test.go).
   - render/vulkan: every embedded .spv is non-empty, 4-byte-aligned and
     starts with the SPIR-V magic.
   - engine: the Super Shotgun (pickup grants the weapon + shells and
@@ -2350,7 +2752,11 @@ GPU.
     yaw ignores it; pitch stays clamped; NewGame propagates every config
     knob). The chainsaw viewmodel + audio (C/D idle vibration, A/B firing
     grind, every other weapon idling on 'A' and silent, the DSSAWIDL whir
-    looping only while ready). The player fall arc (constants match id's
+    looping only while ready). Weapon bob (weapons_test.go — X scales with
+    moveSpeedFrac and stays within weaponBobMaxX, bobPhase's rate tracks
+    movement speed, Y rises twice per sway cycle and never dips below rest,
+    the size swing is largest at the sway's centre and smallest at its
+    extremes). The player fall arc (constants match id's
     GRAVITY/kick/hard-landing, leaving a ledge arms the -GRAVITY*2 kick
     without moving that frame, a runner clears ~2x a walker's ground, the
     ledge boost only fires above running speed and preserves direction).
@@ -2428,6 +2834,27 @@ GPU.
     tests: stand the player on every shareware item and confirm it
     collects; walk Doom II MAP01 start -> exit with real collision and
     assert no frame renders as mostly black void.
+    Heretic (heretic_test.go, skipped without wad/heretic.wad):
+    wad.IsHeretic() true; E1M1 spawns the yellow key + the right Heretic
+    decorations (SRTC/WTRH/SKH*) via spriteOverride; the special-34 keyed
+    door refuses to open, then opens with the yellow key held (a raising
+    vldoor on its sector); special 99 is inert on use and starts scroller
+    thinkers instead; the Heretic voxel pack loads (>=50 frames, the
+    4-letter key sprites AKYY/BKYY/CKYY resolve via the whole-sprite
+    fallback). Monsters: E1M1 spawns several with the monster flag set and
+    a wired synthesized MobjInfo; a full sim run doesn't panic; a golem
+    dropped next to the player chases, enters its melee phase and claws
+    them; a monster under fire takes pain then ends a non-shootable corpse
+    with killCount bumped; a 700-tic all-woken sim of ten maps (incl. the
+    three boss levels) stays panic-free with no stuck FSM state. Weapons /
+    artifacts: the Heretic start loadout + ammo caps, applyHereticWeapons
+    reshaping the table (and resetWeaponTables NOT leaking it into a
+    following Doom session), the crossbow's 3-bolt spread, a Quartz Flask
+    healing 25, Tome/Wings setting their powers, Morph Ovum chickening a
+    monster, and the Tome making the Wand a 5-shot fan + the Firemace a
+    big-radius death ball. heretic_screenshot_test.go (opt-in
+    HERETIC_SHOT=1) renders geometry + things + monsters + weapon + the
+    Heretic status bar to PNGs.
 
 The GPU present path and the real input/window loop are not unit-tested.
 The engine tests need cgo to build, since the package imports window/audio.
@@ -2443,16 +2870,22 @@ layout). They're gitignored — a derivative of id's sprites with their own
 terms. Absent, or `voxels false` in config.json, the game just uses
 sprites.
 
-Loading. cmd/engine picks Doom2_Voxel.pk3 when the start map is a Doom II
-MAPxx, else Doom1_Voxel.pk3, and calls assets.LoadVoxelPackDir — which
-finds the assets/voxel directory next to the working directory or the exe
-and reads the .pk3 (a zip):
-  - VOXELDEF.txt (assets/voxeldef.go) — one line per frame,
-    `<sprite><frame> = "<basename>" [{ AngleOffset = N  Scale = f }]`, e.g.
-    `trooa = "trooa" {}` maps sprite TROO frame A to voxels/trooa.kvx.
-    C-style /* */ blocks (the pack's disabled projectile entries) and //
-    line comments are stripped first. The D2 pack keeps everything under
-    filter/doom.id.doom2/; path.Base collapses that away.
+Loading. cmd/engine picks reikallhereticvoxels.pk3 for a Heretic IWAD
+(section 24), Doom2_Voxel.pk3 when the start map is a Doom II MAPxx, else
+Doom1_Voxel.pk3, and calls assets.LoadVoxelPackDir — which finds the
+assets/voxel directory next to the working directory or the exe and reads
+the .pk3 (a zip):
+  - VOXELDEF (assets/voxeldef.go) — the def lump, named either "VOXELDEF.txt"
+    (the Doom packs) or "VOXELDEF" (reikall's Heretic pack). One entry per
+    line, `<sprite><frame> = "<basename>" [{ AngleOffset = N  Scale = f }]`,
+    e.g. `trooa = "trooa" {}` maps sprite TROO frame A to voxels/trooa.kvx.
+    A bare 4-letter key (`akyy = "akyy"`) means "every frame of that sprite"
+    — stored as "<sprite>*" and picked up by VoxelSet.Model's whole-sprite
+    fallback (Heretic keys / some artifact pickups). `spin` /
+    `overridepalette` / `pivot` and other unknown props are ignored. C-style
+    /* */ blocks (disabled entries) and // line comments are stripped first.
+    The D2 pack keeps everything under filter/doom.id.doom2/; path.Base
+    collapses that away.
   - KVX (assets/kvx.go, decodeKVX) — Ken Silverman's voxel format: an
     int32 mip-0 length, then that mip (xsiz/ysiz/zsiz, xpivot/ypivot/zpivot
     in 8.8 fixed point, an int32 xoffset[xsiz+1] table, an int16
@@ -2575,8 +3008,9 @@ THE OS-SPECIFIC FILES — the entire list a porter recreates
      cgo path there and purego only on Linux. A macOS port adds
      midi_darwin.go (AudioToolbox, or its own FluidSynth path) with the same
      symbols. Nothing outside package audio references the platform files
-     directly — cmd/engine drives it through the exported type
-     (playLevelMusic / OnLevelChange).
+     directly — cmd/engine drives it through the exported surface
+     (audio.Setup / audio.PlayLevelMusic / MusicPlayer.Stop, Game.OnLevel
+     Change).
   2. The audio effect path is NOT build-tagged any more: audio.go +
      mixer.go are the one PrBoom-style software mixer for every platform
      (single 48 kHz S16 stereo oto stream, fixed voice pool, oldest-wins
@@ -2654,3 +3088,627 @@ STILL A NO-OP AFTER A BARE PORT (until file 1 above is done)
   (macOS/BSD — section 16). Windows and Linux have music. Everything else
   — rendering, input, sound effects, the file picker, the full game loop —
   works on first build.
+
+
+22. PACKAGE launcher — THE PRE-GAME MENU
+---------------------------------------
+The screen shown before any game window opens: pick a WAD and a level, edit
+every config.json setting, then Play. cmd/engine and cmd/isoengine both run
+it in a loop with a play session (section 2); Quit (or closing its window)
+is the only exit.
+
+Decoupled from Doom by design (theme.go's package doc): no WAD assets, no
+game fonts or palette — one public-domain 7x13 bitmap font (basicfont,
+canvas.go), flat rectangles, a dark neutral slate palette (the `theme`
+table, one place to re-skin). It reuses the engine's own presentation
+stack, nothing new: a fixed 900x700 window (window.NewFixed) and a plain
+vulkan.New(win, w, h, vsync=true, debug=false, lit=false) blit renderer —
+"present this RGBA8 CPU buffer", the same vanilla path lightingMode
+"vanilla" uses — which is exactly what launcher.Canvas produces. Both are
+torn down before the game's window stands up.
+
+  launcher.Run(config.Load()) (run.go)
+    - opens the window + blit renderer, builds Canvas / UI / Poller / Model
+    - each frame: win.PollEvents -> Poller.Poll (one Input snapshot) ->
+      ui.Begin -> Draw(ui, m) (screen.go — the whole UI in one function)
+      -> ui.End (the open dropdown's overlay list, drawn last) ->
+      renderer.DrawFrame(canvas.Img.Pix)
+    - a "Browse..." click sets Model.BrowseRequested; run.go pops the
+      native window.PickWADFile AFTER presenting that frame (a blocking OS
+      dialog, not mid-draw)
+    - loop exits on Model.Done (Play / Quit / window close). On Play:
+      Cfg.Map / Cfg.WADPath are set and config.SaveMerge(Cfg, config
+      .ResolvePath()) writes config.json, then Run returns a launcher
+      .Result{WAD, WADPath, MapName, Config} and ok=true. Quit / close ->
+      ok=false, Result zero, config.json untouched.
+
+Model (model.go) is the whole live session state — one instance, one
+goroutine, no locks. NewModel seeds it from the passed-in config; if
+config's wadPath still resolves, PickWAD pre-loads it so re-launching drops
+you back where you left off. PickWAD calls wad.LoadWithIWAD (parse + PWAD
+merge, section 2), fills Maps, and picks a default level (the current one if
+the new WAD still has it, else wad.PreferredStartMap). A failed pick leaves
+any previous selection intact and only sets Model.Status.
+
+UI (ui.go) is a small immediate-mode widget kit: Button, Checkbox, Slider /
+IntSlider, Options (a dropdown whose option list is deferred and drawn on
+top of everything by UI.End; scrolls past dropdownMaxRows = 8), TextField,
+IntField, plus Hint (a one-line hover tooltip: queued by a row after its
+widget draws, drawn on top by UI.End just before the dropdown overlay).
+An open dropdown's overlay list also swallows the pointer: hover() returns
+false for any widget while the mouse is inside ui.deferred.list, so a click
+on an option can't also toggle the row it visually covers (the Renderer
+list's first option sits exactly on the Lighting Mode box).
+Cross-frame state (which field has focus and its cursor, which dropdown is
+open and its scroll, an in-progress IntField draft) lives in id-keyed maps,
+so the ~38-row settings table needs no matching struct fields. Canvas
+(canvas.go) is the CPU RGBA target: Fill / FillRect / StrokeRect / Text,
+with a Clip stack (the settings panel clips to its viewport; font.Drawer
+writes through a clippedRGBA wrapper).
+
+Poller (input.go) turns window.Window's held-key/button state into per-
+frame edges plus key-repeat (keyRepeatDelay 0.4 s, then keyRepeatRate
+0.03 s) for text editing — a held Backspace must keep deleting, unlike the
+game's "held W = keep walking". It reads window.MenuKey* (arrows,
+Backspace/Delete/Home/End/Enter/Tab) and TakeTypedRaw (raw chars, no
+game-key filtering). These MenuKey / raw-typed hooks are the launcher's
+only additions to package window.
+
+fields.go is the settings table: one `field` per config.Config key — an id,
+a label, a one-line `hint` (its hover tooltip), a Section (which tab it
+groups under), a widget `kind`, and a typed accessor closure straight into
+a *config.Config (no reflection). fields_test.go asserts the table plus a
+short explicit exclusion list (Map -> the top-bar level dropdown;
+CartoonShading -> a top-bar checkbox; WADPath -> set programmatically;
+ShowStatusBar -> the deprecated shim SaveMerge never writes; Music -> no
+checkbox, the Music Volume slider is its on/off and run.go sets Music =
+musicVolume > 0 on Play, with NewModel showing the slider at 0 when music
+was off) accounts for every field on Config, so a field added later can't
+silently go missing —
+the same guard tools/genconfig's DefaultJSON has; other tests assert every
+field has a hint and every Section has a tabTitles entry. The dropdown
+option lists (resolutionOptions, textureQualityOptions, ...) pair
+config.go's own accepted keyword constants with human labels, so the table
+can't offer a value repaired() would reject.
+
+screen.go: a fixed top bar (title, up to maxQuickChips = 5 WAD quick-pick
+chips from launcher.ListWADs — every *.wad beside the assets.FindDir("wad")
+directory — plus Browse..., the selected-WAD line, the Level dropdown, and
+the Cartoon Shading checkbox), then the settings panel — a tab strip
+(drawTabStrip: one button per Section, tabTitles for the short labels,
+Model.ActiveTab the current one, switching resets the scroll) over just the
+active tab's rows (layoutTab is the ONE layout computation, run once with
+draw==nil to measure content height for scroll clamping and once to draw,
+so the two can't drift; most tabs fit without scrolling). Hovering a row
+shows its fields.go hint via ui.Hint. Then a bottom bar (Status line, Quit,
+Play). Enter anywhere = Play unless a text field was focused when the frame
+began (it consumes its own Enter to commit the edit); Play / Enter both go
+through tryPlay's WAD+map validation.
+
+
+23. cmd/isoengine — ISOMETRIC TOP-DOWN MODE
+------------------------------------------
+A standalone second executable: the exact same engine.Game simulation
+(physics, collision, monster AI, sector specials, combat, pickups, the
+35 Hz tic) rendered as a Vulkan-hardware top-down isometric view, with a
+mouse-aim control scheme. It is not a mode switch inside cmd/engine — a
+separate main() that shares the launcher and the play-session shape
+(section 2/4) and nothing renders the first-person view.
+
+Entry (main.go). `-camera orbit|fixed` picks the initial camera mode. run()
+is cmd/engine's run() mirrored: audio.Setup once, then loop launcher.Run
+(unmodified — some settings it edits, FOV / mouse sensitivity, are
+first-person-only and simply unread here) and playSession; Escape / window
+close returns to the launcher. TPF_WAD / a *.wad arg takes runHeadless.
+
+playSession wiring on top of a normal engine.NewGame:
+  - game.HardwareMode = true; game.WorldBuilder = worldgeo.New(...) with
+    SkipCeilings = true (a top-down camera would only ever see ceiling
+    undersides); OnLevelChange re-applies SkipCeilings + Invalidate after
+    engine/level.go rebuilds the builder for the next map.
+  - game.ReplaceMovementSystem(engine.IsoMovementSystem{}) and
+    game.ReplaceUseSystem(engine.IsoUseSystem{}) (section 14) — slots 0/1
+    swapped in place, every other System unchanged.
+  - the loop calls game.AdvanceSimulation(dt) itself (in game.Run's place),
+    then game.SyncIsoWorldGeometry() (iso_render.go — the rebuild-static-
+    geometry-on-change + sector-height-interpolation check renderFrame does
+    for the hardware path, since this loop bypasses renderFrame), builds
+    worldgeo geometry, collects this frame's sprites/voxels
+    (game.CollectIsoWorldObjects — collectWorldObjects with sprite rotation
+    taken from the camera azimuth via a virtual distant viewpoint, no
+    "behind the view plane" cull since an orthographic camera has no
+    behind), appends the player's own PLAY billboard (built here — the
+    player mobj is never in Game.mobjs, section 14), draws the HUD onto
+    raster's overlay plane (game.DrawHUD, config hudStyle / F1 the same as
+    cmd/engine), and calls renderer.DrawIso(geo, cam, overlay, reveal).
+
+Input each frame: WASD thrust is screen-relative to the camera azimuth
+(Game.IsoCameraAzimuth), NOT the player's facing. The player faces and
+fires toward the mouse: worldgeo.IsoUnprojectToGround gives the cursor's
+ground point (Game.IsoAimX/Y), and nearestAimTarget snaps that onto a live
+shootable mobj whose projected screen position (worldgeo.IsoProjectToScreen
+over game.AimTargetPositions()) lands within aimSnapRadius = 40 px, so a
+shot the crosshair is visually on connects (Game.IsoAimLocked, read by
+weapons.go's spread). IsoMovementSystem also mirrors Camera.Angle onto
+playerMobj.Angle every frame (not just per tic) so aim-then-click is exact.
+IsoUseSystem activates the nearest special line within useRange by
+proximity — a facing ray would point at whatever the mouse aims at, not the
+switch the player walked up to.
+
+Camera (camera.go, cameraController). A worldgeo.IsoCamera (camera_iso.go):
+an orthographic camera looking at (TargetX/Y/Z — overwritten every frame to
+follow the player) from Azimuth, tilted down by Elevation, with Zoom the
+view half-height in map units. Elevation is pinned at IsoTrueElevation
+(atan(1/sqrt2), the classic 2:1 isometric angle) for the controller's whole
+life — it never tilts, only rotates and zooms. "orbit" mode: Left/Right
+arrows rotate, right-mouse-drag rotates (left is fire), wheel zooms.
+"fixed" mode: Left/Right step the 8 fixed 45-degree azimuths (Doom's own
+sprite-rotation resolution). Tab toggles the two. IsoViewProj builds the
+column-major mat4 (real 3D rotation, no pitch-shear hack — the camera is
+genuinely tilted); IsoBasis is shared by the projection and the
+screen->world unproject so they can't disagree.
+
+GPU path (render/vulkan/isosetup.go + isoworld.go). vulkan.NewIso reuses
+the shared instance/device/swapchain bootstrap, then builds its OWN
+fixed-size offscreen colour+depth scene target, per-texture descriptor
+cache, world + voxel pipelines (iso.vert/frag, isovoxel.vert/frag), and a
+present stage that blits the scene to the swapchain letterboxed — its own
+pool/sampler/pipeline rather than sharing worldResources', since hw and iso
+are mutually exclusive per Renderer. DrawIso pushes IsoViewProj + a fixed
+directional "sun" for shape + an ambient floor + the target size + a
+player-occlusion fade radius as push constants. Seeing things behind walls
+has three layers, all limited to the player's vicinity so a busy map's far
+rooms stay clean:
+  - Occluded-silhouette pass. After the normal sprite + voxel draws,
+    recordIsoCommandBuffer re-draws just the moving things (never walls)
+    with pipeSpriteReveal / pipeVoxelReveal — clones of the normal
+    pipelines with GREATER depth compare, no depth write, alpha blend — so
+    any monster/item/barrel a wall or a higher floor is hiding still shows
+    as a flat ISO_REVEAL_TINT (warm gold) ghost. iso.frag gates it to
+    within IsoRevealScreenRadius px of screen centre (fading over the outer
+    third); recordIsoVoxels does the same by the model's projected NDC
+    distance. IsoRevealAlpha = 0 disables the whole pass.
+  - Wall shimmer. The Reveal UBO (up to maxIsoReveal = 64 screen positions,
+    now built player-proximity-filtered in cmd/isoengine —
+    isoRevealWorldRadius) still drives a dithered partial-discard of a wall
+    between the camera and each nearby thing, but at a tight
+    IsoRevealHaloRadius and a gentle cap — a "something's here" hint, not
+    the peephole it used to punch.
+  - playerFade: the original wider, up-to-35% dither around screen centre
+    so a near wall never hides where the player is.
+Voxel meshes upload lazily on first sight (syncIsoVoxelMeshes) rather than
+warmed up front. Ground shadows and the enhanced software lighting chain
+are not in this path.
+
+
+24. HERETIC SUPPORT
+------------------
+Raven's Heretic (1994) shipped on this same 1993 engine, so its WADs load
+and play on top of Doom / Doom II with a compatibility layer (engine/
+heretic*.go, raster/heretichud.go, wad.WAD.IsHeretic). What is shared
+unchanged: the map format, BSP, the renderer, and — because Heretic
+inherited id's linedef table 1..98 verbatim — almost every line/sector
+special. Ported: the full monster roster (data-driven, reusing the Doom
+AI), all decorations, keyed doors, Heretic's eight weapons + six ammo
+types, the ten inventory artifacts, the status bar, the sky, animated
+liquids, sounds, music, and the voxel pack. Heretic is a playable game
+here — what's NOT modelled is the Tome-of-Power *powered* weapon modes, a
+real chicken-morph player state, and the wind/scrolling-current sectors.
+
+Detection (wad.WAD.IsHeretic): the WAD carries a "MUS_E1M1" music lump
+(Heretic's per-map prefix; Doom never uses MUS_) AND the Heretic-only menu
+graphic M_HTIC. cmd/engine uses it to pick the voxel pack; the engine sets
+Game.heretic, which switches on everything below.
+
+  Things (engine/heretic.go's hereticThings, keyed by GZDoom's Heretic
+  DoomEdNums). Heretic's doomednums mostly collide with different Doom
+  things — doomednum 10 is a bloody corpse in Doom but Wand Crystal ammo in
+  Heretic, 66 is a Revenant vs. a Gargoyle, 73 is a hanging torso vs. the
+  green key — so spawnMapThings, when g.heretic, resolves a THING through
+  the Heretic table FIRST and only falls through to doomedNumToType for
+  what it doesn't cover (Heretic monsters, the 2001-2005 weapon slots).
+  Each Heretic thing spawns as one MT_HERETIC mobj (a single shared
+  template + spawn state S_HERETIC) with its sprite carried in
+  Mobj.spriteOverride (Heretic sprites aren't in Doom's spriteNames table)
+  and its box/flags set per-entry; mobjSpriteName resolves override-or-Doom
+  at every render site. overrideFrames>1 gives a torch / brazier /
+  chandelier a stateless sprite-cycle in mobjTick. Covered: the 3 keys
+  (functional — see below), all ammo (mapped to a Doom ammo type),
+  health/shield artifacts (mapped to a Doom heal / armour / power), the
+  inert artifacts (egg, tome, wings, timebomb — collectible so they don't
+  litter the floor but with no effect), and every static decoration
+  (skull-hangs, serpent/wall torches, braziers, pillars, stalag*ites,
+  moss, pods, the volcano, hanging corpses, key gizmos).
+
+  Keys & doors. Heretic's keyed manual doors use the same special numbers
+  as Doom (26/27/28 DR, 32/33/34 D1) with the same key groupings, so the
+  only fix needed is that the Heretic key THINGS (doomednums 79/80/73 ->
+  CKYY/AKYY/BKYY, granting Keys[0]/[1]/[2] via giveHeretic) actually spawn
+  and can be picked up — before, they didn't, so every keyed door in the
+  game was unopenable. Heretic's special 99 is NOT Doom's "SR blue-key
+  blazing door": it is a passive scrolling wall texture (waterfalls /
+  lavafalls), on one-sided untagged walls. Doom's activateLine would have
+  flung every untagged sector open the instant the player pressed Space
+  near one; for g.heretic, activateLine treats 99 as a no-op and
+  spawnSpecials registers it as a wall scroller (like 48/85).
+
+  Sky (engine.hereticSkyTexture, applied in ApplyMapInfo). Heretic ships
+  only SKY1..SKY3 and picks by episode differently from Doom's SKY1..SKY4
+  (E1->SKY1, E2->SKY2, E3->SKY3, E4/E5/E6 reuse SKY1/SKY3/SKY3); without
+  this E4+ asked for a nonexistent SKY4 and drew the missing-texture
+  checkerboard. raster.SetPreferWADSky(true) also makes the CPU path ignore
+  the external Mars panorama for Heretic, and Textures.DropHiresOverrides
+  ("SKY1".."SKY3") removes the generated Doom sky PNGs (whose names collide),
+  so Heretic's own fantasy skies show.
+
+  HD textures (assets/textures/heretic/, section 11). cmd/engine's NewGame
+  calls Textures.SetHeretic(true) for a Heretic IWAD, so a community Heretic
+  HD pack imported by tools/importhereticpbr overrides every wall/flat it
+  covers, ahead of every other override. Separate dir = its Doom-name
+  collisions never reach a Doom session. Inert if the pack isn't installed.
+
+  Liquids & animation. classifyFloorLiquid / worldgeo.liquidKindOfFlat and
+  the builtinAnimDefs table gained Heretic's flat/texture families
+  (FLTWAWA/FLTFLWW water, FLTLAVA lava, FLTSLUD sludge, FLATHUH; WATRWAL /
+  LAVAFL walls) so Heretic liquids animate and get the water/lava shading.
+
+  Torch lights + flames (engine/heretic.go). Every Heretic decoration is one
+  MT_HERETIC mobj told apart only by spriteOverride, so the Doom decoLights
+  table (keyed by mobjType) can't reach them and Heretic torches emitted no
+  light. hereticDecoLights maps the sprite prefix — WTRH wall torch, SRTC
+  serpent torch, KFR1 fire brazier, CHDL chandelier, VLCO volcano — to a
+  warm fire-flicker decoLightDef PLUS a flameZ (the emitter sits up the wall
+  / on the stand, not at mo.Height*0.72); hereticDecoLight(mo) returns both,
+  and buildStaticLights falls back to it for an MT_HERETIC mobj decoLights
+  misses. E1M1 goes 18 -> 39 static emitters.
+
+  reikall's voxel models for these props are the bare bracket / dim ember —
+  the flame is a separate model (TFULA.kvx) its DECORATE spawns as a child,
+  which this engine doesn't run. LoadVoxelPack stashes TFULA under a
+  reserved key (VoxelSet.HereticTorchFlame); when a torch/brazier voxelizes,
+  the three world collectors (collectWorldObjects, drawMobjs,
+  CollectIsoWorldObjects) also emit that flame model on top via
+  Game.hereticFlameFor — FullBright, gently turning + bobbing, scaled and
+  lifted per prep type (hereticTorchFlames), seated at the host model's
+  visual top (baseZ + (ZPivot-0.5)*hostScale). The warm point light now sits
+  at the same height, so the wall around a torch takes an orange cast.
+  raster.SceneThing gained ModelScale (a multiplier over config voxelScale)
+  for the software path's flame.
+
+  Monsters (engine/heretic_actors.go — hereticMonsters, keyed by Heretic
+  DoomEdNum). Heretic mobjs behave like Doom's, so the ported Doom AI runs
+  UNCHANGED: each monster is a hereticActorDef with GZDoom-style animation
+  strings (parseHFrames) and a synthesized *MobjInfo whose SpawnState /
+  SeeState / MeleeState / ... point at the S_HERETIC_* sentinels.
+  setMobjState intercepts a sentinel and calls hSetPhase, so aLook /
+  aChase / pDamageMobj / pKillMobj drive the data-driven FSM
+  (hereticActorTick) transparently — aChase's "goto Melee" is just
+  setMobjState(mo, mo.Info.MeleeState). The Mobj carries hact / hPhase /
+  hFrameIdx / hFrameTic; mo.Tics is pinned -1 so the Doom state countdown
+  stays out of it. Missiles are MT_HERETIC mobjs with MF_MISSILE + a per-
+  shot hDamage (spawnHereticMissile / moveMissile); explodeMissile just
+  removes them (no impact animation yet). Covered: Gargoyle + Fire
+  Gargoyle, Golem + Ghost, Nitrogolem + Ghost, Undead Warrior + Ghost,
+  Weredragon, Ophidian, Sabreclaw, Disciple; the Iron Lich, Maulotaur and
+  D'Sparil are present but simplified (walk + one attack, big HP). Ghost
+  variants are the base def + MF_SHADOW. Sound lump names (mumsit, kgtat1,
+  ...) resolve case-insensitively against heretic.wad.
+
+  Sounds (engine/heretic.go's hereticSfx, applied in loadSound when
+  g.heretic). Every Doom "DS*" lump name the engine hard-codes (doors,
+  switches, lifts, teleporters, pickups, player pain/death, and the still-
+  Doom weapon fire) is remapped to Heretic's own prefix-less lump (DOROPN,
+  SWITCH, ITEMUP, PLRPAI, GLDHIT, ...), so nothing falls silent.
+
+  Music. audio.PlayLevelMusic tries "MUS_"+mapName alongside the Doom
+  candidates, so Heretic's MUS_ExMy tracks resolve.
+
+  Weapons (engine/heretic_weapons.go). PlayerStats.Ammo/MaxAmmo widened
+  from [4] to [numAmmoTypes]=6 (4 flame orbs, 5 mace spheres). NewGame
+  resetWeaponTables() restores a pristine Doom weapon set every session
+  (also fixing a latent DEH leak through the launcher loop), then
+  applyHereticWeapons() overwrites the 8 slots + weaponSlots in place:
+  Staff/Gauntlets (melee) on slot 1, Elven Wand 2, Ethereal Crossbow 3,
+  Dragon Claw 4, Hellstaff 5, Phoenix Rod 6, Firemace 7 — every non-melee
+  slot carries a Heretic ProjectileDef (hFXWand FX01, hFXCrossbow FX03,
+  hFXDragonClaw FX18, hFXHellstaff FX00, hFXPhoenix FX04+FX08, hFXMace
+  FX02; the crossbow's is a 3-bolt spread via ProjectileDef.Shots/
+  SpreadRad). The Wand deviates from vanilla on purpose: id's Gold Wand is
+  hitscan, but "PUFF" isn't a lump here so a hitscan spark read as nothing
+  leaving the wand — so it fires a real travelling FX01 bolt aimed straight
+  down the crosshair (spawnProjectile uses Camera yaw+pitch), glowing warm
+  via projectileLight's default. Fire mechanics reuse the Doom dispatch.
+  Tome of Power: while pwTome > 0, beginFire swaps in each weapon's
+  WeaponDef.Powered projectile (bigger, blast radius, the Firemace's one
+  huge FX02-E death ball; the Wand's hFXWandP is a 5-bolt fan), and the
+  Staff / Gauntlets hit ~2-4x with the Gauntlets leeching life.
+  hereticPlayerStats() is the fresh spawn (staff + wand + 50 crystals).
+
+  Weapon swap (config switchWeapons). NewGame reads cfg and picks the
+  arsenal independently of g.heretic: hereticArsenal = g.heretic XOR
+  switchWeapons. So a Doom level gets applyHereticWeapons() +
+  hereticPlayerStats(), and a Heretic level keeps the pristine Doom table
+  (resetWeaponTables already ran). Everything else keyed off g.heretic
+  (sky, HUD, monsters, the hereticSfx sound remap) is untouched — only the
+  guns change. The pickup THINGS grant by SLOT (giveWeapon(wpShotgun) etc.,
+  and giveHeretic's hgWp* cases), so a Heretic crossbow THING in a Doom-
+  weapon session hands you the Doom shotgun and vice versa with no extra
+  wiring — and engine/switchweapons.go re-skins those THINGS to match: when
+  g.swapWeapons, spawnMapThings calls swapDoomPickupSprite (a Doom
+  weapon/ammo/backpack pickup mobj -> the equivalent Heretic sprite via
+  weaponPickupSkins / ammoPickupSkins) and spawnHereticThing calls
+  swapHereticPickupSprite (keyed by the hereticGift). Only the sprite
+  changes (spriteOverride + the mobjTick frame cycler for the animated
+  ones); the mobj type, collision, and touch handler are as before.
+  Cross-game art/sound: cmd/engine finds the other IWAD (wad.OtherGameIWAD,
+  which factors iwadSearchDirs out of resolveIWAD) and calls
+  Textures.SetSpriteFallback — a sprite (or, via a lazily-built
+  fallbackSpriteIndex in SpriteFrame, a whole sprite prefix) the played WAD
+  lacks is pulled from that WAD and decoded through ITS palette, so a
+  Heretic gun in Doom stays gold — plus Game.AltWAD (loadSound's fallback
+  for a fire lump like BOWSHT / DSSHOTGN).
+
+  Hit sparks (melee only, now the Wand travels). pLineAttack takes an hpuff
+  sprite name: Doom uses MT_PUFF as authored, but "PUFF" / "BLUD" aren't
+  lumps in heretic.wad, so a Heretic MELEE weapon (the Staff / Gauntlets,
+  still hitscan-range) otherwise landed with no visible effect. spawnAttackPuff
+  re-skins MT_PUFF to a real Heretic puff — PUF3 (the staff spark), PUF1
+  (the green Gauntlets spark) — full-bright, cycling off hereticPuffFrames
+  then self-removing via hExpireIn; spawnAttackBlood does the same to give
+  MT_BLOOD Heretic's BLOD sprite. fireMelee passes PUF3 / PUF1.
+
+  Artifacts (engine/heretic_arti.go). PlayerStats gains Inventory[10] +
+  ArtiCurrent; the pickup routes an artifact THING to giveArtifact (stacks
+  to 16). artifactSystem (a registered System) edge-detects Enter = use,
+  [ / ] = cycle. Effects: Ring of Invincibility / Shadowsphere -> the Doom
+  powers; Quartz Flask / Mystic Urn -> heal; Tome of Power -> pwTome (the
+  powered weapon modes above, + a gold ExtraLight tint); Torch -> pwTorch (a
+  brighter ExtraLight bump); Wings of Wrath -> pwFlight (free vertical
+  movement in resolvePlayerZ); Time Bomb -> a fused pRadiusAttack
+  (Game.timeBombs, ticked in runTic); Morph Ovum -> chickenize the aimed-at
+  monster (swap its hact for the weak hChickenDef); Chaos Device ->
+  teleport to the player-1 start.
+
+  HUD (raster/heretichud.go). For a Heretic game g.drawHUD routes BOTH
+  in-game styles to a Heretic renderer: "doom" -> DrawHereticStatusBar
+  (BARBACK, the gargoyle end pieces, the health chain + sliding LIFEGEM, the
+  IN / SMALLIN number fonts for health / armour / ready ammo, the
+  YKEYICON/GKEYICON/BKEYICON key icons, the artifact box + selected
+  artifact icon + count from HUDStats.Arti / ArtiCount); "quake2" ->
+  DrawHereticQuakeHUD, the same minimal-corners idea as DrawQuakeHUD (big
+  health bottom-left, big ready ammo bottom-right, no status-bar chrome) but
+  with those Heretic lumps — health/armour in "IN", the six ammo pickup
+  sprites (hereticAmmoIcons), the shield icon, and the key column with the
+  selected artifact box stacked above it on the right edge (Quake II has no
+  inventory, and the bottom centre is the weapon's). Ghost monsters
+  (MF_SHADOW) are drawn at 1/3 sector light — no fuzz distortion, but they
+  read as shadowy.
+
+  Bosses (engine/heretic_actors.go). The Iron Lich / Maulotaur / D'Sparil
+  each carry a hereticActorDef.bossMissiles slice; the "boss" frame action
+  (hDoBossAttack) picks one at random per attack (or the melee if the
+  target is close), giving the Lich its ice-ball / slow-ball / fire-column,
+  the Maulotaur its hammer + fireball + floor-fire, and D'Sparil a
+  fast/slow fireball. Behaviour and HP only — the Lich's whirlwind, the
+  Maulotaur's charge, and D'Sparil's two-phase serpent-then-mage fight are
+  not modelled.
+
+  Wind (engine/specials.go hereticWindThrust). Heretic sector specials
+  20-39 (east/north/south/west, five strength slots each) add a per-tic
+  push to the player's velocity in playerInSpecialSector, airborne
+  included. Specials 40-51 (mobj-only wind) aren't modelled.
+
+  Monster-projectile impacts. explodeMissile freezes an MT_HERETIC missile
+  in place, swaps to its hMissileDef.deathSprite (defaulting to a short
+  replay of the flight sprite) and removes it after the animation
+  (Mobj.hExpireIn, decremented in mobjTick).
+
+  Voxels (config voxels). cmd/engine and cmd/isoengine pick
+  assets/voxel/reikallhereticvoxels.pk3 when w.IsHeretic(). Two loader
+  fixes were needed: the pack's def lump is named "VOXELDEF" (no ".txt"),
+  and it uses bare 4-letter sprite keys ("akyy" = every frame of AKYY) that
+  parseVoxeldef now accepts (stored as "<sprite>*", resolved by
+  VoxelSet.Model's whole-sprite fallback). ~60 sprite frames map directly
+  from its VOXELDEF; the rest of the pack's models are wired through its
+  DECORATE, which this engine doesn't parse, so LoadVoxelPack detects the
+  pack (its "akyy*" key) and hand-fills ~41 more sprite->KVX pairings
+  (hereticVoxelAlias — ammo crystals, braziers, torches, pillars,
+  stalag*ites, moss, chandeliers, key gizmos, hanging skulls, the six
+  weapon pickups). Combined VOXELDEF + aliases cover ~98 KVX models / 101
+  sprite frames. Anything still unmapped falls back to the (correct)
+  Heretic sprite. reikall's pack has NO monster models — every Heretic
+  monster stays a billboard sprite (this is the pack, not a bug); it
+  voxelizes items, ammo, keys, weapons, and decorations only.
+
+  Confirmed working on the hardware path: the GPU voxel pipeline
+  (render/vulkan/worldvoxel.go recordVoxels) draws every collected
+  instance — a live E1M1 frame is ~116 instances / 116 vkCmdDraw, all
+  cache-resident. Two one-shot log lines make it visible at a glance:
+  engine's "[hw] map objects this frame — N voxel instance(s), M sprite(s)"
+  (engine/game.go, mirrors drawMobjs' software-path line) and vulkan's
+  "voxel models — drew N of M instance(s) ... K model(s) resident".
+
+Not done: a real chicken-morph PLAYER state (single-player Heretic has no
+way to trigger one — the Morph Ovum chickens a monster instead); the
+bosses' signature moves (Lich whirlwind, Maulotaur charge, D'Sparil's
+two-phase fight); Heretic's MAPINFO / episode-end story screens; and the
+Tome-of-Power counter on the HUD. Also the DECORATE-only voxels the pack
+can't hand-alias, and monster voxels (the pack ships none).
+
+
+25. cmd/editor — THE LEVEL EDITOR
+----------------------------------
+A dual-view map editor: a 2D top-down view on the left, and the same CPU
+software rasterizer the game itself uses rendering the map live on the
+right, so an edit shows up in 3D immediately. See EDITOR_MANUAL.txt
+(repo root) for the user-facing how-to; this section is the shape of the
+code underneath it. A separate executable from cmd/engine — it shares no
+process state, only packages — built on a NEW immediate-mode UI kit
+(imkit/) rather than launcher/'s, since the editor's panels (a draggable
+splitter, tabs, a thumbnail grid, drag-and-drop, popup menus) go well
+beyond what the settings-screen kit offers; the two kits are siblings, not
+yet unified.
+
+editor.Run(wadPath, startNew, fullscreen) (app.go) owns the whole session:
+  - resolveWAD picks a WAD (the argument, or the first *.wad WITH AT LEAST
+    ONE MAP under wad/Game WADs/, wad/, or assets/, walked in that order —
+    skipping a map-less WAD, e.g. a pure texture pack, that would otherwise
+    load fine and then fail with "no maps"); LoadBank aggregates textures
+    (see below); NewDoc loads the WAD's first map, or NewEmptyDoc builds a
+    fresh one (-new / File > New Level — a real, immediately-playable
+    512x512 room + a player start, textured from whatever names the asset
+    set actually has, never a name that doesn't exist there).
+  - App.openWindow(fullscreen) creates the window (window.NewFixed at
+    1600x900, or window.New(0,0,title,true) — borderless, the monitor's
+    own mode, the exact mechanism cmd/engine's fullscreen uses) and its
+    vulkan.New blit renderer (section 9's vanilla path, same as the
+    launcher's own Canvas). F11 / View > Toggle Fullscreen calls it again
+    later — from App.pending, never mid-frame — tearing down the old
+    win+blit and creating new ones; imkit.Canvas.Resize keeps the SAME
+    *Canvas (so imkit.UI and every widget's cross-frame id-keyed state
+    survive the switch untouched), the 2D/3D split position rescales
+    proportionally to the new width, and the 3D view's raster.Renderer is
+    dropped so it reallocates at its new pane size. cmd/editor/main.go's
+    init() calls runtime.LockOSThread(), matching cmd/engine/
+    cmd/isoengine — every GLFW call has to stay on the thread that called
+    glfw.Init(), and editor is its own binary so it needs its own pin.
+  - The frame loop mirrors launcher.Run's shape: PollEvents -> Poller.Poll
+    -> ui.Begin -> App.frame (menu bar, the VSplit, the three panes, the
+    status bar) -> ui.End -> blit.DrawFrame(canvas.Img.Pix); a deferred
+    App.pending closure runs after present (Play, Save, New Level, the
+    fullscreen toggle — anything that shouldn't mutate state mid-draw);
+    Doc.RebuildIfDirty runs last, picking up any geometry edit made this
+    frame.
+
+Bank (assets.go) is the editor's merged asset set: wad.Merge across the
+WAD being edited plus every *.wad found (recursively) under the same three
+directories resolveWAD searches, one assets.Textures over the result, and
+the browsers' name lists — wad.WallTextureNames (TEXTURE1/2) and
+wad.FlatNames (between the F_START/FF_START.. _END markers, sub-section
+markers themselves excluded) — both new wad/enumerate.go additions, since
+the engine itself only ever resolves a texture by name, never lists them.
+WallThumb/FlatThumb cache a decoded *image.RGBA per name for the thumbnail
+grid.
+
+Doc (doc.go) is the map being edited: it mutates a *wad.Level's slices
+directly (Vertexes/Linedefs/Sidedefs/Sectors/Things — no separate edit
+model yet, see EDITOR_MANUAL.txt's Limitations), plus a `selection` (one
+map[int]bool per element kind). The 3D view never reads that Level
+directly — Doc.render is a SEPARATE wad.Level (a shallow copy with its own
+Vertexes/Segs/Subsectors) that Doc.rebuildTree fills from nodebuild.Build,
+so the node builder's own bookkeeping (the split-point vertices it has to
+add when a partition cuts a wall) can never leak into, or get clobbered by,
+the geometry you're actually editing — an earlier version appended those
+straight onto Level.Vertexes and trimmed them back off before every
+rebuild by a remembered count, which a future geometry edit would have
+silently invalidated. rebuildTree runs nodebuild.Build after any edit that
+calls Doc.markDirty (RebuildIfDirty is the once-a-frame, no-op-if-clean
+check); on failure it falls back to the WAD's own shipped NODES if the map
+still has them, else keeps the last good tree and records the error for
+the status bar and the 3D pane's placeholder text.
+
+nodebuild (package nodebuild, used only by the editor and its tests) is a
+classic recursive BSP builder producing the exact bsp.Node/InnerNode/Leaf +
+wad.Seg/Subsector types bsp.Build reads from a real NODES lump, so nothing
+downstream (the renderer, bsp.SubsectorPolygons, bsp.PointSector) can tell
+the difference. Each one/two-sided linedef becomes one or two segs; at each
+step the seg whose line best divides the remaining set (fewest splits,
+most balanced) becomes the partition, straddling segs are split at the
+exact float intersection (rounded to integer only when a vertex is finally
+emitted), and a set no seg's line can divide is a convex leaf. classify's
+on-partition epsilon is deliberately tiny (0.05 world units) — the build
+works in exact floats, so a genuine crossing is never that close, and a
+looser epsilon was found (via a 100%-vs-shipped-NODES point-in-sector test
+across 9 maps) to misread a shallow crossing as "entirely on one side" and
+drop that wall from the other subtree: a leak that silently merged two
+sectors' space into one convex cell. nodebuild.Reject is always all-zero
+(valid — no sight-check shortcut, not incorrect) and nodebuild.Blockmap
+walks each linedef in short steps marking every 128-unit cell it crosses;
+neither is held to matching what a particular vanilla builder or another
+port's own tool would produce (see EDITOR_MANUAL.txt's Limitations) — the
+target is this engine's own loader.
+
+view2d (view2d.go) is the left pane: pan (middle-drag) and zoom-to-cursor
+in world space (camX/camY/zoom map to screen through w2s/s2w), a grid whose
+line spacing self-hides once screen-thin, and four selection Modes
+(Vertices/Linedefs/Sectors/Things — number keys 1-4 or the toolbar) each
+with their own nearest-element hit test (nearestVert/nearestLine/
+nearestThing by screen-pixel distance; Sectors by bsp.PointSectorIndex on
+Doc.render). Selecting anything calls the onPick callback App.Run wires to
+view3d.FocusOn (below). The DRAW tool (G, or the toolbar button) collects
+grid/vertex-snapped clicks into a draft polyline (view2d.snap prefers an
+existing vertex within ~10 screen px, else the grid) and, on a click back
+near the first point, commitRoom turns it into a brand new sector: fresh
+vertices, one-sided linedefs all the way around, textured from the panel's
+current Walls/Flats selection. Doom's front sidedef is the RIGHT side of a
+linedef's start->end direction, so a one-sided room's walls face inward
+only if the loop winds clockwise in map space (y-up); commitRoom's
+polyArea check reverses the draft if it doesn't (this exact winding was
+backwards in an early version of both commitRoom and NewEmptyDoc — every
+wall backface-culled from inside the room it bounded, and the 3D view
+rendered solid black; TestCommitRoomFacesInward / TestNewEmptyDoc
+BuildsAndFacesInward in editor/doc_test.go check it the same way
+raster.renderSeg's own backface cull does, by cross product against the
+room's centre). Drag-and-drop (imkit.DragSource/DropTarget) is how a
+texture/flat/thing actually gets onto the map — see panel below;
+view2d.drawDropHover outlines the live drop target while a drag is in
+flight. A click on the pane's own
+top-left toolbar strip (y < rect.Y+34) is excluded from both selection and
+the draw tool, so choosing a mode or hitting DRAW can't also select or
+place a vertex on whatever geometry happens to sit under the button.
+
+view3d (view3d.go) owns a raster.Renderer sized to its pane (recreated
+whenever the pane resizes) and a free-fly raster.Camera: RMB-drag looks
+(WASD/Q/E move — see the key table below), always rendering
+Doc.RenderLevel() against Doc.tree, whatever it currently is.
+FocusOn(x, y, floorZ) — the 2D selection's "jump the 3D view there" — does
+not teleport: it computes a point back along the camera's existing bearing
+to the target (so it approaches from roughly where it already was, not
+through a wall on the far side), stores it as a glide{} target alongside
+the current pose as the start, and stepGlide eases position and angle to
+it over ~0.3s (smoothstep). Moving the camera yourself (WASD, or a
+right-drag look) cancels an in-progress glide.
+
+panel (panel.go, things.go) is the right-docked tabbed browser: Walls and
+Flats are both imkit.ThumbGrid over Bank's name lists with a filter box —
+clicking a thumbnail sets it as DRAW's current texture, dragging one onto
+a linedef (Walls) or into a sector (Flats, via Doc.SetLineTexture /
+SetSectorFlat) textures it directly. Things is a filtered, categorised
+list built from a hand-maintained thingDefs table (doomednum, name,
+category, sprite prefix — Doom/Doom II only so far, no engine.MobjInfo
+cross-check or Heretic types yet) whose rows are themselves drag sources
+(thingPayload{num}); dropping one calls Doc.AddThing at the snapped drop
+point. Info is a plain read-out of the map's element counts and the
+current selection size — no per-element inspector fields yet (heights,
+light, special/tag, angle — see EDITOR_MANUAL.txt's Limitations).
+
+Saving (save.go): Doc.SavePWAD runs nodebuild.Build fresh (independent of
+the live Doc.render used for preview) and writes a single-map PWAD via the
+new wad/write.go — EncodeVertexes/Linedefs/Sidedefs/Sectors/Things/Segs/
+Subsectors/Nodes (each the exact byte-for-byte inverse of wad/level.go's
+own decoders) plus wad.WritePWAD (header + directory + lump bytes) and
+wad.MapMarkerLumps (the marker + the 11-lump block in loader order).
+File > Save map as PWAD (Ctrl+S) writes "<wad>_<map>.wad" next to the
+source; File > Play this map (F5) does the same to a temp file and execs
+the engine binary on it (bin/linux_engine, bin/windows_engine.exe, or
+"engine" on PATH) so a level can be played without leaving the editor.
+
+Keys and controls:
+  1 / 2 / 3 / 4          2D mode: Vertices / Linedefs / Sectors / Things
+  G                      toggle the DRAW tool; Esc cancels a room in progress
+  left-click             (select mode) pick the nearest element, or clear;
+                        (draw mode) place a snapped point / close the loop
+  scroll wheel           2D: zoom to cursor.  panel: scroll the list
+  middle-drag            2D: pan
+  [ / ]                  halve / double the 2D grid spacing
+  Home                   frame the whole map in the 2D view
+  drag a thumbnail/row    onto a linedef (wall), a sector (flat), or
+                        anywhere on the map (a thing) to drop it there
+  RMB-drag (3D pane)     look around
+  W / A / S / D          3D: move forward / strafe-left / back / strafe-right
+  Q / E                  3D: move down / up
+  Shift (3D pane)        move faster
+  F11                    toggle fullscreen
+  Ctrl+N                 new level        Ctrl+R   reload the current map
+  Ctrl+S                 save as PWAD     F5       play this map
+  Ctrl+Q                 quit

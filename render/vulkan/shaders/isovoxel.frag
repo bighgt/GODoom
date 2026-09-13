@@ -16,8 +16,13 @@ layout(location = 0) out vec4 outColor;
 // the same way voxel.frag's PC is, so the two stages' blocks can't be
 // pruned to incompatible layouts).
 layout(push_constant) uniform PC {
-    layout(offset = 96) vec4 shade; // x = sector light 0..1, y = fullbright flag
+    // x = sector light 0..1, y = fullbright flag, z = occluded-silhouette
+    // alpha (> 0 => this is the GREATER-depth reveal pass; draw a flat
+    // ISO_REVEAL_TINT ghost at that alpha, matching iso.frag).
+    layout(offset = 96) vec4 shade;
 } pc;
+
+const vec3 ISO_REVEAL_TINT = vec3(1.0, 0.80, 0.38);
 
 // Keep == isoSunDir/isoSunStrength/isoAmbientFloor in isoworld.go — there's
 // no push-constant room left (96 vertex + 16 fragment already fills the
@@ -29,6 +34,10 @@ const float SUN_STRENGTH = 0.5;
 const float AMBIENT_FLOOR = 0.35;
 
 void main() {
+    if (pc.shade.z > 0.0) { // occluded-silhouette pass
+        outColor = vec4(ISO_REVEAL_TINT, pc.shade.z);
+        return;
+    }
     if (pc.shade.y > 0.5) {
         outColor = vec4(vColor * 1.35, 1.0); // emissive, matches iso.frag's sprite-full handling
         return;

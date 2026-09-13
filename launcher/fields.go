@@ -21,6 +21,7 @@ const (
 type field struct {
 	id      string
 	label   string
+	hint    string // one-line explanation, shown as a hover tooltip
 	section string
 	kind    kind
 
@@ -54,20 +55,34 @@ func choices(values []string) []choice {
 	return out
 }
 
-// Section names, in the order they're drawn.
+// Section names — one per settings tab, in tab order.
 const (
-	SectionDisplay    = "Display"
-	SectionRendering  = "Rendering & Lighting"
-	SectionAudio      = "Audio"
-	SectionInput      = "Input & Controls"
-	SectionGameplay   = "Gameplay"
-	SectionHUD        = "HUD & Crosshair"
-	SectionAdvanced   = "Advanced"
+	SectionDisplay   = "Display"
+	SectionRendering = "Rendering & Lighting"
+	SectionAudio     = "Audio"
+	SectionInput     = "Input & Controls"
+	SectionGameplay  = "Gameplay"
+	SectionHUD       = "HUD & Crosshair"
+	SectionAdvanced  = "Advanced"
 )
 
 var sectionOrder = []string{
 	SectionDisplay, SectionRendering, SectionAudio, SectionInput,
 	SectionGameplay, SectionHUD, SectionAdvanced,
+}
+
+// tabTitles is the short label each section shows on the tab strip — the
+// full Section* strings ("Rendering & Lighting", "HUD & Crosshair") are too
+// wide to fit seven tabs across the 900px panel. fields_test.go asserts
+// every section in sectionOrder has one.
+var tabTitles = map[string]string{
+	SectionDisplay:   "Display",
+	SectionRendering: "Graphics",
+	SectionAudio:     "Audio",
+	SectionInput:     "Controls",
+	SectionGameplay:  "Gameplay",
+	SectionHUD:       "HUD",
+	SectionAdvanced:  "Advanced",
 }
 
 // resolutionOptions/textureQualityOptions/... pair exactly config.go's own
@@ -129,102 +144,110 @@ var (
 //     superseded by HUDStyle; SaveMerge simply never touches that key.
 //   - WADPath: set programmatically when a WAD is picked (screen.go), not
 //     user-edited as its own row.
+//   - CartoonShading: a whole-scene visual-style switch, promoted to its
+//     own row in screen.go's top bar (next to the WAD/level pickers, where
+//     it's seen before scrolling past it) rather than the settings panel.
 //
-// fields_test.go asserts this list plus those three explicit exclusions
-// accounts for every field on config.Config, the same way config_test.go's
+// fields_test.go asserts this list plus those explicit exclusions accounts
+// for every field on config.Config, the same way config_test.go's
 // TestDefaultJSONIsComplete guards DefaultJSON — so a field added to Config
 // later can't silently go missing from the launcher too.
 var fields = []field{
 	// --- Display ---
-	{id: "resolution", label: "Resolution", section: SectionDisplay, kind: kindOptions,
+	{id: "resolution", label: "Resolution", hint: "Internal render resolution. Higher is sharper but costs performance.", section: SectionDisplay, kind: kindOptions,
 		stringAt: func(c *config.Config) *string { return &c.Resolution }, options: resolutionOptions},
-	{id: "renderScale", label: "Render Scale", section: SectionDisplay, kind: kindSlider,
+	{id: "renderScale", label: "Render Scale", hint: "Multiplier on the render resolution. Below 1.0 renders smaller then upscales for speed.", section: SectionDisplay, kind: kindSlider,
 		floatAt: func(c *config.Config) *float64 { return &c.RenderScale }, min: config.MinRenderScale, max: config.MaxRenderScale, format: "%.2f"},
-	{id: "windowed", label: "Windowed", section: SectionDisplay, kind: kindCheckbox,
+	{id: "windowed", label: "Windowed", hint: "Run in a resizable window instead of borderless fullscreen.", section: SectionDisplay, kind: kindCheckbox,
 		boolAt: func(c *config.Config) *bool { return &c.Windowed }},
-	{id: "windowWidth", label: "Window Width", section: SectionDisplay, kind: kindIntField,
+	{id: "windowWidth", label: "Window Width", hint: "Window width in pixels; also its render width (windowed mode only).", section: SectionDisplay, kind: kindIntField,
 		intAt: func(c *config.Config) *int { return &c.WindowWidth }},
-	{id: "windowHeight", label: "Window Height", section: SectionDisplay, kind: kindIntField,
+	{id: "windowHeight", label: "Window Height", hint: "Window height in pixels; also its render height (windowed mode only).", section: SectionDisplay, kind: kindIntField,
 		intAt: func(c *config.Config) *int { return &c.WindowHeight }},
-	{id: "fovDegrees", label: "Field of View", section: SectionDisplay, kind: kindSlider,
+	{id: "fovDegrees", label: "Field of View", hint: "Horizontal field of view in degrees. Wider shows more but distorts the edges.", section: SectionDisplay, kind: kindSlider,
 		floatAt: func(c *config.Config) *float64 { return &c.FOVDegrees }, min: config.MinFOV, max: config.MaxFOV, format: "%.0f°"},
-	{id: "vsync", label: "V-Sync", section: SectionDisplay, kind: kindCheckbox,
+	{id: "vsync", label: "V-Sync", hint: "Sync frame presentation to the monitor refresh to remove tearing.", section: SectionDisplay, kind: kindCheckbox,
 		boolAt: func(c *config.Config) *bool { return &c.VSync }},
-	{id: "maxFPS", label: "Max FPS (0=uncapped)", section: SectionDisplay, kind: kindIntField,
+	{id: "maxFPS", label: "Max FPS (0=uncapped)", hint: "Frame-rate cap. 0 leaves it uncapped.", section: SectionDisplay, kind: kindIntField,
 		intAt: func(c *config.Config) *int { return &c.MaxFPS }},
-	{id: "showDebugInfo", label: "Debug Overlay", section: SectionDisplay, kind: kindCheckbox,
+	{id: "showDebugInfo", label: "Debug Overlay", hint: "Show the on-screen debug overlay: FPS, player position and frame timings.", section: SectionDisplay, kind: kindCheckbox,
 		boolAt: func(c *config.Config) *bool { return &c.ShowDebugInfo }},
 
 	// --- Rendering & Lighting ---
-	{id: "renderer", label: "Renderer", section: SectionRendering, kind: kindOptions,
+	{id: "renderer", label: "Renderer", hint: "Software = classic CPU rasteriser. Hardware = GPU path with dynamic lights and effects.", section: SectionRendering, kind: kindOptions,
 		stringAt: func(c *config.Config) *string { return &c.Renderer }, options: rendererOptions},
-	{id: "lightingMode", label: "Lighting Mode", section: SectionRendering, kind: kindOptions,
+	{id: "lightingMode", label: "Lighting Mode", hint: "Enhanced adds dynamic lights and modern shading; Vanilla keeps the flat sector light.", section: SectionRendering, kind: kindOptions,
 		stringAt: func(c *config.Config) *string { return &c.LightingMode }, options: lightingModeOptions},
-	{id: "lightScale", label: "Light Scale", section: SectionRendering, kind: kindSlider,
+	{id: "lightScale", label: "Light Scale", hint: "Overall brightness of dynamic lights.", section: SectionRendering, kind: kindSlider,
 		floatAt: func(c *config.Config) *float64 { return &c.LightScale }, min: config.MinLightScale, max: config.MaxLightScale, format: "%.2f"},
-	{id: "ambientLight", label: "Ambient Light", section: SectionRendering, kind: kindSlider,
+	{id: "ambientLight", label: "Ambient Light", hint: "Minimum light level everywhere, so nothing falls to pure black.", section: SectionRendering, kind: kindSlider,
 		floatAt: func(c *config.Config) *float64 { return &c.AmbientLight }, min: config.MinAmbientLight, max: config.MaxAmbientLight, format: "%.2f"},
-	{id: "exposure", label: "Exposure", section: SectionRendering, kind: kindSlider,
+	{id: "exposure", label: "Exposure", hint: "Tone-mapping exposure for the hardware renderer. Higher is brighter.", section: SectionRendering, kind: kindSlider,
 		floatAt: func(c *config.Config) *float64 { return &c.Exposure }, min: config.MinExposure, max: config.MaxExposure, format: "%.2f"},
-	{id: "shadows", label: "Dynamic Shadows", section: SectionRendering, kind: kindCheckbox,
+	{id: "shadows", label: "Dynamic Shadows", hint: "Cast dynamic shadows from lights (hardware renderer).", section: SectionRendering, kind: kindCheckbox,
 		boolAt: func(c *config.Config) *bool { return &c.Shadows }},
-	{id: "groundShadows", label: "Ground Shadows", section: SectionRendering, kind: kindCheckbox,
+	{id: "groundShadows", label: "Ground Shadows", hint: "Draw a simple blob shadow beneath things and the player.", section: SectionRendering, kind: kindCheckbox,
 		boolAt: func(c *config.Config) *bool { return &c.GroundShadows }},
-	{id: "textureQuality", label: "Texture Quality", section: SectionRendering, kind: kindOptions,
+	{id: "textureQuality", label: "Texture Quality", hint: "Texture filtering. Anisotropic looks best but is heavy on the Software renderer; trilinear is a good balance.", section: SectionRendering, kind: kindOptions,
 		stringAt: func(c *config.Config) *string { return &c.TextureQuality }, options: textureQualityOptions},
-	{id: "voxels", label: "Voxel Models", section: SectionRendering, kind: kindCheckbox,
+	{id: "voxels", label: "Voxel Models", hint: "Render supported items and decorations as 3D voxel models instead of flat sprites.", section: SectionRendering, kind: kindCheckbox,
 		boolAt: func(c *config.Config) *bool { return &c.Voxels }},
-	{id: "voxelScale", label: "Voxel Scale", section: SectionRendering, kind: kindSlider,
+	{id: "voxelScale", label: "Voxel Scale", hint: "Size multiplier for voxel models.", section: SectionRendering, kind: kindSlider,
 		floatAt: func(c *config.Config) *float64 { return &c.VoxelScale }, min: config.MinVoxelScale, max: config.MaxVoxelScale, format: "%.2f"},
-	{id: "quake1Textures", label: "Quake 1 Texture Pack", section: SectionRendering, kind: kindCheckbox,
+	{id: "quake1Textures", label: "Quake 1 Texture Pack", hint: "Swap in the converted Quake 1 textures wherever a matching name exists.", section: SectionRendering, kind: kindCheckbox,
 		boolAt: func(c *config.Config) *bool { return &c.Quake1Textures }},
-	{id: "fogColor", label: "Fog Colour (hex RRGGBB)", section: SectionRendering, kind: kindTextField,
+	{id: "fogColor", label: "Fog Colour (hex RRGGBB)", hint: "Distance-fog colour as hex RRGGBB, e.g. 202830.", section: SectionRendering, kind: kindTextField,
 		stringAt: func(c *config.Config) *string { return &c.FogColor }},
-	{id: "fogDensity", label: "Fog Density", section: SectionRendering, kind: kindSlider,
+	{id: "fogDensity", label: "Fog Density", hint: "Thickness of distance fog. 0 disables it.", section: SectionRendering, kind: kindSlider,
 		floatAt: func(c *config.Config) *float64 { return &c.FogDensity }, min: 0, max: config.MaxFogDensity, format: "%.4f"},
 
 	// --- Audio ---
-	{id: "music", label: "Music", section: SectionAudio, kind: kindCheckbox,
-		boolAt: func(c *config.Config) *bool { return &c.Music }},
-	{id: "weaponVolume", label: "Weapon Volume", section: SectionAudio, kind: kindSlider,
+	// No "Music" checkbox: the slider IS the on/off — drag it to 0 and
+	// run.go turns cfg.Music off (NewModel shows the slider at 0 when it
+	// was). One control, not a checkbox plus a redundant volume.
+	{id: "musicVolume", label: "Music Volume", hint: "Level background music. Drag to 0 to turn music off.", section: SectionAudio, kind: kindSlider,
+		floatAt: func(c *config.Config) *float64 { return &c.MusicVolume }, min: config.MinMusicVolume, max: config.MaxMusicVolume, format: "%.2f"},
+	{id: "weaponVolume", label: "Weapon Volume", hint: "Volume of the player's own weapons.", section: SectionAudio, kind: kindSlider,
 		floatAt: func(c *config.Config) *float64 { return &c.WeaponVolume }, min: config.MinWeaponVolume, max: config.MaxWeaponVolume, format: "%.2f"},
-	{id: "worldVolume", label: "World Volume", section: SectionAudio, kind: kindSlider,
+	{id: "worldVolume", label: "World Volume", hint: "Volume of everything else: monsters, doors, pickups and ambience.", section: SectionAudio, kind: kindSlider,
 		floatAt: func(c *config.Config) *float64 { return &c.WorldVolume }, min: config.MinWorldVolume, max: config.MaxWorldVolume, format: "%.2f"},
 
 	// --- Input & Controls ---
-	{id: "invertMouseY", label: "Invert Mouse Y", section: SectionInput, kind: kindCheckbox,
+	{id: "invertMouseY", label: "Invert Mouse Y", hint: "Push the mouse forward to look down instead of up.", section: SectionInput, kind: kindCheckbox,
 		boolAt: func(c *config.Config) *bool { return &c.InvertMouseY }},
-	{id: "mouseSensitivity", label: "Mouse Sensitivity", section: SectionInput, kind: kindSlider,
+	{id: "mouseSensitivity", label: "Mouse Sensitivity", hint: "How far the view turns per unit of mouse movement.", section: SectionInput, kind: kindSlider,
 		floatAt: func(c *config.Config) *float64 { return &c.MouseSensitivity }, min: config.MinMouseSensitivity, max: config.MaxMouseSensitivity, format: "%.4f"},
-	{id: "turnSpeed", label: "Keyboard Turn Speed", section: SectionInput, kind: kindSlider,
+	{id: "turnSpeed", label: "Keyboard Turn Speed", hint: "How fast the arrow / turn keys rotate the view.", section: SectionInput, kind: kindSlider,
 		floatAt: func(c *config.Config) *float64 { return &c.TurnSpeed }, min: config.MinTurnSpeed, max: config.MaxTurnSpeed, format: "%.2f"},
-	{id: "alwaysRun", label: "Always Run", section: SectionInput, kind: kindCheckbox,
+	{id: "alwaysRun", label: "Always Run", hint: "Move at run speed without holding the run key.", section: SectionInput, kind: kindCheckbox,
 		boolAt: func(c *config.Config) *bool { return &c.AlwaysRun }},
 
 	// --- Gameplay ---
-	{id: "skill", label: "Skill", section: SectionGameplay, kind: kindIntSlider,
+	{id: "skill", label: "Skill", hint: "Difficulty 1 (easiest) to 5 (Nightmare): monster count, damage and respawns.", section: SectionGameplay, kind: kindIntSlider,
 		intAt: func(c *config.Config) *int { return &c.Skill }, min: config.MinSkill, max: config.MaxSkill, format: "%.0f"},
-	{id: "damageScale", label: "Damage Scale %", section: SectionGameplay, kind: kindIntField,
+	{id: "damageScale", label: "Damage Scale %", hint: "Percentage multiplier on damage the player takes. 100 is normal.", section: SectionGameplay, kind: kindIntField,
 		intAt: func(c *config.Config) *int { return &c.DamageScale }},
-	{id: "switchWeaponOnPickup", label: "Auto-Switch Weapon", section: SectionGameplay, kind: kindCheckbox,
+	{id: "switchWeaponOnPickup", label: "Auto-Switch Weapon", hint: "Automatically switch to a newly picked-up weapon.", section: SectionGameplay, kind: kindCheckbox,
 		boolAt: func(c *config.Config) *bool { return &c.SwitchWeaponOnPickup }},
-	{id: "flashlight", label: "Flashlight Enabled", section: SectionGameplay, kind: kindCheckbox,
+	{id: "switchWeapons", label: "Swap Doom/Heretic Weapons", hint: "Give Doom's arsenal in Heretic and Heretic's in Doom, including the on-map pickups.", section: SectionGameplay, kind: kindCheckbox,
+		boolAt: func(c *config.Config) *bool { return &c.SwitchWeapons }},
+	{id: "flashlight", label: "Flashlight Enabled", hint: "Enable the toggleable player flashlight.", section: SectionGameplay, kind: kindCheckbox,
 		boolAt: func(c *config.Config) *bool { return &c.Flashlight }},
 
 	// --- HUD & Crosshair ---
-	{id: "hudStyle", label: "HUD Style", section: SectionHUD, kind: kindOptions,
+	{id: "hudStyle", label: "HUD Style", hint: "Doom's full status bar, a minimal Quake II readout, or no HUD at all.", section: SectionHUD, kind: kindOptions,
 		stringAt: func(c *config.Config) *string { return &c.HUDStyle }, options: hudStyleOptions},
-	{id: "hudScale", label: "HUD Scale", section: SectionHUD, kind: kindSlider,
+	{id: "hudScale", label: "HUD Scale", hint: "Size of the HUD and status bar.", section: SectionHUD, kind: kindSlider,
 		floatAt: func(c *config.Config) *float64 { return &c.HUDScale }, min: config.MinHUDScale, max: config.MaxHUDScale, format: "%.2f"},
-	{id: "weaponScale", label: "Weapon Scale", section: SectionHUD, kind: kindSlider,
+	{id: "weaponScale", label: "Weapon Scale", hint: "Size of the first-person weapon sprite.", section: SectionHUD, kind: kindSlider,
 		floatAt: func(c *config.Config) *float64 { return &c.WeaponScale }, min: config.MinWeaponScale, max: config.MaxWeaponScale, format: "%.2f"},
-	{id: "crosshair", label: "Crosshair", section: SectionHUD, kind: kindOptions,
+	{id: "crosshair", label: "Crosshair", hint: "Crosshair shape, or off.", section: SectionHUD, kind: kindOptions,
 		stringAt: func(c *config.Config) *string { return &c.Crosshair }, options: crosshairOptions},
-	{id: "crosshairSize", label: "Crosshair Size", section: SectionHUD, kind: kindOptions,
+	{id: "crosshairSize", label: "Crosshair Size", hint: "Crosshair size.", section: SectionHUD, kind: kindOptions,
 		stringAt: func(c *config.Config) *string { return &c.CrosshairSize }, options: crosshairSizeOptions},
 
 	// --- Advanced ---
-	{id: "iwad", label: "IWAD Override Path", section: SectionAdvanced, kind: kindTextField,
+	{id: "iwad", label: "IWAD Override Path", hint: "Explicit path to the base IWAD to merge with a PWAD. Blank = auto-detect.", section: SectionAdvanced, kind: kindTextField,
 		stringAt: func(c *config.Config) *string { return &c.IWAD }},
 }
 

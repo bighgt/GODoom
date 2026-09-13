@@ -637,6 +637,10 @@ func (g *Game) spawnSpecials() {
 			g.thinkers = append(g.thinkers, &scroller{side: int(g.Level.Linedefs[i].FrontSidedef), dx: 1})
 		case 85: // scroll wall right
 			g.thinkers = append(g.thinkers, &scroller{side: int(g.Level.Linedefs[i].FrontSidedef), dx: -1})
+		case 99: // Heretic: passive scrolling wall texture (waterfalls / lavafalls)
+			if g.heretic {
+				g.thinkers = append(g.thinkers, &scroller{side: int(g.Level.Linedefs[i].FrontSidedef), dx: 1})
+			}
 		}
 	}
 
@@ -691,7 +695,10 @@ func (g *Game) playerInSpecialSector() {
 	if sec == nil {
 		return
 	}
-	// Only when actually standing on the floor.
+	if g.heretic {
+		g.hereticWindThrust(int(sec.SpecialType)) // wind pushes airborne too
+	}
+	// The damage floors / secret / exit below only fire on the floor.
 	if g.Camera.Z-EyeHeight > float64(sec.FloorHeight)+1 {
 		return
 	}
@@ -721,6 +728,30 @@ func (g *Game) playerInSpecialSector() {
 			g.exitLevel = 1
 		}
 	}
+}
+
+// hereticWindThrust applies Heretic's wind/scroll sector push (id's
+// P_PlayerInSpecialSector, specials 20-39): 20-24 east, 25-29 north,
+// 30-34 south, 35-39 west, with the strength ramping across the five slots.
+func (g *Game) hereticWindThrust(special int) {
+	if special < 20 || special > 39 {
+		return
+	}
+	// units/sec added to player velocity this tic, per strength slot
+	mag := [5]float64{0.7, 1.4, 3.5, 4.2, 4.9}
+	var ax, ay float64
+	switch {
+	case special <= 24: // east (+X)
+		ax, ay = mag[special-20], 0
+	case special <= 29: // north (+Y)
+		ax, ay = 0, mag[special-25]
+	case special <= 34: // south (-Y)
+		ax, ay = 0, -mag[special-30]
+	default: // west (-X)
+		ax, ay = -mag[special-35], 0
+	}
+	g.VelX += ax
+	g.VelY += ay
 }
 
 // ---------- surrounding-sector queries (id's P_Find*) ----------

@@ -47,7 +47,9 @@ func PlayLevelMusic(w *wad.WAD, music *MusicPlayer, override, mapName, logPrefix
 	if music == nil {
 		return
 	}
-	candidates := []string{override, wad.MusicLumpName(mapName), "D_" + mapName}
+	// "MUS_ExMy" covers Heretic (its per-map music lump prefix); harmless
+	// for Doom, which never has one.
+	candidates := []string{override, wad.MusicLumpName(mapName), "D_" + mapName, "MUS_" + mapName}
 	for _, lumpName := range candidates {
 		if lumpName == "" {
 			continue

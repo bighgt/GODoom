@@ -14,7 +14,7 @@ import (
 type HUDStats struct {
 	Health, Armor int
 	// Ammo/MaxAmmo are indexed by ammo type: 0 bullets, 1 shells, 2 cells, 3 rockets.
-	Ammo, MaxAmmo [4]int
+	Ammo, MaxAmmo [6]int
 	// CurrentAmmo selects which of the 4 ammo types the big number next to
 	// the face shows (mirrors the current weapon's ammo type); -1 shows
 	// nothing there (e.g. fists).
@@ -27,6 +27,12 @@ type HUDStats struct {
 	Keys [6]bool
 	// GodMode: draw the invulnerability face.
 	GodMode bool
+
+	// Arti / ArtiCount: the currently-selected Heretic inventory artifact's
+	// icon lump and how many are held (0 / "" = none). Only DrawHereticStatusBar
+	// reads these.
+	Arti      string
+	ArtiCount int
 }
 
 // Screen positions below are ported directly from id's own

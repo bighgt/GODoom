@@ -94,7 +94,7 @@ func (g *Game) CollectIsoWorldObjects(camAzimuth float64) ([]worldgeo.Sprite, []
 		if mo.State == S_NULL {
 			continue
 		}
-		name := spriteNames[mo.Sprite]
+		name := mobjSpriteName(mo)
 		ix, iy, iz, iang := mo.renderState(frac)
 		if g.Voxels != nil {
 			if model, angOff, mscale, ok := g.Voxels.Model(name, mo.Frame); ok && model != nil {
@@ -109,6 +109,11 @@ func (g *Game) CollectIsoWorldObjects(camAzimuth float64) ([]worldgeo.Sprite, []
 					Light:      float32(g.spriteSectorLight(ix, iy)) / 255,
 					FullBright: mo.Fullbright,
 				})
+				if g.heretic {
+					if f, ok := g.hereticFlameFor(name, model, ix, iy, iz, vscale*mscale, g.renderClock); ok {
+						voxels = append(voxels, f)
+					}
+				}
 				continue // the voxel model replaces the billboard
 			}
 		}

@@ -48,8 +48,8 @@ const maxIsoReveal = 64
 // updateIsoReveal). Count is a float (not int) only so its own row stays a
 // plain vec4 like the rest; iso.frag rounds it back to int.
 type isoRevealUBO struct {
-	count      [4]float32 // x = count, yzw unused
-	points     [maxIsoReveal][4]float32 // xy = screen pos (px), z = clip depth [0,1], w unused
+	count  [4]float32               // x = count, yzw unused
+	points [maxIsoReveal][4]float32 // xy = screen pos (px), z = clip depth [0,1], w unused
 }
 
 // isoPushConstants is iso.vert/iso.frag's shared push-constant layout: the
@@ -68,9 +68,16 @@ type isoRevealUBO struct {
 // what turns that NDC centre into the pixel coordinate iso.frag compares
 // gl_FragCoord.xy against.
 type isoPushConstants struct {
-	viewProj                      [16]float32
-	sunX, sunY, sunZ, sunStrength float32
+	viewProj                                   [16]float32
+	sunX, sunY, sunZ, sunStrength              float32
 	ambientFloor, screenW, screenH, fadeRadius float32
+	// reveal (iso.frag's pc.reveal): x > 0 marks the occluded-silhouette
+	// pass — a wall/floor-hidden monster/item within reveal.y px of screen
+	// centre shows as a flat ISO_REVEAL_TINT ghost at reveal.x alpha (x/y
+	// are 0 on the normal pass). z is the tight wall-shimmer-halo radius (px)
+	// occluderFade uses around each reveal-list point on BOTH passes. w pads
+	// the struct to a whole vec4.
+	revealAlpha, revealScreenRadius, revealHaloRadius, rpad0 float32
 }
 
 type isoResources struct {
@@ -91,6 +98,11 @@ type isoResources struct {
 
 	plWorld   vk.PipelineLayout
 	pipeWorld vk.Pipeline
+	// pipeSpriteReveal / pipeVoxelReveal are pipeWorld / pipeVoxel with
+	// GREATER depth compare, no depth write and alpha blending — the
+	// occluded-silhouette pass (see recordIsoCommandBuffer). Same layouts /
+	// shaders as their normal counterparts, gated by the reveal push value.
+	pipeSpriteReveal vk.Pipeline
 
 	// Reveal UBO (set 1): the screen position + depth of every monster/
 	// item/barrel/other thing this frame's isometric front end wants a wall
@@ -117,9 +129,10 @@ type isoResources struct {
 	// Renderer instance, so nothing is saved by sharing wr's, and keeping
 	// them separate means neither path's teardown has to reason about the
 	// other's fields (the same rationale as texCache/dsl0 above).
-	plVoxel   vk.PipelineLayout
-	pipeVoxel vk.Pipeline
-	voxCache  map[*assets.VoxelModel]*voxelMesh
+	plVoxel         vk.PipelineLayout
+	pipeVoxel       vk.Pipeline
+	pipeVoxelReveal vk.Pipeline // occluded-silhouette variant, see pipeSpriteReveal
+	voxCache        map[*assets.VoxelModel]*voxelMesh
 
 	// Static (walls/flats) + dynamic (sprite billboard) geometry, one
 	// device-local vertex buffer each. Not double-buffered per frame in
@@ -419,8 +432,8 @@ func (r *Renderer) isoCreateRevealResources() error {
 
 		write := vk.WriteDescriptorSet{
 			SType: vk.StructureTypeWriteDescriptorSet, DstSet: set, DstBinding: 0, DescriptorCount: 1,
-			DescriptorType:  vk.DescriptorTypeUniformBuffer,
-			PBufferInfo:     []vk.DescriptorBufferInfo{{Buffer: buf, Offset: 0, Range: vk.DeviceSize(size)}},
+			DescriptorType: vk.DescriptorTypeUniformBuffer,
+			PBufferInfo:    []vk.DescriptorBufferInfo{{Buffer: buf, Offset: 0, Range: vk.DeviceSize(size)}},
 		}
 		vk.UpdateDescriptorSets(r.device, 1, []vk.WriteDescriptorSet{write}, 0, nil)
 	}
@@ -494,9 +507,9 @@ func (r *Renderer) isoCreatePipelines() error {
 	ir := r.ir
 
 	plInfo := vk.PipelineLayoutCreateInfo{
-		SType:          vk.StructureTypePipelineLayoutCreateInfo,
-		SetLayoutCount: 2,
-		PSetLayouts:    []vk.DescriptorSetLayout{ir.dsl0, ir.revealSetLayout},
+		SType:                  vk.StructureTypePipelineLayoutCreateInfo,
+		SetLayoutCount:         2,
+		PSetLayouts:            []vk.DescriptorSetLayout{ir.dsl0, ir.revealSetLayout},
 		PushConstantRangeCount: 1,
 		PPushConstantRanges: []vk.PushConstantRange{{
 			StageFlags: vk.ShaderStageFlags(vk.ShaderStageVertexBit) | vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
@@ -582,7 +595,7 @@ func (r *Renderer) isoCreatePipelines() error {
 		PMultisampleState:   &multisample,
 		PDepthStencilState:  &depthStencil,
 		PColorBlendState:    &colorBlend,
-		PDynamicState:        &dynamic,
+		PDynamicState:       &dynamic,
 		Layout:              ir.plWorld,
 		RenderPass:          ir.rpScene,
 		Subpass:             0,
@@ -592,6 +605,30 @@ func (r *Renderer) isoCreatePipelines() error {
 		return fmt.Errorf("vulkan: iso world pipeline: %s", vk.Error(res))
 	}
 	ir.pipeWorld = pipelines[0]
+
+	// Occluded-silhouette variant: draws only where something's in front
+	// (GREATER), never writes depth, and blends its flat tint over it.
+	depthReveal := depthStencil
+	depthReveal.DepthWriteEnable = vk.False
+	depthReveal.DepthCompareOp = vk.CompareOpGreater
+	cbaReveal := cba
+	cbaReveal.BlendEnable = vk.True
+	cbaReveal.SrcColorBlendFactor = vk.BlendFactorSrcAlpha
+	cbaReveal.DstColorBlendFactor = vk.BlendFactorOneMinusSrcAlpha
+	cbaReveal.ColorBlendOp = vk.BlendOpAdd
+	cbaReveal.SrcAlphaBlendFactor = vk.BlendFactorOne
+	cbaReveal.DstAlphaBlendFactor = vk.BlendFactorZero
+	cbaReveal.AlphaBlendOp = vk.BlendOpAdd
+	colorBlendReveal := colorBlend
+	colorBlendReveal.PAttachments = []vk.PipelineColorBlendAttachmentState{cbaReveal}
+	revealInfo := info
+	revealInfo.PDepthStencilState = &depthReveal
+	revealInfo.PColorBlendState = &colorBlendReveal
+	revealPipes := make([]vk.Pipeline, 1)
+	if res := vk.CreateGraphicsPipelines(r.device, nil, 1, []vk.GraphicsPipelineCreateInfo{revealInfo}, nil, revealPipes); res != vk.Success {
+		return fmt.Errorf("vulkan: iso reveal pipeline: %s", vk.Error(res))
+	}
+	ir.pipeSpriteReveal = revealPipes[0]
 
 	return r.isoCreatePresentPipeline()
 }
@@ -787,6 +824,31 @@ func (r *Renderer) isoCreateVoxelPipeline() error {
 		return fmt.Errorf("vulkan: iso voxel pipeline: %s", vk.Error(res))
 	}
 	ir.pipeVoxel = out[0]
+
+	// Occluded-silhouette variant (see pipeSpriteReveal): GREATER depth, no
+	// write, blended — draws a voxel model's flat tint only where a wall or
+	// higher floor hides it.
+	depthReveal := depthStencil
+	depthReveal.DepthWriteEnable = vk.False
+	depthReveal.DepthCompareOp = vk.CompareOpGreater
+	cbaReveal := cba
+	cbaReveal.BlendEnable = vk.True
+	cbaReveal.SrcColorBlendFactor = vk.BlendFactorSrcAlpha
+	cbaReveal.DstColorBlendFactor = vk.BlendFactorOneMinusSrcAlpha
+	cbaReveal.ColorBlendOp = vk.BlendOpAdd
+	cbaReveal.SrcAlphaBlendFactor = vk.BlendFactorOne
+	cbaReveal.DstAlphaBlendFactor = vk.BlendFactorZero
+	cbaReveal.AlphaBlendOp = vk.BlendOpAdd
+	colorBlendReveal := colorBlend
+	colorBlendReveal.PAttachments = []vk.PipelineColorBlendAttachmentState{cbaReveal}
+	revealInfo := info
+	revealInfo.PDepthStencilState = &depthReveal
+	revealInfo.PColorBlendState = &colorBlendReveal
+	revOut := make([]vk.Pipeline, 1)
+	if res := vk.CreateGraphicsPipelines(r.device, nil, 1, []vk.GraphicsPipelineCreateInfo{revealInfo}, nil, revOut); res != vk.Success {
+		return fmt.Errorf("vulkan: iso voxel reveal pipeline: %s", vk.Error(res))
+	}
+	ir.pipeVoxelReveal = revOut[0]
 	return nil
 }
 

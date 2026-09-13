@@ -134,11 +134,22 @@ func (g *Game) buildStaticLights() {
 			continue
 		}
 		d, ok := decoLights[mo.Type]
+		z := mo.Z + mo.Height*0.72
+		if !ok {
+			// Heretic torches / braziers / chandeliers are all MT_HERETIC,
+			// told apart only by spriteOverride — decoLights (keyed by type)
+			// can't see them, and their flame is up a wall / on a stand,
+			// not at mo.Height*0.72.
+			var hz float64
+			if d, hz, ok = hereticDecoLight(mo); ok {
+				z = hz
+			}
+		}
 		if !ok {
 			continue
 		}
 		g.staticLights = append(g.staticLights, staticLight{
-			x: mo.X, y: mo.Y, z: mo.Z + mo.Height*0.72,
+			x: mo.X, y: mo.Y, z: z,
 			r: d.r, g: d.g, b: d.b,
 			baseInten: d.inten, baseRadius: d.radius,
 			sector: -1, flicker: d.flicker, seed: seed,

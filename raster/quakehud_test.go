@@ -11,7 +11,7 @@ func TestDrawQuakeHUDCorners(t *testing.T) {
 
 	r.DrawQuakeHUD(HUDStats{
 		Health: 87, Armor: 50,
-		Ammo: [4]int{42, 0, 0, 0}, MaxAmmo: [4]int{200, 0, 0, 0}, CurrentAmmo: 0,
+		Ammo: [6]int{42}, MaxAmmo: [6]int{200}, CurrentAmmo: 0,
 		Keys: [6]bool{true, false, false, false, false, true},
 	})
 

@@ -160,6 +160,9 @@ func (r *Renderer) buildSkyTable(cam *Camera, level *wad.Level) {
 	}
 
 	tex := r.skybox // the disk panorama overrides the WAD sky when it loaded
+	if r.preferWADSky {
+		tex = nil // e.g. Heretic — its own fantasy skies fit better than the Mars panorama
+	}
 	if tex == nil {
 		if r.skyWADTex == nil || r.skyWADFor != mapName {
 			name := skyTextureForMap(mapName)

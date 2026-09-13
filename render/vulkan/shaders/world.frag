@@ -37,7 +37,10 @@ layout(set = 1, binding = 2) uniform World {
     vec4 spotPosInvR2;  // xyz world pos, w = 1/radius^2
     vec4 spotDirCosOuter; // xyz normalized direction, w = cos(outer half-angle)
     vec4 spotColor;      // rgb colour * intensity, a = intensity (>0 = on)
-    vec4 spotCosInner;   // x = cos(inner half-angle), yzw unused
+    // x = cos(inner half-angle); y = cartoon-shading band count (config
+    // cartoonShading — fade() posterizes to this many steps when > 0, 0 =
+    // off); zw unused.
+    vec4 spotCosInner;
     vec4 lightPos[MAX_LIGHTS];      // xyz = world pos, w = 1 / radius^2
     vec4 lightColor[MAX_LIGHTS];    // rgb = colour * intensity
     vec4 shadowCaster[SHADOW_MAX];  // xyz = floor pos, w = radius (0 = list end)
@@ -86,7 +89,17 @@ float fade(bool isFlat) {
     float startmap = (15.0 - lnum) * 4.0;
     float k = clamp((W.light.z / max(vDepth, 1.0)) * 0.5, 0.0, 23.5); // W.light.z = 2560 ref
     float row = clamp(startmap - k, 0.0, 31.0);
-    return (32.0 - row) / 32.0;
+    float f = (32.0 - row) / 32.0;
+    // Cartoon shading (config cartoonShading, W.spotCosInner.y = band
+    // count): collapse the smooth distance/sector gradient into flat steps
+    // — the classic cel-shaded look — rather than a continuous ramp. Round
+    // to the nearest step rather than floor/ceil so a band's midpoint reads
+    // as that band's own brightness, not its darker or lighter neighbour's.
+    float bands = W.spotCosInner.y;
+    if (bands > 0.5) {
+        f = floor(f * bands + 0.5) / bands;
+    }
+    return f;
 }
 
 // AMBIENT_GAMMA shapes sectorAmbientFrac's curve: <1 lifts the midtones (a

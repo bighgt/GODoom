@@ -109,7 +109,17 @@ func (t *Textures) SpriteFrame(prefix string, frame, rot int) (im *RGBA, flip, o
 	if t.spriteIndex == nil {
 		t.spriteIndex = buildSpriteIndex(t.w)
 	}
-	d := t.spriteIndex[strings.ToUpper(prefix)]
+	up := strings.ToUpper(prefix)
+	d := t.spriteIndex[up]
+	if d == nil && t.fallbackW != nil {
+		// switchWeapons: a weapon/ammo pickup re-skinned to the other game's
+		// sprite — that game's IWAD has the frames (decoded through its
+		// palette by Sprite, below).
+		if t.fallbackSpriteIndex == nil {
+			t.fallbackSpriteIndex = buildSpriteIndex(t.fallbackW)
+		}
+		d = t.fallbackSpriteIndex[up]
+	}
 	if d == nil || frame < 0 || frame >= len(d.frames) {
 		return nil, false, false
 	}

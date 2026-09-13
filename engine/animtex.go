@@ -92,6 +92,16 @@ var builtinAnimDefs = []animDef{
 	{true, "SFALL1", "SFALL4", 8, nil, nil},
 	{true, "WFALL1", "WFALL4", 8, nil, nil},
 	{true, "DBRAIN1", "DBRAIN4", 8, nil, nil},
+
+	// Heretic's liquid flats + animated walls. Harmless for Doom WADs —
+	// initTexAnims drops any range whose frames the loaded WAD doesn't ship.
+	{false, "FLTWAWA1", "FLTWAWA3", 8, nil, nil},
+	{false, "FLTFLWW1", "FLTFLWW3", 8, nil, nil},
+	{false, "FLTLAVA1", "FLTLAVA4", 8, nil, nil},
+	{false, "FLATHUH1", "FLATHUH4", 8, nil, nil},
+	{false, "FLTSLUD1", "FLTSLUD3", 8, nil, nil},
+	{true, "WATRWAL1", "WATRWAL3", 8, nil, nil},
+	{true, "LAVAFL1", "LAVAFL3", 8, nil, nil},
 }
 
 // parseAnimatedLump decodes a BOOM ANIMATED lump: a run of 23-byte records

@@ -45,15 +45,27 @@ type Projectile struct {
 // facing direction (yaw and pitch both), offset slightly ahead so it
 // doesn't immediately collide with geometry right at the camera.
 func (g *Game) spawnProjectile(def *ProjectileDef) {
-	dx, dy, dz := aimDirection(g.Camera)
-	g.projectiles = append(g.projectiles, &Projectile{
-		X:  g.Camera.X + dx*projectileStartDist,
-		Y:  g.Camera.Y + dy*projectileStartDist,
-		Z:  g.Camera.Z + dz*projectileStartDist,
-		DX: dx, DY: dy, DZ: dz,
-		def:   def,
-		Alive: true,
-	})
+	baseYaw := g.Camera.Angle
+	_, _, dz := aimDirection(g.Camera)
+	shots := def.Shots
+	if shots < 1 {
+		shots = 1
+	}
+	for i := 0; i < shots; i++ {
+		yaw := baseYaw
+		if shots > 1 {
+			yaw += (float64(i) - float64(shots-1)/2) * def.SpreadRad
+		}
+		dx, dy := math.Cos(yaw), math.Sin(yaw)
+		g.projectiles = append(g.projectiles, &Projectile{
+			X:  g.Camera.X + dx*projectileStartDist,
+			Y:  g.Camera.Y + dy*projectileStartDist,
+			Z:  g.Camera.Z + dz*projectileStartDist,
+			DX: dx, DY: dy, DZ: dz,
+			def:   def,
+			Alive: true,
+		})
+	}
 }
 
 // aimDirection is the camera's forward unit vector in full 3D, combining

@@ -12,7 +12,7 @@ type PlayerStats struct {
 	// ArmorType: 0 none, 1 green (absorbs 1/3), 2 blue (absorbs 1/2).
 	ArmorType int
 	// Ammo/MaxAmmo are indexed by ammo type: 0 bullets, 1 shells, 2 cells, 3 rockets.
-	Ammo, MaxAmmo [4]int
+	Ammo, MaxAmmo [numAmmoTypes]int
 	// CurrentAmmo selects which of the 4 ammo types the big number next to
 	// the face shows (mirrors the current weapon's ammo type); -1 shows
 	// nothing there (e.g. fists).
@@ -30,13 +30,19 @@ type PlayerStats struct {
 	// only tops ammo up instead of doubling MaxAmmo again (id's
 	// player->backpack).
 	Backpack bool
+
+	// Inventory / ArtiCurrent — Heretic's artifact inventory (counts per
+	// artifact, capped at artiMax; -1 = nothing selected). See
+	// engine/heretic_arti.go. Unused in a Doom game.
+	Inventory   [numArtifacts]int
+	ArtiCurrent int
 }
 
 // DefaultPlayerStats is a real Doom fresh-spawn loadout: 100 health, no
 // armour, fist + pistol, 50 bullets. Everything else is found via pickups
 // (pickup.go).
 func DefaultPlayerStats() PlayerStats {
-	ps := PlayerStats{Health: 100, CurrentAmmo: 0}
+	ps := PlayerStats{Health: 100, CurrentAmmo: 0, ArtiCurrent: -1}
 	ps.MaxAmmo = dehMaxAmmo // vanilla {200,50,300,50} unless a DEH Ammo edit changed it
 	ps.Ammo[0] = 50         // bullets
 	ps.Weapons[wpFist] = true

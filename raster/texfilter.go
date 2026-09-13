@@ -75,11 +75,27 @@ func (r *Renderer) SetTextureQuality(name string) {
 // bleed black into its neighbours; coverage is kept in alpha.
 type texMips struct {
 	lv []texLevel
+	// opaque is set when every texel of the base image is fully opaque (the
+	// common case for walls and every case for flats) — bilerpLevel then
+	// skips the alpha channel's multiply-accumulate and just returns 255.
+	// drawWallSpan's `fa >= 128` hole test and drawFlatSpan (alpha ignored)
+	// both stay correct.
+	opaque bool
 }
 
 type texLevel struct {
 	pix  []byte
 	w, h int
+
+	// Precomputed by buildTexMips for bilerpLevel's hot path — that routine
+	// runs up to (2 levels * maxAniso) times per filtered pixel, so a divide
+	// or a modulo in it is a real cost at aniso16x. sx/sy rescale a level-0
+	// texel coordinate into this level; when the level's dimension is a
+	// power of two (every mip of a 64x128-style base is), wrap is a mask,
+	// not wrapInt's `%`.
+	sx, sy       float64
+	wMask, hMask int
+	wPow2, hPow2 bool
 }
 
 // worldMips returns t's cached mip chain, building it on first use. Never
@@ -107,6 +123,22 @@ func buildTexMips(t *assets.RGBA) *texMips {
 	for cur := base; cur.w > 1 || cur.h > 1; {
 		cur = boxHalve(cur)
 		m.lv = append(m.lv, cur)
+	}
+	l0w, l0h := m.lv[0].w, m.lv[0].h
+	for k := range m.lv {
+		lv := &m.lv[k]
+		lv.sx = float64(lv.w) / float64(l0w)
+		lv.sy = float64(lv.h) / float64(l0h)
+		lv.wMask, lv.hMask = lv.w-1, lv.h-1
+		lv.wPow2 = lv.w&lv.wMask == 0
+		lv.hPow2 = lv.h&lv.hMask == 0
+	}
+	m.opaque = true
+	for p := 3; p < len(base.pix); p += 4 {
+		if base.pix[p] != 255 {
+			m.opaque = false
+			break
+		}
 	}
 	return m
 }
@@ -164,26 +196,71 @@ func boxHalve(s texLevel) texLevel {
 // dimensions (exact for the power-of-two case, a sub-texel drift at coarse
 // levels for the odd composite-texture heights).
 func (m *texMips) bilerpLevel(k int, u, v float64) (r, g, b, a float64) {
-	l := m.lv[k]
-	l0 := m.lv[0]
-	uk := u*float64(l.w)/float64(l0.w) - 0.5
-	vk := v*float64(l.h)/float64(l0.h) - 0.5
+	l := &m.lv[k]
+	uk := u*l.sx - 0.5
+	vk := v*l.sy - 0.5
 	u0 := int(math.Floor(uk))
 	v0 := int(math.Floor(vk))
-	tu := uk - float64(u0)
-	tv := vk - float64(v0)
-	u0w, u1w := wrapInt(u0, l.w), wrapInt(u0+1, l.w)
-	v0w, v1w := wrapInt(v0, l.h), wrapInt(v0+1, l.h)
-	p00 := (v0w*l.w + u0w) * 4
-	p10 := (v0w*l.w + u1w) * 4
-	p01 := (v1w*l.w + u0w) * 4
-	p11 := (v1w*l.w + u1w) * 4
-	f := func(i int) float64 {
-		top := float64(l.pix[p00+i])*(1-tu) + float64(l.pix[p10+i])*tu
-		bot := float64(l.pix[p01+i])*(1-tu) + float64(l.pix[p11+i])*tu
-		return top*(1-tv) + bot*tv
+
+	// Wrap by mask on the power-of-two mips (the common case — every level
+	// of a 64x128-style base), else wrapInt's modulo. A negative operand of
+	// Go's `&` still wraps correctly for a power-of-two modulus.
+	var u0w, u1w, v0w, v1w int
+	if l.wPow2 {
+		u0w, u1w = u0&l.wMask, (u0+1)&l.wMask
+	} else {
+		u0w, u1w = wrapInt(u0, l.w), wrapInt(u0+1, l.w)
 	}
-	return f(0), f(1), f(2), f(3)
+	if l.hPow2 {
+		v0w, v1w = v0&l.hMask, (v0+1)&l.hMask
+	} else {
+		v0w, v1w = wrapInt(v0, l.h), wrapInt(v0+1, l.h)
+	}
+
+	row0, row1 := v0w*l.w, v1w*l.w
+	p00 := (row0 + u0w) * 4
+	p10 := (row0 + u1w) * 4
+	p01 := (row1 + u0w) * 4
+	p11 := (row1 + u1w) * 4
+	// Bounds-check hint: prove the widest index once so the 16 texel reads
+	// below don't each re-check.
+	_ = l.pix[p00+3]
+	_ = l.pix[p10+3]
+	_ = l.pix[p01+3]
+	_ = l.pix[p11+3]
+
+	// Fixed-point bilinear: 8-bit fractional weights, integer multiply-add,
+	// one convert to float at the end. This routine is ~half of all CPU in
+	// the filtered world render (up to 2*maxAniso calls per pixel), so the
+	// texels stay bytes through the blend instead of 16 int->float64
+	// conversions plus float muls per call. fu,fv in 0..255; the four corner
+	// weights are (256-fu)(256-fv) etc and sum to exactly 65536, so the
+	// accumulator >>16 (with rounding) lands back in 0..255. Max error vs
+	// the float path is under 1/255 — imperceptible, and TestAnisoIsotropic-
+	// EqualsTrilinear only compares taps==1 (a straight trilinear call).
+	fu := uint32((uk - float64(u0)) * 256)
+	fv := uint32((vk - float64(v0)) * 256)
+	if fu > 255 {
+		fu = 255
+	}
+	if fv > 255 {
+		fv = 255
+	}
+	w00 := (256 - fu) * (256 - fv)
+	w10 := fu * (256 - fv)
+	w01 := (256 - fu) * fv
+	w11 := fu * fv
+	pix := l.pix
+	const round = 1 << 15
+	r = float64((uint32(pix[p00])*w00 + uint32(pix[p10])*w10 + uint32(pix[p01])*w01 + uint32(pix[p11])*w11 + round) >> 16)
+	g = float64((uint32(pix[p00+1])*w00 + uint32(pix[p10+1])*w10 + uint32(pix[p01+1])*w01 + uint32(pix[p11+1])*w11 + round) >> 16)
+	b = float64((uint32(pix[p00+2])*w00 + uint32(pix[p10+2])*w10 + uint32(pix[p01+2])*w01 + uint32(pix[p11+2])*w11 + round) >> 16)
+	if m.opaque {
+		a = 255
+	} else {
+		a = float64((uint32(pix[p00+3])*w00 + uint32(pix[p10+3])*w10 + uint32(pix[p01+3])*w01 + uint32(pix[p11+3])*w11 + round) >> 16)
+	}
+	return
 }
 
 // trilinear blends the two chain levels bracketing lod (0 = base). lod is
@@ -216,6 +293,24 @@ type anisoPlan struct {
 	step     float64 // 1/taps, hoisted
 }
 
+// log2fast approximates log2(x) for x > 0 with a quadratic fit of the
+// mantissa (max abs error ~0.0055 over any range) — plenty for choosing a
+// mip level and its blend fraction, and ~10x cheaper than math.Log2, which
+// planAniso otherwise calls once per filtered pixel (it was ~9% of the
+// whole world render at aniso16x). x <= 0 shouldn't reach here (callers
+// clamp the footprint to >= 1e-6); it returns a large negative if it does.
+func log2fast(x float64) float64 {
+	if x <= 0 {
+		return -1e30
+	}
+	bits := math.Float64bits(x)
+	exp := int((bits>>52)&0x7ff) - 1023
+	// mantissa forced into [1, 2)
+	m := math.Float64frombits(bits&0x000fffffffffffff | 0x3ff0000000000000)
+	// minimax-ish quadratic for log2 on [1, 2]
+	return float64(exp) + (-0.344845*m+2.024658)*m - 1.674873
+}
+
 // planAniso resolves the tap count and mip LOD for a footprint: major/minor
 // axis lengths (texels) and the unit major-axis direction (mdu, mdv), with a
 // hard cap of maxTaps. A near-isotropic footprint (a billboard, a face-on
@@ -244,7 +339,7 @@ func planAniso(major, minor, mdu, mdv float64, maxTaps int) anisoPlan {
 	if lodLen < minor {
 		lodLen = minor
 	}
-	lod := math.Log2(lodLen)
+	lod := log2fast(lodLen)
 	if lod < 0 {
 		lod = 0
 	}
@@ -254,17 +349,57 @@ func planAniso(major, minor, mdu, mdv float64, maxTaps int) anisoPlan {
 // sampleAnisoPlan takes p.taps trilinear samples spread along the major axis,
 // centred at (u, v) in level-0 texel units, and averages them.
 func (m *texMips) sampleAnisoPlan(u, v float64, p anisoPlan) (r, g, b, a float64) {
-	if p.taps == 1 {
+	if p.taps <= 1 {
 		return m.trilinear(u, v, p.lod)
 	}
+
+	// Every tap shares p.lod, so resolve the bracketing mip levels ONCE
+	// here rather than re-running trilinear's clamp/branch per tap. When the
+	// LOD lands on a level (or past the last one — a far floor clamped to
+	// the 1x1 mip), fr is 0 and the whole chain drops to one bilerp per tap.
+	last := len(m.lv) - 1
+	lod := p.lod
+	if lod < 0 {
+		lod = 0
+	} else if lod > float64(last) {
+		lod = float64(last)
+	}
+	lo := int(lod)
+	fr := lod - float64(lo)
+	hi := lo + 1
+	if hi > last {
+		hi, fr = last, 0
+	}
+
+	// March the tap centres incrementally: du,dv is one tap step along the
+	// major axis, uu,vv starts at the first tap (i=0 => off = step/2 - 0.5,
+	// scaled by majorLen). Saves a mul+sub per tap vs recomputing off.
+	span := p.step * p.majorLen
+	du, dv := p.mdu*span, p.mdv*span
+	off0 := 0.5*span - 0.5*p.majorLen
+	uu, vv := u+p.mdu*off0, v+p.mdv*off0
 	var sr, sg, sb, sa float64
-	for i := 0; i < p.taps; i++ {
-		off := ((float64(i)+0.5)*p.step - 0.5) * p.majorLen
-		tr, tg, tb, ta := m.trilinear(u+p.mdu*off, v+p.mdv*off, p.lod)
-		sr += tr
-		sg += tg
-		sb += tb
-		sa += ta
+	if fr > 0 {
+		for i := 0; i < p.taps; i++ {
+			r0, g0, b0, a0 := m.bilerpLevel(lo, uu, vv)
+			r1, g1, b1, a1 := m.bilerpLevel(hi, uu, vv)
+			sr += r0 + (r1-r0)*fr
+			sg += g0 + (g1-g0)*fr
+			sb += b0 + (b1-b0)*fr
+			sa += a0 + (a1-a0)*fr
+			uu += du
+			vv += dv
+		}
+	} else {
+		for i := 0; i < p.taps; i++ {
+			r0, g0, b0, a0 := m.bilerpLevel(lo, uu, vv)
+			sr += r0
+			sg += g0
+			sb += b0
+			sa += a0
+			uu += du
+			vv += dv
+		}
 	}
 	return sr * p.step, sg * p.step, sb * p.step, sa * p.step
 }

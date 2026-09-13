@@ -88,6 +88,13 @@ func Run(initial config.Config) (Result, bool, error) {
 
 	m.Cfg.Map = m.MapName
 	m.Cfg.WADPath = m.WADPath
+	// The Music Volume slider is the only music control (no checkbox): a
+	// slider at 0 means "music off". Keep the Music bool — the engine's real
+	// gate, and what a hand-edited config.json still uses — in sync with it.
+	// (config.repaired then bumps a literal musicVolume 0 back to 1.0, which
+	// is fine: Music=false is what silences it, and NewModel re-derives the
+	// slider's 0 from Music next time.)
+	m.Cfg.Music = m.Cfg.MusicVolume > 0
 	path := config.ResolvePath()
 	if err := config.SaveMerge(m.Cfg, path); err != nil {
 		return Result{}, false, fmt.Errorf("launcher: save %s: %w", path, err)

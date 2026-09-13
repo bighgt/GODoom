@@ -87,7 +87,7 @@ func (g *Game) gldefStaticLights(mo *Mobj, firstSeed int) []staticLight {
 	if g.gldefs == nil {
 		return nil
 	}
-	name := spriteNames[mo.Sprite]
+	name := mobjSpriteName(mo)
 	if name == "" {
 		return nil
 	}

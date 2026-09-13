@@ -187,6 +187,25 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 	textures.SetQuake1Textures(cfg.Quake1Textures)
 	done()
 
+	// config's switchWeapons: play with the OTHER game's arsenal. The
+	// weapon-table swap itself is in engine.NewGame (it reads cfg); here we
+	// give the renderer the other IWAD for its weapon / projectile sprites
+	// and the game the same for its fire sounds.
+	var altWAD *wad.WAD
+	if cfg.SwitchWeapons {
+		if ow, op, ok := wad.OtherGameIWAD(path, w); ok {
+			altWAD = ow
+			textures.SetSpriteFallback(ow)
+			which := "Heretic"
+			if w.IsHeretic() {
+				which = "Doom"
+			}
+			log.Printf("engine: switchWeapons — %s weapon art/sounds from %s", which, filepath.Base(op))
+		} else {
+			log.Printf("engine: switchWeapons on, but the other game's IWAD wasn't found next to %s — the arsenal still swaps, the new guns just draw/sound blank", filepath.Base(path))
+		}
+	}
+
 	wm := "fullscreen"
 	if cfg.Windowed {
 		wm = fmt.Sprintf("windowed %dx%d", cfg.WindowWidth, cfg.WindowHeight)
@@ -196,9 +215,9 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 		runMode = "always-run"
 	}
 	log.Printf("engine: config in effect — %s, renderer=%s, resolution=%s x%.2f, fov=%.0f, vsync=%v, hudScale=%.2f, weaponScale=%.2f, lighting=%s lightScale=%.2f exposure=%.2f shadows=%v groundShadows=%v, textureQuality=%s, "+
-		"invertMouseY=%v, mouseSensitivity=%.4f, turnSpeed=%.2f, %s, skill=%d, damageScale=%d, music=%v, weaponVolume=%.2f, worldVolume=%.2f, debugInfo=%v, hud=%s, crosshair=%s/%s, voxels=%v x%.2f, quake1Textures=%v",
+		"invertMouseY=%v, mouseSensitivity=%.4f, turnSpeed=%.2f, %s, skill=%d, damageScale=%d, music=%v, musicVolume=%.2f, weaponVolume=%.2f, worldVolume=%.2f, debugInfo=%v, hud=%s, crosshair=%s/%s, voxels=%v x%.2f, quake1Textures=%v",
 		wm, cfg.Renderer, cfg.Resolution, cfg.RenderScale, cfg.FOVDegrees, cfg.VSync, cfg.HUDScale, cfg.WeaponScale, cfg.LightingMode, cfg.LightScale, cfg.Exposure, cfg.Shadows, cfg.GroundShadows, cfg.TextureQuality,
-		cfg.InvertMouseY, cfg.MouseSensitivity, cfg.TurnSpeed, runMode, cfg.Skill, cfg.DamageScale, cfg.Music, cfg.WeaponVolume, cfg.WorldVolume, cfg.ShowDebugInfo, cfg.HUDStyle, cfg.Crosshair, cfg.CrosshairSize,
+		cfg.InvertMouseY, cfg.MouseSensitivity, cfg.TurnSpeed, runMode, cfg.Skill, cfg.DamageScale, cfg.Music, cfg.MusicVolume, cfg.WeaponVolume, cfg.WorldVolume, cfg.ShowDebugInfo, cfg.HUDStyle, cfg.Crosshair, cfg.CrosshairSize,
 		cfg.Voxels, cfg.VoxelScale, cfg.Quake1Textures)
 
 	cam := engine.StartCamera(level, tree)
@@ -341,7 +360,8 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 	}
 
 	game := engine.NewGame(win, renderer, ras, w, level, tree, cam, cfg)
-	game.LitMode = lit // may have been forced off by the fallback above
+	game.LitMode = lit   // may have been forced off by the fallback above
+	game.AltWAD = altWAD // switchWeapons fire-sound fallback (nil otherwise)
 	if hw {
 		game.HardwareMode = true
 		done = stageTimer("build static world geometry (BSP walk + texture decode)")
@@ -359,7 +379,10 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 
 	if cfg.Voxels {
 		pk3 := "Doom1_Voxel.pk3"
-		if strings.HasPrefix(mapName, "MAP") {
+		switch {
+		case w.IsHeretic():
+			pk3 = "reikallhereticvoxels.pk3"
+		case strings.HasPrefix(mapName, "MAP"):
 			pk3 = "Doom2_Voxel.pk3"
 		}
 		done = stageTimer("load voxel pack " + pk3)
@@ -401,6 +424,7 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 			}
 		}
 	} else {
+		music.SetVolume(cfg.MusicVolume)
 		audio.PlayLevelMusic(w, music, game.MapMusicLump(mapName), mapName, "engine")
 		// Restart music when the engine advances to the next level, and when
 		// the idmus cheat asks for a specific map's track.

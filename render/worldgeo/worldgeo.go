@@ -47,12 +47,13 @@ const (
 // raster.classifyFloorLiquid and engine's liquidKindOfFlat. Returns
 // KindFlat for anything that is not a liquid.
 func liquidKindOfFlat(name string) uint16 {
+	has := func(p string) bool { return len(name) >= len(p) && name[:len(p)] == p }
 	switch {
-	case len(name) >= 6 && name[:6] == "FWATER":
+	case has("FWATER"), has("FLTWAWA"), has("FLTFLWW"): // Doom / Heretic water
 		return KindLiquidWater
-	case (len(name) >= 4 && name[:4] == "LAVA") || name == "FIRELAVA":
+	case has("LAVA") || name == "FIRELAVA" || has("FLTLAVA"): // Doom / Heretic lava
 		return KindLiquidLava
-	case (len(name) >= 6 && name[:6] == "NUKAGE") || (len(name) >= 5 && name[:5] == "SLIME"):
+	case has("NUKAGE"), has("SLIME"), has("FLTSLUD"): // Doom / Heretic sludge
 		return KindLiquidNukage
 	}
 	return KindFlat

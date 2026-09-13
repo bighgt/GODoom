@@ -36,6 +36,18 @@ const (
 	// the assets/textures/walls|flats overrides.
 	quakeWallsDir = "assets/textures/quake1/walls"
 	quakeFlatsDir = "assets/textures/quake1/flats"
+
+	// hereticWallsDir/hereticFlatsDir hold an optional Heretic HD texture
+	// pack (a PBR pack's base-colour layer, routed here by
+	// tools/importhereticpbr). The files are already named by Heretic lump
+	// name, so — unlike the Quake pack — no per-name table is needed.
+	// Indexed exactly like the hi-res set, but WallTexture/Flat only consult
+	// them when SetHeretic(true) has been called (cmd/engine, when
+	// w.IsHeretic()); a separate directory so a Heretic pack's Doom-name
+	// collisions (SW1OFF, DOORSTON, ...) never touch a Doom session's
+	// assets/textures/walls|flats overrides.
+	hereticWallsDir = "assets/textures/heretic/walls"
+	hereticFlatsDir = "assets/textures/heretic/flats"
 )
 
 // loadHiresWalls/loadHiresFlats load the procedurally upscaled wall
@@ -55,6 +67,8 @@ func indexHiresFlats() map[string]string   { return indexHiresDir(hiresFlatsDir)
 func indexHiresSprites() map[string]string { return indexHiresDir(hiresSpritesDir) }
 func indexQuakeWalls() map[string]string   { return indexHiresDir(quakeWallsDir) }
 func indexQuakeFlats() map[string]string   { return indexHiresDir(quakeFlatsDir) }
+func indexHereticWalls() map[string]string { return indexHiresDir(hereticWallsDir) }
+func indexHereticFlats() map[string]string { return indexHiresDir(hereticFlatsDir) }
 
 // indexHiresDir walks relDir (recursively) and returns a lump-name ->
 // PNG-path map *without* decoding anything — the override set can be well

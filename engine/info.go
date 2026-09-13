@@ -181,6 +181,8 @@ const (
 
 	MT_TELEPORTMAN // doomednum 14 — teleport landing spot
 
+	MT_HERETIC // every Heretic map object (engine/heretic.go) — see spawnHereticThing
+
 	NUMMOBJTYPES
 )
 
@@ -408,6 +410,12 @@ var mobjInfo = [NUMMOBJTYPES]MobjInfo{
 	MT_HANGTSKULL:           hang(76, S_HANGTSKULL, 64, MF_SOLID),
 	MT_HANGTLOOKINGUP:       hang(77, S_HANGTLOOKUP, 64, MF_SOLID),
 	MT_HANGTNOBRAIN:         hang(78, S_HANGTNOBRAIN, 64, MF_SOLID),
+
+	// The one shared template for every Heretic map object. doomednum -1
+	// (spawnMapThings routes Heretic THINGS here itself, by its own table —
+	// see engine/heretic.go); radius/height/flags/sprite are all overridden
+	// on the spawned Mobj per-thing.
+	MT_HERETIC: {Name: "heretic", DoomedNum: -1, SpawnState: S_HERETIC, SpawnHealth: 1000, Radius: 16, Height: 16, Mass: 100},
 }
 
 // item builds a MobjInfo for a pickup: not solid, not counted as a kill,

@@ -13,9 +13,11 @@ import (
 // doc comment. Kept as its own table (rather than just subtracting a count)
 // so a mismatch names exactly which field is missing.
 var excludedFields = map[string]string{
-	"Map":           "the dedicated map dropdown, not a settings row",
-	"ShowStatusBar": "deprecated back-compat shim superseded by hudStyle",
-	"WADPath":       "set programmatically when a WAD is picked",
+	"Map":            "the dedicated map dropdown, not a settings row",
+	"ShowStatusBar":  "deprecated back-compat shim superseded by hudStyle",
+	"WADPath":        "set programmatically when a WAD is picked",
+	"CartoonShading": "promoted to its own row in screen.go's top bar",
+	"Music":          "no checkbox — the Music Volume slider is the on/off (run.go derives Music from it)",
 }
 
 // TestFieldsCoverEveryConfigField guards against silently forgetting a
@@ -48,6 +50,29 @@ func TestFieldsCoverEveryConfigField(t *testing.T) {
 	}
 	if seen != len(fields) {
 		t.Errorf("fields has %d rows but only %d matched a Config field — a row's id doesn't match any json tag", len(fields), seen)
+	}
+}
+
+// TestEveryFieldHasAHint keeps the hover-tooltip coverage honest: a new
+// settings row without a hint would just show nothing on rollover.
+func TestEveryFieldHasAHint(t *testing.T) {
+	for _, f := range fields {
+		if strings.TrimSpace(f.hint) == "" {
+			t.Errorf("%s: no hint text", f.id)
+		}
+	}
+}
+
+// TestEverySectionHasATabTitle guards the tab strip: a section in
+// sectionOrder with no tabTitles entry would draw a blank tab.
+func TestEverySectionHasATabTitle(t *testing.T) {
+	for _, s := range sectionOrder {
+		if strings.TrimSpace(tabTitles[s]) == "" {
+			t.Errorf("section %q has no tab title", s)
+		}
+		if len(fieldsInSection(s)) == 0 {
+			t.Errorf("section %q has a tab but no fields", s)
+		}
 	}
 }
 

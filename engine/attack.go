@@ -28,7 +28,14 @@ func pAimSlope(shooter, target *Mobj) float64 {
 // up to rangeU units. The first shootable thing in the way takes damage
 // (blood, or a puff for MF_NOBLOOD things like the barrel); if nothing is
 // hit before a wall, a puff marks the wall.
-func (g *Game) pLineAttack(shooter *Mobj, angle, slope, rangeU float64, damage int) {
+//
+// hpuff is the Heretic puff sprite the impact spark uses (PUF2 = the Gold
+// Wand's little yellow flame, PUF3 = the staff spark, PUF1 = the green
+// Gauntlets spark). It is only consulted for a Heretic session — the Doom
+// MT_PUFF sprite name "PUFF" isn't in heretic.wad, so without this a
+// Heretic hitscan/melee weapon lands with no visible effect at all. Doom
+// callers pass "".
+func (g *Game) pLineAttack(shooter *Mobj, angle, slope, rangeU float64, damage int, hpuff string) {
 	dx, dy := math.Cos(angle), math.Sin(angle)
 	ox, oy, oz := shooter.X, shooter.Y, eyeZ(shooter)
 
@@ -88,18 +95,69 @@ func (g *Game) pLineAttack(shooter *Mobj, angle, slope, rangeU float64, damage i
 	hx, hy, hz := ox+dx*bestT, oy+dy*bestT, oz+slope*bestT
 	switch {
 	case best == nil:
-		g.P_SpawnMobj(hx-dx*4, hy-dy*4, hz, MT_PUFF)
+		g.spawnAttackPuff(hx-dx*4, hy-dy*4, hz, hpuff)
 		// Shot a wall — trip its gun (G1/GR) special, if any.
 		if wallLine >= 0 && shooter == g.playerMobj {
 			g.shotLine(wallLine, shooter)
 		}
 	case best.Flags&MF_NOBLOOD != 0:
 		g.pDamageMobj(best, shooter, shooter, damage)
-		g.P_SpawnMobj(hx, hy, hz, MT_PUFF)
+		g.spawnAttackPuff(hx, hy, hz, hpuff)
 	default:
 		g.pDamageMobj(best, shooter, shooter, damage)
-		g.P_SpawnMobj(hx, hy, hz, MT_BLOOD)
+		g.spawnAttackBlood(hx, hy, hz)
 	}
+}
+
+// hereticPuffFrames is how many animation frames of each Heretic puff
+// sprite the impact spark plays (heretic.wad: PUFn A.. lumps) — the frame
+// cycler in mobjTick needs it, and it must be > 1 to run at all. Some are
+// deliberately shorter than the full lump run: PUF2's last two frames are a
+// spread red cross-spark that reads as an explosion up close, so the Wand
+// spark stops at the orange frames.
+var hereticPuffFrames = map[string]int{
+	"PUF1": 4, // Gauntlets — green sparks
+	"PUF2": 3, // Gold Wand — a little yellow-to-orange flame (skips the red cross)
+	"PUF3": 4, // Elven Staff — a small tan spark
+	"PUF4": 6, // powered Staff — big blue flare
+}
+
+// spawnAttackPuff drops the little hit spark a hitscan/melee attack leaves
+// at its impact point. Doom uses MT_PUFF as-is; Heretic re-skins it to a
+// real Heretic puff sprite (see pLineAttack's hpuff doc) because "PUFF"
+// isn't a lump in heretic.wad. Full-bright, animates once, then removes
+// itself (hExpireIn) rather than running the S_PUFF state chain.
+func (g *Game) spawnAttackPuff(x, y, z float64, hpuff string) {
+	mo := g.P_SpawnMobj(x, y, z, MT_PUFF)
+	if !g.heretic {
+		return
+	}
+	if hpuff == "" {
+		hpuff = "PUF3"
+	}
+	frames := hereticPuffFrames[hpuff]
+	if frames < 2 {
+		frames = 4
+	}
+	mo.spriteOverride = hpuff
+	mo.overrideFrames, mo.overrideTics = frames, 3
+	mo.Fullbright = true
+	mo.Tics = -1 // hExpireIn owns the lifetime; keep the S_PUFF countdown out
+	mo.hExpireIn = frames * 3
+}
+
+// spawnAttackBlood is spawnAttackPuff's blood-splat counterpart: MT_BLOOD
+// for Doom, re-skinned to Heretic's BLOD sprite otherwise (heretic.wad has
+// no "BLUD").
+func (g *Game) spawnAttackBlood(x, y, z float64) {
+	mo := g.P_SpawnMobj(x, y, z, MT_BLOOD)
+	if !g.heretic {
+		return
+	}
+	mo.spriteOverride = "BLOD"
+	mo.overrideFrames, mo.overrideTics = 3, 3
+	mo.Tics = -1
+	mo.hExpireIn = 3 * 3
 }
 
 // pSpawnMissile launches a missile of type typ from source toward dest,

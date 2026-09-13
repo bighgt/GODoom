@@ -55,7 +55,18 @@ func parseVoxeldef(text string) map[string]voxelEntry {
 			continue
 		}
 		file := strings.ToLower(strings.TrimSpace(rest[q1+1 : q1+1+q2]))
-		if !validVoxelKey(key) || file == "" {
+		if file == "" {
+			continue
+		}
+		switch {
+		case validVoxelKey(key):
+			// "<sprite><frame>" — a specific frame.
+		case validWholeSpriteKey(key):
+			// A bare 4-letter sprite name applies to every frame; Model()
+			// looks these up under the "<sprite>*" key (Heretic keys, some
+			// weapon/artifact pickups in reikall's pack).
+			key += "*"
+		default:
 			continue
 		}
 
@@ -78,16 +89,18 @@ func parseVoxeldef(text string) map[string]voxelEntry {
 }
 
 // validVoxelKey accepts a "<sprite><frame>" key: a 4-character sprite name
-// followed by a single frame letter (a..z), the only shape this pack uses.
+// followed by a single frame letter (a..z).
 func validVoxelKey(k string) bool {
-	if len(k) != 5 {
-		return false
-	}
-	if k[4] < 'a' || k[4] > 'z' {
-		return false
-	}
-	for i := 0; i < 4; i++ {
-		c := k[i]
+	return len(k) == 5 && k[4] >= 'a' && k[4] <= 'z' && spriteChars(k[:4])
+}
+
+// validWholeSpriteKey accepts a bare 4-letter sprite name (a VOXELDEF entry
+// with no frame letter, meaning "every frame of this sprite").
+func validWholeSpriteKey(k string) bool { return len(k) == 4 && spriteChars(k) }
+
+func spriteChars(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
 		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '[' || c == ']' || c == '\\') {
 			return false
 		}

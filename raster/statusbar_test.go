@@ -64,7 +64,7 @@ func TestSmallAmmoRowsMatchLabels(t *testing.T) {
 	_, _, tex := loadTestLevel(t)
 	r := New(tex, 320, 200)
 	r.DrawStatusBar(HUDStats{
-		Ammo: [4]int{123, 123, 123, 123}, MaxAmmo: [4]int{456, 456, 456, 456}, CurrentAmmo: -1,
+		Ammo: [6]int{123, 123, 123, 123}, MaxAmmo: [6]int{456, 456, 456, 456}, CurrentAmmo: -1,
 	})
 	bar := New(tex, 320, 200)
 	bar.blitSprite("STBAR", 0, stbarY)

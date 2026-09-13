@@ -261,6 +261,29 @@ func TestWeaponVolumeDefaultAndRepair(t *testing.T) {
 	}
 }
 
+func TestMusicVolumeDefaultAndRepair(t *testing.T) {
+	if d := Default(); d.MusicVolume != 1.0 {
+		t.Errorf("default musicVolume = %.2f, want 1.0", d.MusicVolume)
+	}
+	base := Config{Resolution: "720p", FOVDegrees: 90}
+	// Absent (zero) -> default (0 is "unset", not "mute", like the other scalars).
+	if c := base.repaired(); c.MusicVolume != 1.0 {
+		t.Errorf("absent -> musicVolume=%.2f, want 1.0", c.MusicVolume)
+	}
+	// Above range -> default.
+	c2 := base
+	c2.MusicVolume = 5
+	if c := c2.repaired(); c.MusicVolume != 1.0 {
+		t.Errorf("out-of-range -> musicVolume=%.2f, want 1.0", c.MusicVolume)
+	}
+	// In range -> kept.
+	c3 := base
+	c3.MusicVolume = 0.4
+	if c := c3.repaired(); c.MusicVolume != 0.4 {
+		t.Errorf("valid altered: musicVolume=%.2f, want 0.4", c.MusicVolume)
+	}
+}
+
 func TestWorldVolumeDefaultAndRepair(t *testing.T) {
 	if d := Default(); d.WorldVolume != 0.5 {
 		t.Errorf("default worldVolume = %.2f, want 0.5", d.WorldVolume)

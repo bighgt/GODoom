@@ -15,6 +15,7 @@ type SceneThing struct {
 
 	Model         *assets.VoxelModel // nil -> draw the sprite
 	ModelAngleOff float64            // VOXELDEF AngleOffset, degrees
+	ModelScale    float64            // extra scale on top of config voxelScale; 0 == 1
 
 	Prefix string // 4-letter sprite name (voxel fallback + non-voxel things)
 	Frame  int
@@ -39,7 +40,7 @@ func (r *Renderer) DrawThings(cam Camera, list []SceneThing) (voxels, sprites in
 	// on the strip workers.
 	for i := range list {
 		t := &list[i]
-		if t.Model != nil && !r.voxelOnScreenOK(cam, t.X, t.Y, t.Model) {
+		if t.Model != nil && !r.voxelOnScreenOK(cam, t.X, t.Y, t.Model, t.ModelScale) {
 			t.Model = nil // too small / off screen — fall back to the sprite
 		}
 		if t.Model != nil {
@@ -60,7 +61,7 @@ func (r *Renderer) DrawThings(cam Camera, list []SceneThing) (voxels, sprites in
 			t := &list[i]
 			switch {
 			case t.Model != nil:
-				r.drawVoxel(cam, t.X, t.Y, t.Z, t.Angle, t.Light, t.FullBright, t.ModelAngleOff, t.Model, c)
+				r.drawVoxel(cam, t.X, t.Y, t.Z, t.Angle, t.Light, t.FullBright, t.ModelAngleOff, t.Model, t.ModelScale, c)
 			case t.sprite != nil:
 				r.drawThingSprite(cam, t, c)
 			}

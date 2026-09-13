@@ -235,12 +235,25 @@ func (r *Renderer) uploadIsoVoxelMesh(m *assets.VoxelModel) error {
 // but the push constant's fragment half is just (light, fullbright): no
 // per-instance shade.zw payload, since isovoxel.frag has no dynamic lights
 // to gate.
-func (r *Renderer) recordIsoVoxels(cmd vk.CommandBuffer, g *worldgeo.Geometry, vp [16]float32) {
+// revealAlpha > 0 makes this the occluded-silhouette pass: bind
+// pipeVoxelReveal (GREATER depth) and hand isovoxel.frag the alpha in
+// shade.z so a hidden voxel model shows as a flat tint.
+func (r *Renderer) recordIsoVoxels(cmd vk.CommandBuffer, g *worldgeo.Geometry, vp [16]float32, revealAlpha float32) {
 	ir := r.ir
-	if ir.pipeVoxel == nil || len(g.Voxels) == 0 {
+	pipe := ir.pipeVoxel
+	if revealAlpha > 0 {
+		pipe = ir.pipeVoxelReveal
+	}
+	if pipe == nil || len(g.Voxels) == 0 {
 		return
 	}
-	vk.CmdBindPipeline(cmd, vk.PipelineBindPointGraphics, ir.pipeVoxel)
+	vk.CmdBindPipeline(cmd, vk.PipelineBindPointGraphics, pipe)
+
+	// On the reveal pass, a model far from screen centre (i.e. far from the
+	// player) doesn't get a silhouette — mirrors iso.frag's per-fragment
+	// screen-radius gate for sprites. r² of the cutoff, in pixels.
+	revealR2 := float64(IsoRevealScreenRadius) * float64(IsoRevealScreenRadius)
+	halfW, halfH := float64(ir.w)*0.5, float64(ir.h)*0.5
 
 	var pc [voxelPushBytes / 4]float32
 	for i := range g.Voxels {
@@ -250,6 +263,13 @@ func (r *Renderer) recordIsoVoxels(cmd vk.CommandBuffer, g *worldgeo.Geometry, v
 			continue
 		}
 		mvp := worldgeo.Mat4Mul(vp, worldgeo.VoxelModelMatrix(inst))
+		if revealAlpha > 0 && mvp[15] != 0 {
+			dx := float64(mvp[12]/mvp[15]) * halfW
+			dy := float64(mvp[13]/mvp[15]) * halfH
+			if dx*dx+dy*dy > revealR2 {
+				continue
+			}
+		}
 		copy(pc[0:16], mvp[:])
 		pc[16], pc[17], pc[18], pc[19] = inst.X, inst.Y, inst.Z, inst.Scale
 		pc[20], pc[21], pc[22], pc[23] = float32(math.Cos(float64(inst.Yaw))), float32(math.Sin(float64(inst.Yaw))), 0, 0
@@ -257,7 +277,7 @@ func (r *Renderer) recordIsoVoxels(cmd vk.CommandBuffer, g *worldgeo.Geometry, v
 		if inst.FullBright {
 			fb = 1
 		}
-		pc[24], pc[25], pc[26], pc[27] = inst.Light, fb, 0, 0
+		pc[24], pc[25], pc[26], pc[27] = inst.Light, fb, revealAlpha, 0
 
 		vk.CmdPushConstants(cmd, ir.plVoxel, vk.ShaderStageFlags(vk.ShaderStageVertexBit),
 			0, voxelPushVert, unsafe.Pointer(&pc[0]))
@@ -380,9 +400,21 @@ var (
 	IsoAmbient     = float32(0.35)
 	// IsoPlayerFadeRadius is how far (in the offscreen render target's own
 	// pixels — see iso.frag's playerFade()) a wall/masked fragment can sit
-	// from screen centre and still be considered "over the player" and
-	// faded so an occluding wall never hides where the player is.
-	IsoPlayerFadeRadius = float32(56)
+	// from screen centre and still be dithered-faded so a near wall doesn't
+	// hide where the PLAYER is.
+	IsoPlayerFadeRadius = float32(64)
+	// IsoRevealHaloRadius is the much tighter version of the above around
+	// each nearby monster/item in the reveal list — just a soft shimmer so
+	// the wall says "something's here"; the silhouette pass makes it legible.
+	IsoRevealHaloRadius = float32(40)
+	// IsoRevealAlpha drives the occluded-silhouette pass (isoworld.go's
+	// recordIsoCommandBuffer, iso.frag / isovoxel.frag ISO_REVEAL_TINT): a
+	// monster/item/barrel a wall or a higher floor is hiding, WITHIN
+	// IsoRevealScreenRadius px of screen centre (i.e. near the player), is
+	// re-drawn as a flat gold ghost at this alpha, fading over the outer
+	// third. 0 disables the pass.
+	IsoRevealAlpha        = float32(0.42)
+	IsoRevealScreenRadius = float32(260)
 )
 
 // uploadIsoOverlay memcpys the HUD's CPU-drawn RGBA8 plane into this frame's
@@ -550,10 +582,11 @@ func (r *Renderer) recordIsoCommandBuffer(cmd vk.CommandBuffer, imageIndex uint3
 
 	vp := worldgeo.IsoViewProj(cam, ir.w, ir.h)
 	pc := isoPushConstants{
-		viewProj:     vp,
-		sunX:         IsoSunDir[0], sunY: IsoSunDir[1], sunZ: IsoSunDir[2], sunStrength: IsoSunStrength,
+		viewProj: vp,
+		sunX:     IsoSunDir[0], sunY: IsoSunDir[1], sunZ: IsoSunDir[2], sunStrength: IsoSunStrength,
 		ambientFloor: IsoAmbient,
 		screenW:      float32(ir.w), screenH: float32(ir.h), fadeRadius: IsoPlayerFadeRadius,
+		revealHaloRadius: IsoRevealHaloRadius, // occluderFade's per-thing wall shimmer (both passes)
 	}
 	vk.CmdBindPipeline(cmd, vk.PipelineBindPointGraphics, ir.pipeWorld)
 	vk.CmdPushConstants(cmd, ir.plWorld,
@@ -612,7 +645,24 @@ func (r *Renderer) recordIsoCommandBuffer(cmd vk.CommandBuffer, imageIndex uint3
 	// Voxel models — own pipeline, still inside the world pass so the depth
 	// buffer sorts them against the level and the textured geometry (same
 	// reasoning as world.go's recordVoxels call).
-	r.recordIsoVoxels(cmd, g, vp)
+	r.recordIsoVoxels(cmd, g, vp, 0)
+
+	// Occluded-silhouette pass: re-draw just the moving things (sprite
+	// billboards + voxel models — never the walls) with the GREATER-depth
+	// pipelines, so any monster/item/barrel a wall or a higher floor is
+	// hiding still shows as a flat ISO_REVEAL_TINT ghost. depthWrite is off
+	// and the depth buffer already has the whole scene, so no sorting is
+	// needed. Cheap: it's the same handful of billboards/models again.
+	if IsoRevealAlpha > 0 && (len(g.Draws) > 0 || len(g.Voxels) > 0) {
+		pc.revealAlpha = IsoRevealAlpha
+		pc.revealScreenRadius = IsoRevealScreenRadius
+		vk.CmdBindPipeline(cmd, vk.PipelineBindPointGraphics, ir.pipeSpriteReveal)
+		vk.CmdPushConstants(cmd, ir.plWorld,
+			vk.ShaderStageFlags(vk.ShaderStageVertexBit)|vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+			0, uint32(unsafe.Sizeof(pc)), unsafe.Pointer(&pc))
+		drawRuns(ir.dynVBO, g.Draws)
+		r.recordIsoVoxels(cmd, g, vp, IsoRevealAlpha)
+	}
 
 	vk.CmdEndRenderPass(cmd)
 
@@ -701,6 +751,9 @@ func (r *Renderer) destroyIsoResources() {
 	if ir.pipeWorld != nil {
 		vk.DestroyPipeline(dev, ir.pipeWorld, nil)
 	}
+	if ir.pipeSpriteReveal != nil {
+		vk.DestroyPipeline(dev, ir.pipeSpriteReveal, nil)
+	}
 	if ir.plWorld != nil {
 		vk.DestroyPipelineLayout(dev, ir.plWorld, nil)
 	}
@@ -729,6 +782,9 @@ func (r *Renderer) destroyIsoResources() {
 	}
 	if ir.pipeVoxel != nil {
 		vk.DestroyPipeline(dev, ir.pipeVoxel, nil)
+	}
+	if ir.pipeVoxelReveal != nil {
+		vk.DestroyPipeline(dev, ir.pipeVoxelReveal, nil)
 	}
 	if ir.plVoxel != nil {
 		vk.DestroyPipelineLayout(dev, ir.plVoxel, nil)

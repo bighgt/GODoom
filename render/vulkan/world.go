@@ -84,6 +84,17 @@ const (
 	worldUBOFloats = worldUBOHead + worldMaxLights*4*2 + shadowCasterMax*4
 )
 
+// cartoonLightBands/cartoonOutlineStrength tune config.CartoonShading's
+// look: how many flat lighting steps world.frag's fade() posterizes to, and
+// how dark worldblit.frag's depth-edge outline pass draws (0..1, applied as
+// a mix toward black — see recordWorldCommandBuffer's blitPC comment).
+// Fixed constants rather than config knobs — like ambGodrayStrength and
+// friends, a style choice more than something a player needs to dial in.
+const (
+	cartoonLightBands      = 4.0
+	cartoonOutlineStrength = 0.85
+)
+
 // worldUBO mirrors world.frag's `World` block header field-for-field. The
 // per-frame upload writes floats() then appends the light arrays.
 type worldUBO struct {
@@ -106,14 +117,20 @@ type worldUBO struct {
 	// from lightPos/lightColor (isotropic point lights) because a beam
 	// needs a direction and cone angle neither carries. SpotIntensity <= 0
 	// means off.
-	SpotX, SpotY, SpotZ          float32
-	SpotInvR2                    float32 // 1/radius^2
-	SpotDX, SpotDY, SpotDZ       float32 // normalized
-	SpotCosOuter                 float32
-	SpotR, SpotG, SpotB          float32
-	SpotIntensity                float32
-	SpotCosInner                 float32
-	spotPad0, spotPad1, spotPad2 float32
+	SpotX, SpotY, SpotZ    float32
+	SpotInvR2              float32 // 1/radius^2
+	SpotDX, SpotDY, SpotDZ float32 // normalized
+	SpotCosOuter           float32
+	SpotR, SpotG, SpotB    float32
+	SpotIntensity          float32
+	SpotCosInner           float32
+	// CartoonBands is cartoon-shading's band count (world.frag's fade()
+	// posterizes its 0..1 brightness to the nearest multiple of 1/N when
+	// this is > 0; 0 = off, the smooth vanilla gradient) — repurposes what
+	// was a spare pad float alongside the flashlight's own vec4, rather
+	// than growing the UBO for one more scalar.
+	CartoonBands       float32
+	spotPad1, spotPad2 float32
 }
 
 func (u worldUBO) floats() [worldUBOHead]float32 {
@@ -127,7 +144,7 @@ func (u worldUBO) floats() [worldUBOHead]float32 {
 		u.SpotX, u.SpotY, u.SpotZ, u.SpotInvR2,
 		u.SpotDX, u.SpotDY, u.SpotDZ, u.SpotCosOuter,
 		u.SpotR, u.SpotG, u.SpotB, u.SpotIntensity,
-		u.SpotCosInner, u.spotPad0, u.spotPad1, u.spotPad2,
+		u.SpotCosInner, u.CartoonBands, u.spotPad1, u.spotPad2,
 	}
 }
 
@@ -197,12 +214,13 @@ type worldResources struct {
 	plVoxel   vk.PipelineLayout
 	pipeVoxel vk.Pipeline
 	voxCache  map[*assets.VoxelModel]*voxelMesh
+	voxDbg    int // 0 until recordVoxels has logged its one-shot "drew N models" line
 
 	slots [maxFramesInFlight]worldSlot
 
 	texCache map[*assets.RGBA]*worldTex // keyed by the shared bitmap pointer
 
-	bloom  worldBloom  // HDR bright-pass + blur (worldbloom.go)
+	bloom   worldBloom   // HDR bright-pass + blur (worldbloom.go)
 	ambient worldAmbient // quarter-res shadow/AO/god-ray term (worldambient.go)
 
 	// Static world geometry (all walls + flats) — one device-local vertex
@@ -542,6 +560,9 @@ func (r *Renderer) uploadWorldFrame(sl *worldSlot, g *worldgeo.Geometry, cam wor
 		AmbB:         ambB,
 		AmbStrength:  ambStr,
 	}
+	if cam.CartoonShading {
+		u.CartoonBands = cartoonLightBands
+	}
 	if cam.SpotIntensity > 0 {
 		rad := cam.SpotRadius
 		if rad < 0.001 {
@@ -820,6 +841,10 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 		sharpenStrength = 0.35 // CAS 0..1
 		ditherStrength  = 1.0  // +/- 1 LSB triangular-PDF, kills 8-bit banding
 	)
+	outlineStrength := float32(0)
+	if cam.CartoonShading {
+		outlineStrength = cartoonOutlineStrength
+	}
 	blitPC := [24]float32{
 		wr.bloom.exposure, wr.bloom.strength, float32(cam.Time), float32(worldgeo.NearPlane),
 		bSin, bCos, float32(bFocal), float32(worldgeo.FarPlane),
@@ -827,7 +852,9 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 		// p3.w (godrayStrength) scales+tints the pre-marched god-ray luma
 		// worldblit.frag samples from worldambient.go's ambient buffer.
 		float32(wr.w), float32(wr.h), ssrStrength, ambGodrayStrength,
-		sharpenStrength, ditherStrength, 0, 0, // p4.zw unused (pad to a vec4)
+		// p4.w was the last unused pad; now cartoon shading's depth-edge
+		// outline strength (0 = off — see cartoonOutlineStrength's doc).
+		sharpenStrength, ditherStrength, 0, outlineStrength,
 		// p5: full-frame sector-effect tint (rgb, amount; A<0 also = heat wobble)
 		cam.TintR, cam.TintG, cam.TintB, cam.TintA,
 	}

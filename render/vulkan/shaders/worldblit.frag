@@ -26,7 +26,10 @@
 //   3. tonemap     — ACES filmic (Narkowicz fit) of (scene+bloom)*exposure.
 //   4. FXAA        — console-variant edge AA on the tonemapped image.
 //   5. CAS         — FidelityFX-style contrast-adaptive sharpen.
-//   6. overlay + ordered-free triangular dither to kill 8-bit banding.
+//   6. outline     — config cartoonShading: darkens pixels where uDepth
+//                    jumps sharply against its 4 neighbours (a silhouette,
+//                    a corner, geometry against the sky) toward black.
+//   7. overlay + ordered-free triangular dither to kill 8-bit banding.
 
 layout(location = 0) in vec2 fragUV;
 layout(location = 0) out vec4 outColor;
@@ -56,7 +59,7 @@ layout(push_constant) uniform PC {
     vec4 p1; // sinA, cosA, focal(px), farPlane
     vec4 p2; // camX, camY, camZ, horizonY(px, pitch-sheared)
     vec4 p3; // width, height, ssrStrength, godrayStrength
-    vec4 p4; // sharpenStrength(0..1), ditherStrength(LSBs), unused, unused
+    vec4 p4; // sharpenStrength(0..1), ditherStrength(LSBs), unused, cartoonOutlineStrength(0=off)
     vec4 p5; // screen tint: rgb, amount (0 = none; amount < 0 also = heat wobble)
 } pc;
 
@@ -114,6 +117,40 @@ float depthAtUV(vec2 uv) {
     vec2 res = pc.p3.xy;
     ivec2 t = ivec2(clamp(uv, vec2(0.0), vec2(0.9999)) * res);
     return linDepth(texelFetch(uDepth, t, 0).r);
+}
+
+// depthAtTexel is depthAtUV for an already-clamped integer texel — used by
+// cartoonOutline's 4-neighbour taps, which would otherwise sample past the
+// edge of uDepth for a pixel on the screen border (texelFetch outside a
+// texture's bounds is undefined, unlike a filtered sampler's clamp-to-edge).
+float depthAtTexel(ivec2 t) {
+    ivec2 res = ivec2(pc.p3.xy) - 1;
+    return linDepth(texelFetch(uDepth, clamp(t, ivec2(0), res), 0).r);
+}
+
+// cartoonOutline (config cartoonShading, pc.p4.w = strength, 0 = off): a
+// cheap 4-neighbour depth-edge detector — silhouettes, corners, and
+// geometry seen against the sky (whose depth reads as the far plane) all
+// show up as a sharp jump against centerDepth. The threshold scales with
+// distance rather than a fixed map-unit gap: at typical Doom-scale depths a
+// fixed threshold either misses distant wall seams (a few units of true
+// depth difference is a whole wall, far away) or false-positives on nearby
+// texture-scale depth noise, so it's a fraction of the pixel's own depth
+// instead. Returns 0..1 — how much of an edge this pixel sits on, not just
+// a bool, so a grazing edge still darkens gently.
+float cartoonOutline(ivec2 texel, float centerDepth) {
+    // A 1-texel radius reads as a hairline once the render-resolution image
+    // is upscaled to the window — too thin to read as a deliberate cartoon
+    // outline rather than ordinary edge noise. OUTLINE_R thickens it by
+    // sampling further out; still just 4 taps, so the cost stays flat.
+    const int OUTLINE_R = 2;
+    float dl = depthAtTexel(texel + ivec2(-OUTLINE_R, 0));
+    float dr = depthAtTexel(texel + ivec2(OUTLINE_R, 0));
+    float du = depthAtTexel(texel + ivec2(0, -OUTLINE_R));
+    float dd = depthAtTexel(texel + ivec2(0, OUTLINE_R));
+    float delta = abs(dl - centerDepth) + abs(dr - centerDepth) + abs(du - centerDepth) + abs(dd - centerDepth);
+    float threshold = max(centerDepth * 0.01, 4.0);
+    return clamp(delta / threshold - 1.0, 0.0, 1.0);
 }
 
 // worldFromPixel: render-res pixel (origin top-left) + camera-forward
@@ -282,7 +319,16 @@ void main() {
         if (pc.p4.x > 0.0) mapped = cas(uv, mapped);
     }
 
-    // 6. sector-effect screen tint (lava / nukage / blood) — after tonemap,
+    // 6. cartoon outline (config cartoonShading) — runs on everything,
+    // water and sky included: a boat's waterline and a building's roofline
+    // against the sky are exactly the silhouettes a cel-shaded look wants
+    // outlined, not edges to protect from.
+    if (pc.p4.w > 0.0) {
+        float edge = cartoonOutline(texel, ez0) * pc.p4.w;
+        mapped = mix(mapped, vec3(0.0), edge);
+    }
+
+    // 7. sector-effect screen tint (lava / nukage / blood) — after tonemap,
     // before the HUD so the overlay stays true-colour. A negative amount also
     // asks for a slow heat wobble + brightness breathing (lava).
     float tintAmt = abs(pc.p5.w);
@@ -296,7 +342,7 @@ void main() {
         mapped = mix(mapped, pc.p5.rgb, clamp(tintAmt, 0.0, 0.85));
     }
 
-    // 7. overlay (crisp, unsharpened) + triangular-PDF dither
+    // 8. overlay (crisp, unsharpened) + triangular-PDF dither
     vec4 ov = texture(uOverlay, uv);
     vec3 col = mix(mapped, ov.rgb, ov.a);
 

@@ -197,6 +197,12 @@ type Game struct {
 	// level's background music is driven entirely from cmd/engine.
 	AudioDevice *audio.Device
 
+	// AltWAD is the other game's IWAD, set by cmd/engine after NewGame when
+	// config's switchWeapons is on. loadSound falls back to it for a weapon
+	// fire lump the played WAD doesn't have (the sprite side is handled by
+	// assets.Textures.SetSpriteFallback). Nil otherwise.
+	AltWAD *wad.WAD
+
 	// Voxels, when set, replaces a map object's flat sprite with a voxel
 	// model wherever the loaded pack has one for that sprite frame (see
 	// drawMobjs, raster.DrawVoxel). nil = sprites only. Set by cmd/engine
@@ -252,6 +258,24 @@ type Game struct {
 	// Skill (1..5) filters which map THINGS spawn; consumed by
 	// spawnMapThings during NewGame. Default 3.
 	Skill int
+	// heretic is set in NewGame when the loaded WAD is a Heretic IWAD
+	// (isHereticWAD). It switches spawnMapThings to the Heretic thing table
+	// (engine/heretic.go), teaches the door code Heretic's non-locked
+	// special 99, and picks the Heretic sky / animated flats. Heretic
+	// game_design.txt §24. heretic gates the Heretic thing tables, weapons,
+	// artifact inventory, HUD and door/sky/liquid fixes.
+	heretic bool
+
+	// swapWeapons mirrors config.SwitchWeapons: the arsenal (weapon table,
+	// starting loadout) is the OTHER game's, and the on-map weapon / ammo
+	// pickup THINGS are re-skinned to match (engine/switchweapons.go). Set
+	// in NewGame before spawnMapThings.
+	swapWeapons bool
+
+	// Heretic artifact inventory input edges + active Time Bombs (see
+	// engine/heretic_arti.go).
+	artiUseDown, artiNextDown, artiPrevDown bool
+	timeBombs                               []timeBomb
 	// MaxFPS caps the frame rate in Run when > 0 (a sleep at end of frame);
 	// meant for when vsync is off. 0 = uncapped.
 	MaxFPS int
@@ -324,6 +348,11 @@ type Game struct {
 	// per-thing contact-blob pass (drawGroundShadows).
 	shadows       bool
 	groundShadows bool
+	// cartoonShading (config cartoonShading, default off) asks the hardware
+	// renderer for a cel-shaded look — see worldgeo.Camera.CartoonShading's
+	// doc comment for what that actually does; renderFrame's hardware
+	// branch copies this onto the per-frame Camera it builds.
+	cartoonShading bool
 
 	closing       bool          // set once when Escape has asked the window to close, so the log line prints once
 	spaceWasDown  bool          // for edge-detecting the "use" key (E)
@@ -542,6 +571,7 @@ func NewGame(win *window.Window, renderer render.Renderer, ras *raster.Renderer,
 		exposure:             float32(cfg.Exposure),
 		shadows:              cfg.Shadows,
 		groundShadows:        cfg.GroundShadows,
+		cartoonShading:       cfg.CartoonShading,
 		damageScale:          cfg.DamageScale,
 		weaponVolume:         cfg.WeaponVolume,
 		worldVolume:          cfg.WorldVolume,
@@ -563,6 +593,55 @@ func NewGame(win *window.Window, renderer render.Renderer, ras *raster.Renderer,
 	g.AddSystem(combatSystem{})
 	g.AddSystem(cheatSystem{})
 	g.AddSystem(flashlightSystem{})
+	g.AddSystem(artifactSystem{}) // Heretic inventory (no-op for a Doom game)
+
+	// The weapon table is a mutated package global (DEH edits it too), so
+	// every session starts from a pristine Doom copy before DEH / Heretic
+	// reshape it — otherwise a Heretic session would leak its weapons into
+	// the next Doom one through the launcher loop.
+	resetWeaponTables()
+
+	g.heretic = isHereticWAD(w)
+	if g.heretic {
+		log.Printf("engine: Heretic IWAD detected — monsters, artifacts, HUD, doors, sky, voxels active")
+		if g.Raster != nil {
+			g.Raster.SetPreferWADSky(true) // Heretic's own skies, not the Mars panorama
+			if tx := g.Raster.Textures(); tx != nil {
+				// Prefer the Heretic HD texture pack (assets/textures/heretic/,
+				// tools/importhereticpbr) for every wall/flat it covers — inert
+				// when the pack isn't installed.
+				tx.SetHeretic(true)
+				if hw, hf := tx.HereticPackSize(); hw+hf > 0 {
+					log.Printf("engine: Heretic HD texture pack active — %d walls, %d flats", hw, hf)
+				}
+				// Heretic's SKY1..SKY3 texture names collide with Doom's
+				// generated sky PNGs — drop those overrides so the Heretic
+				// sky isn't replaced by a Doom one.
+				tx.DropHiresOverrides("SKY1", "SKY2", "SKY3")
+			}
+		}
+	}
+
+	// Arsenal. Normally this game's own — but config's switchWeapons puts
+	// Heretic's guns in a Doom level and Doom's in a Heretic one (the
+	// pickup THINGS grant by slot, so they adapt). The Doom set is already
+	// active (resetWeaponTables above + the struct-literal player stats), so
+	// only the Heretic case needs work.
+	g.swapWeapons = cfg.SwitchWeapons
+	hereticArsenal := g.heretic
+	if cfg.SwitchWeapons {
+		hereticArsenal = !g.heretic
+		which := "Heretic"
+		if !hereticArsenal {
+			which = "Doom"
+		}
+		log.Printf("engine: switchWeapons — playing with the %s arsenal", which)
+	}
+	if hereticArsenal {
+		applyHereticWeapons()           // reshape the 8 weapon slots into Heretic's set
+		g.Player = hereticPlayerStats() // staff + wand + 50 crystals, Heretic ammo caps
+		g.Weapon = NewWeaponState()
+	}
 
 	g.mods = loadMods()                // assets/mods/*.pk3 + loose files
 	g.loadTextureDefs(w, g.mods)       // ZDoom TEXTURES composite defs (WAD and/or mod)
@@ -783,6 +862,11 @@ func (g *Game) renderFrame() error {
 		geom := g.WorldBuilder.Build(float32(g.Camera.X), float32(g.Camera.Y))
 		restoreSecH() // authoritative heights back before anything else reads them
 		sprites, voxels := g.collectWorldObjects()
+		if g.Voxels != nil && !g.loggedVoxelStatus && len(sprites)+len(voxels) > 0 {
+			g.loggedVoxelStatus = true
+			log.Printf("engine: [hw] map objects this frame — %d voxel instance(s), %d sprite(s) to the GPU voxel/billboard pass",
+				len(voxels), len(sprites))
+		}
 		g.WorldBuilder.AddSprites(g.Camera.Angle, sprites)
 		g.WorldBuilder.AddVoxels(voxels)
 		wc := worldgeo.Camera{
@@ -790,6 +874,7 @@ func (g *Game) renderFrame() error {
 			Angle: g.Camera.Angle, Pitch: g.Camera.Pitch, FOVDeg: fov,
 			Time: g.renderClock, // world.frag water ripple
 			FogR: g.fogR, FogG: g.fogG, FogB: g.fogB, FogDensity: g.fogDensity,
+			CartoonShading: g.cartoonShading,
 		}
 		// Dynamic point lights (muzzle flash, projectile glow, map lights) —
 		// world.frag adds a smooth 1-(d/R)^2 falloff on top of the vanilla
@@ -1036,6 +1121,27 @@ func (g *Game) resolvePlayerZ(dt float64) {
 		return
 	}
 	floor, ceil := float64(sec.FloorHeight), float64(sec.CeilingHeight)
+
+	// Heretic Wings of Wrath: free vertical movement, no gravity or fall
+	// damage. Space rises, no key sinks slowly; clamp between the floor and
+	// just under the ceiling.
+	if g.heretic && g.Player.Powers[pwFlight] > 0 && !g.playerDead {
+		const flySpeed = 200.0
+		vz := -0.35 * flySpeed // gentle sink by default
+		if g.Window != nil && g.Window.JumpPressed() {
+			vz = flySpeed
+		}
+		g.PlayerZ += vz * dt
+		if g.PlayerZ < floor {
+			g.PlayerZ = floor
+		}
+		if top := ceil - playerHeight; g.PlayerZ > top {
+			g.PlayerZ = top
+		}
+		g.VelZ, g.onGround = 0, g.PlayerZ <= floor+0.5
+		g.Camera.Z = g.PlayerZ + EyeHeight
+		return
+	}
 
 	impact := g.VelZ // descent speed going into this step, for the dip depth
 	wasGround := g.onGround

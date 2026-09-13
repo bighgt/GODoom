@@ -166,6 +166,19 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 		return fmt.Errorf("index textures: %w", err)
 	}
 
+	// config's switchWeapons: play with the other game's arsenal — see
+	// engine.NewGame for the table swap; here for the cross-game sprites.
+	var altWAD *wad.WAD
+	if cfg.SwitchWeapons {
+		if ow, op, ok := wad.OtherGameIWAD(path, w); ok {
+			altWAD = ow
+			textures.SetSpriteFallback(ow)
+			log.Printf("isoengine: switchWeapons — weapon art/sounds from %s", filepath.Base(op))
+		} else {
+			log.Printf("isoengine: switchWeapons on, but the other game's IWAD wasn't found — the arsenal still swaps, art may be blank")
+		}
+	}
+
 	win, err := window.New(1280, 720, "TwoPointFive - Isometric", false)
 	if err != nil {
 		return fmt.Errorf("open window: %w", err)
@@ -201,6 +214,7 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 	cam := engine.StartCamera(level, tree)
 	game := engine.NewGame(win, renderer, ras, w, level, tree, cam, cfg)
 	game.AudioDevice = dev
+	game.AltWAD = altWAD // switchWeapons fire-sound fallback (nil otherwise)
 	game.HardwareMode = true
 	game.WorldBuilder = worldgeo.New(level, tree, textures)
 	game.WorldBuilder.SkipCeilings = true
@@ -216,6 +230,7 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 		audio.PlayLevelMusic(w, music, game.MapMusicLump(next), next, "isoengine")
 	}
 	if cfg.Music && music != nil {
+		music.SetVolume(cfg.MusicVolume)
 		audio.PlayLevelMusic(w, music, game.MapMusicLump(mapName), mapName, "isoengine")
 	}
 	loadVoxels(game, mapName, cfg)
@@ -272,20 +287,27 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 		geo := game.WorldBuilder.Build(0, 0)
 		sprites, voxels := game.CollectIsoWorldObjects(ctl.cam.Azimuth)
 
-		// Reveal points: every monster/item/barrel/other thing a wall should
-		// fade for if one stands between it and the camera (see DrawIso's
-		// own doc comment and iso.frag's occluderFade) — built from the same
-		// sprites/voxels this frame already collected, before the player's
-		// own sprite is appended below. The player doesn't need an entry
-		// here: the camera always tracks the player, so iso.frag's
-		// playerFade already covers them for free (fixed screen centre, no
-		// per-frame data needed).
+		// Reveal points: the monsters/items/barrels/etc a wall should fade
+		// for if one stands between it and the camera (see DrawIso's own doc
+		// comment and iso.frag's occluderFade), built from the sprites/voxels
+		// this frame already collected — but only those NEAR THE PLAYER
+		// (isoRevealWorldRadius). A thing off in a far room behind a dozen
+		// walls isn't something you're about to fight, and fading a wall for
+		// each of dozens of them would stipple the whole map. The player
+		// itself needs no entry: the camera tracks it, so iso.frag's
+		// playerFade covers screen centre for free.
 		reveal := make([][3]float32, 0, len(sprites)+len(voxels))
+		add := func(x, y, z float32) {
+			dx, dy := float64(x)-game.Camera.X, float64(y)-game.Camera.Y
+			if dx*dx+dy*dy <= isoRevealWorldRadius*isoRevealWorldRadius {
+				reveal = append(reveal, [3]float32{x, y, z})
+			}
+		}
 		for _, s := range sprites {
-			reveal = append(reveal, [3]float32{s.X, s.Y, s.Z})
+			add(s.X, s.Y, s.Z)
 		}
 		for _, v := range voxels {
-			reveal = append(reveal, [3]float32{v.X, v.Y, v.Z})
+			add(v.X, v.Y, v.Z)
 		}
 
 		if ps, ok := playerSprite(game, ctl.cam.Azimuth, dt); ok {
@@ -324,7 +346,10 @@ func loadVoxels(game *engine.Game, mapName string, cfg config.Config) {
 		return
 	}
 	pk3 := "Doom1_Voxel.pk3"
-	if strings.HasPrefix(mapName, "MAP") {
+	switch {
+	case game.WAD.IsHeretic():
+		pk3 = "reikallhereticvoxels.pk3"
+	case strings.HasPrefix(mapName, "MAP"):
 		pk3 = "Doom2_Voxel.pk3"
 	}
 	vs, err := assets.LoadVoxelPackDir(pk3)
@@ -342,6 +367,12 @@ func loadVoxels(game *engine.Game, mapName string, cfg config.Config) {
 // own rotation frame, far enough that raster.SpriteRotation's quantisation
 // matches an actually-infinitely-distant orthographic viewer.
 const playerViewerDist = 1 << 20
+
+// isoRevealWorldRadius is how far from the player (map units) a thing can be
+// and still drive the wall occluder-fade / occluded-silhouette (see the
+// frame loop's reveal list and iso.frag). ~10 tiles — the stuff you'd
+// actually be engaging; anything past it dotting the map would be noise.
+const isoRevealWorldRadius = 460.0
 
 // playerWalkPhase animates the player's own PLAY sprite through Doom's
 // 4-frame walk cycle (A/B/C/D — the same frames a netgame shows other
@@ -419,4 +450,3 @@ func nearestAimTarget(game *engine.Game, cam worldgeo.IsoCamera, w, h int, mx, m
 	}
 	return x, y, ok
 }
-

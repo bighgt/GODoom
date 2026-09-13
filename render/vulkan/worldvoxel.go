@@ -3,6 +3,7 @@ package vulkan
 import (
 	_ "embed"
 	"fmt"
+	"log"
 	"math"
 	"runtime"
 	"sync"
@@ -31,8 +32,9 @@ var voxelFragSPV []byte
 // Push constant split into two NON-overlapping ranges so the two shader
 // stages' blocks can't be pruned by -O into incompatible layouts (an AMD
 // driver returns VK_ERROR_UNKNOWN from vkCreateGraphicsPipelines for that):
-//   [0,96)   vertex   — mat4 mvp (64) + vec4 trans + vec4 rot (32)
-//   [96,112) fragment — vec4 shade
+//
+//	[0,96)   vertex   — mat4 mvp (64) + vec4 trans + vec4 rot (32)
+//	[96,112) fragment — vec4 shade
 const (
 	voxelPushVert  = 96
 	voxelPushFrag  = 16
@@ -51,8 +53,8 @@ func (r *Renderer) worldCreateVoxelPipeline() error {
 	wr := r.wr
 
 	layoutInfo := vk.PipelineLayoutCreateInfo{
-		SType:          vk.StructureTypePipelineLayoutCreateInfo,
-		SetLayoutCount: 1,
+		SType:                  vk.StructureTypePipelineLayoutCreateInfo,
+		SetLayoutCount:         1,
 		PSetLayouts:            []vk.DescriptorSetLayout{wr.dsl1},
 		PushConstantRangeCount: 2,
 		PPushConstantRanges: []vk.PushConstantRange{
@@ -214,12 +216,12 @@ func (r *Renderer) WarmVoxels(models []*assets.VoxelModel) {
 	wg.Wait()
 
 	type pending struct {
-		m      *assets.VoxelModel
-		vbuf   vk.Buffer
+		m       *assets.VoxelModel
+		vbuf    vk.Buffer
 		vbufMem vk.DeviceMemory
-		off    int
-		size   int
-		count  uint32
+		off     int
+		size    int
+		count   uint32
 	}
 	var todo []pending
 	var scratch []byte // all meshes concatenated, staged in one buffer
@@ -383,12 +385,17 @@ func (r *Renderer) recordVoxels(cmd vk.CommandBuffer, sl *worldSlot, g *worldgeo
 
 	vp := worldgeo.ViewProj(cam, wr.w, wr.h) // once per frame, not per instance
 	var pc [voxelPushBytes / 4]float32       // 28 float32
+	nDrawn, nUncached := 0, 0
 	for i := range g.Voxels {
 		inst := g.Voxels[i]
 		vm := wr.voxCache[inst.Model]
 		if vm == nil || vm.count == 0 {
+			if vm == nil {
+				nUncached++
+			}
 			continue
 		}
+		nDrawn++
 		mvp := worldgeo.Mat4Mul(vp, worldgeo.VoxelModelMatrix(inst))
 		copy(pc[0:16], mvp[:])
 		pc[16], pc[17], pc[18], pc[19] = inst.X, inst.Y, inst.Z, inst.Scale
@@ -405,6 +412,14 @@ func (r *Renderer) recordVoxels(cmd vk.CommandBuffer, sl *worldSlot, g *worldgeo
 			voxelPushVert, voxelPushFrag, unsafe.Pointer(&pc[24]))
 		vk.CmdBindVertexBuffers(cmd, 0, 1, []vk.Buffer{vm.vbuf}, []vk.DeviceSize{0})
 		vk.CmdDraw(cmd, vm.count, 1, 0, 0)
+	}
+	// One line, the first frame any voxel model reaches the GPU, so the log
+	// makes it unambiguous whether the hardware path is drawing them — the
+	// mirror of engine.drawMobjs' software-path "map objects this frame" line.
+	if wr.voxDbg == 0 && nDrawn > 0 {
+		wr.voxDbg = 1
+		log.Printf("vulkan: voxel models — drew %d of %d instance(s) this frame (%d not yet meshed), %d model(s) resident",
+			nDrawn, len(g.Voxels), nUncached, len(wr.voxCache))
 	}
 }
 

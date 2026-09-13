@@ -59,7 +59,8 @@ type mixer struct {
 	voices    [mixVoices]mixVoice
 	seq       uint64
 	sfxGain   float32
-	musicGain float32
+	musicGain float32 // master music gain (TPF_MUSIC_GAIN)
+	musicVol  float32 // user music-volume multiplier on top of musicGain (config musicVolume); 1 = unchanged
 
 	// musicRender, when non-nil, fills an interleaved-stereo int16 block
 	// from the music synth. It is set and cleared by the MusicPlayer under
@@ -90,6 +91,7 @@ func startSharedAudio() (*mixer, error) {
 	m := &mixer{
 		sfxGain:   envGain("TPF_SFX_GAIN", 0.5),
 		musicGain: envGain("TPF_MUSIC_GAIN", 0.5),
+		musicVol:  1.0,
 	}
 
 	ctx, ready, err := oto.NewContext(&oto.NewContextOptions{
@@ -157,6 +159,19 @@ func (m *mixer) setMusicRender(fn func([]int16)) {
 	m.mu.Unlock()
 }
 
+// setMusicVolume sets the user music-volume multiplier (config musicVolume):
+// 1 leaves music at the master TPF_MUSIC_GAIN level, 0 mutes it. Negative
+// values are clamped to 0; the shared mixer keeps the value across trips
+// through the launcher.
+func (m *mixer) setMusicVolume(v float64) {
+	if v < 0 {
+		v = 0
+	}
+	m.mu.Lock()
+	m.musicVol = float32(v)
+	m.mu.Unlock()
+}
+
 // Read is the oto source callback: fill buf with interleaved little-endian
 // int16 stereo, always completely, and never report EOF.
 func (m *mixer) Read(buf []byte) (int, error) {
@@ -178,7 +193,7 @@ func (m *mixer) Read(buf []byte) (int, error) {
 		}
 		m.musicRender(music)
 	}
-	sfxGain, musicGain := m.sfxGain, m.musicGain
+	sfxGain, musicGain := m.sfxGain, m.musicGain*m.musicVol
 
 	for f := 0; f < frames; f++ {
 		var mono float32

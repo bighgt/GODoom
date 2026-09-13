@@ -224,3 +224,63 @@ func TestFilteredRenderSerialEqualsParallel(t *testing.T) {
 		}
 	}
 }
+
+// TestLog2FastAccuracy pins the mantissa-fit error of the log2 approximation
+// planAniso uses for its mip LOD: the fit must stay well under a tenth of a
+// mip level over the whole useful range, or filtered surfaces would pick a
+// visibly wrong blend.
+func TestLog2FastAccuracy(t *testing.T) {
+	var worst float64
+	for x := 1e-3; x < 4096; x *= 1.013 {
+		if e := math.Abs(log2fast(x) - math.Log2(x)); e > worst {
+			worst = e
+		}
+	}
+	if worst > 0.01 {
+		t.Errorf("log2fast worst error %.4f mip levels, want < 0.01", worst)
+	}
+}
+
+// TestBilerpFixedPointMatchesFloat checks the fixed-point bilerp stays
+// within ~1/255 of a plain float64 bilinear, so the rework is invisible in
+// the final 8-bit image.
+func TestBilerpFixedPointMatchesFloat(t *testing.T) {
+	src := solidTex(31, 17, func(x, y int) (byte, byte, byte) {
+		return byte((x*37 + y*11) & 255), byte((x*5 + y*53) & 255), byte((x ^ (y * 3)) & 255)
+	})
+	m := buildTexMips(src)
+	refBilerp := func(u, v float64) (float64, float64, float64) {
+		l := &m.lv[0]
+		uk := u*l.sx - 0.5
+		vk := v*l.sy - 0.5
+		u0 := int(math.Floor(uk))
+		v0 := int(math.Floor(vk))
+		tu, tv := uk-float64(u0), vk-float64(v0)
+		u0w, u1w := wrapInt(u0, l.w), wrapInt(u0+1, l.w)
+		v0w, v1w := wrapInt(v0, l.h), wrapInt(v0+1, l.h)
+		at := func(xx, yy, ch int) float64 { return float64(l.pix[(yy*l.w+xx)*4+ch]) }
+		ch := func(c int) float64 {
+			top := at(u0w, v0w, c)*(1-tu) + at(u1w, v0w, c)*tu
+			bot := at(u0w, v1w, c)*(1-tu) + at(u1w, v1w, c)*tu
+			return top*(1-tv) + bot*tv
+		}
+		return ch(0), ch(1), ch(2)
+	}
+	var worst float64
+	for i := 0; i < 20000; i++ {
+		u := float64(i%997) * 0.031
+		v := float64(i%531) * 0.057
+		gr, gg, gb, _ := m.bilerpLevel(0, u, v)
+		wr, wg, wb := refBilerp(u, v)
+		for _, d := range []float64{gr - wr, gg - wg, gb - wb} {
+			if math.Abs(d) > worst {
+				worst = math.Abs(d)
+			}
+		}
+	}
+	// 8-bit fractional weights (the classic software-renderer choice) — the
+	// measured worst case is ~1.9/255, sub-1%. Fail if it drifts past 2.5.
+	if worst > 2.5 {
+		t.Errorf("fixed-point bilerp worst channel error %.2f/255, want < 2.5", worst)
+	}
+}

@@ -4,6 +4,8 @@ import (
 	"log"
 	"math"
 	"os"
+
+	"twopointfive/raster"
 )
 
 // pickupDebug logs, when TPF_PICKUP_DEBUG is set, every MF_SPECIAL thing the
@@ -24,6 +26,9 @@ const (
 	pwIronFeet // radiation suit
 	pwAllMap
 	pwInfrared
+	pwTome   // Heretic Tome of Power — weapon damage/rate buff
+	pwTorch  // Heretic Torch artifact — a bright light for its duration
+	pwFlight // Heretic Wings of Wrath — free vertical movement
 	numPowers
 )
 
@@ -36,7 +41,7 @@ const (
 
 // clipAmmo is how much one "clip" of each ammo type is worth
 // (bullets, shells, cells, rockets) — id's clipammo[].
-var clipAmmo = [4]int{10, 4, 20, 1}
+var clipAmmo = [numAmmoTypes]int{10, 4, 20, 1, 1, 10}
 
 // weaponPickupAmmo: {ammo type, clips} keyed by weapon index (wp*). id's
 // P_GiveWeapon always gives two clips of the weapon's ammo for a found
@@ -137,6 +142,9 @@ func (g *Game) updatePowers() {
 			g.Player.Powers[i]--
 			if g.Player.Powers[i] == 0 && i == pwInvisibility && g.playerMobj != nil {
 				g.playerMobj.Flags &^= MF_SHADOW
+			}
+			if g.Player.Powers[i] == 0 && (i == pwTorch || i == pwTome) {
+				raster.ExtraLight = 0 // Heretic Torch / Tome ran out
 			}
 		}
 	}
@@ -255,7 +263,7 @@ func (g *Game) pTouchSpecialThing(special, toucher *Mobj) {
 		got = g.giveAmmo(2, clipAmmo[2]*5)
 	case MT_MISC24: // backpack — double capacity once, then a clip of everything
 		if !g.Player.Backpack {
-			for i := 0; i < 4; i++ {
+			for i := range g.Player.MaxAmmo {
 				g.Player.MaxAmmo[i] *= 2
 			}
 			g.Player.Backpack = true
@@ -287,6 +295,9 @@ func (g *Game) pTouchSpecialThing(special, toucher *Mobj) {
 	case MT_SUPERSHOTGUN:
 		got = g.giveWeapon(wpSuperShotgun, special.Flags&MF_DROPPED != 0)
 		sound = "DSWPNUP"
+
+	case MT_HERETIC: // a Heretic key / vial / ammo / artifact (engine/heretic.go)
+		got, sound = g.giveHeretic(special.hereticGift)
 
 	default:
 		return // not a recognised pickup

@@ -22,7 +22,8 @@ type Model struct {
 	Maps     []string
 	MapName  string
 
-	ScrollY float64
+	ActiveTab int     // index into sectionOrder — which settings tab is shown
+	ScrollY   float64 // scroll offset within the active tab (reset on tab change)
 
 	Status    string
 	StatusErr bool
@@ -38,6 +39,12 @@ type Model struct {
 // pre-picked so re-launching drops you back where you left off.
 func NewModel(initial config.Config) *Model {
 	m := &Model{Cfg: initial, QuickWADs: ListWADs(), MapName: strings.TrimSpace(initial.Map)}
+	// The Audio tab has no Music checkbox — the Music Volume slider is the
+	// on/off. Show it at 0 when music was disabled so the slider reflects
+	// reality; run.go turns Cfg.Music back on/off from the slider on Play.
+	if !m.Cfg.Music {
+		m.Cfg.MusicVolume = 0
+	}
 	if initial.WADPath != "" {
 		m.PickWAD(initial.WADPath)
 	}

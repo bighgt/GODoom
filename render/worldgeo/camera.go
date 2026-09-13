@@ -50,6 +50,13 @@ type Camera struct {
 	SpotIntensity              float32
 	SpotRadius                 float32
 	SpotCosOuter, SpotCosInner float32
+
+	// CartoonShading (config cartoonShading) asks the hardware renderer for
+	// a cel-shaded look: world.frag quantizes its lighting into a handful
+	// of flat bands instead of a smooth gradient, and worldblit.frag darkens
+	// pixels where the depth buffer jumps sharply — a silhouette, a corner,
+	// or geometry seen against the sky — into black outlines.
+	CartoonShading bool
 }
 
 // Projection constants — kept byte-identical to raster so a hardware render

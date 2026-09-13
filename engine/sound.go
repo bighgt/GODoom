@@ -13,11 +13,27 @@ func (g *Game) loadSound(name string) *wad.Sound {
 	if g.soundCache == nil {
 		g.soundCache = make(map[string]*wad.Sound)
 	}
+	orig := name
+	if g.heretic {
+		if h, ok := hereticSfx[name]; ok {
+			name = h // Doom DS* lump -> Heretic's own (no DS prefix)
+		}
+	}
 	if s, ok := g.soundCache[name]; ok {
 		return s
 	}
 	var snd *wad.Sound
-	if raw, ok := g.WAD.Find(name); ok {
+	raw, ok := g.WAD.Find(name)
+	if !ok && g.AltWAD != nil {
+		// switchWeapons: a weapon fire lump the played WAD lacks — the other
+		// game's IWAD has it, under the post-remap name or (for a Doom gun in
+		// a Heretic session, where the hereticSfx remap above didn't fire and
+		// left "DS...") the original.
+		if raw, ok = g.AltWAD.Find(name); !ok && orig != name {
+			raw, ok = g.AltWAD.Find(orig)
+		}
+	}
+	if ok {
 		if s, err := wad.DecodeDMX(raw); err == nil {
 			snd = s
 		}

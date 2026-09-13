@@ -112,6 +112,24 @@ type Textures struct {
 	quakeFlats map[string]string
 	quake1     bool
 
+	// hereticWalls/hereticFlats index an optional Heretic HD texture pack
+	// (assets/textures/heretic/, tools/importhereticpbr) the same lazy way.
+	// WallTexture/Flat consult them — ahead of everything else — only when
+	// heretic is true (SetHeretic, from cmd/engine when w.IsHeretic()). A
+	// separate directory so the pack's Doom-name collisions never leak into
+	// a Doom session.
+	hereticWalls map[string]string
+	hereticFlats map[string]string
+	heretic      bool
+
+	// fallbackW is consulted for a SPRITE lump the primary WAD lacks — the
+	// other game's IWAD when config's switchWeapons is on (SetSpriteFallback).
+	// Its own palette (fallbackPal) decodes those lumps, so a Heretic gun in
+	// a Doom session keeps Heretic's colours. Nil = no fallback.
+	fallbackW           *wad.WAD
+	fallbackPal         *wad.Palette
+	fallbackSpriteIndex map[string]*spriteDef // lazily built from fallbackW
+
 	// weaponSprites are a locally-supplied HD replacement pack for the
 	// first-person weapon viewmodel sprites (assets/weapons/*.pk3 — see
 	// weapons.go), decoded eagerly and keyed by lump name. Sprite() prefers
@@ -158,6 +176,8 @@ func New(w *wad.WAD) (*Textures, error) {
 		hiresSprites:  indexHiresSprites(),
 		quakeWalls:    indexQuakeWalls(),
 		quakeFlats:    indexQuakeFlats(),
+		hereticWalls:  indexHereticWalls(),
+		hereticFlats:  indexHereticFlats(),
 		weaponSprites: loadWeaponPack(),
 		brightmaps:    indexBrightmaps(),
 	}
@@ -195,6 +215,57 @@ func New(w *wad.WAD) (*Textures, error) {
 // the renderer resolves anything. No effect if the pack directory is
 // absent. Not safe to call concurrently with rendering.
 func (t *Textures) SetQuake1Textures(on bool) { t.quake1 = on }
+
+// SetHeretic turns the optional Heretic HD texture pack on or off
+// (assets/textures/heretic/, filled by tools/importhereticpbr). When on,
+// any wall/flat name the pack covers is served from there in preference to
+// every other override and the WAD's own composed texture. cmd/engine
+// calls this with w.IsHeretic(); it's inert without the pack directory.
+// Call once at startup, before the renderer resolves anything.
+func (t *Textures) SetHeretic(on bool) { t.heretic = on }
+
+// HereticPackSize reports how many wall / flat names the installed Heretic
+// HD pack covers (0, 0 when none is present) — for a one-line startup log.
+func (t *Textures) HereticPackSize() (walls, flats int) {
+	return len(t.hereticWalls), len(t.hereticFlats)
+}
+
+// SetSpriteFallback registers a secondary WAD whose sprite lumps fill in for
+// names the primary WAD doesn't have — the other game's IWAD, for config's
+// switchWeapons (so a Doom session can draw Heretic's weapon / projectile /
+// puff sprites, and vice versa). Those lumps decode through fw's own
+// PLAYPAL. Call once at startup, before the renderer resolves anything;
+// inert with a nil WAD.
+func (t *Textures) SetSpriteFallback(fw *wad.WAD) {
+	if fw == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.fallbackW = fw
+	if raw, ok := fw.Find("PLAYPAL"); ok {
+		if pals, err := wad.LoadPlaypal(raw); err == nil && len(pals) > 0 {
+			p := pals[0]
+			t.fallbackPal = &p
+		}
+	}
+}
+
+// DropHiresOverrides removes the procedural hi-res / Quake overrides for the
+// given lump names from every index, so those names resolve straight from
+// the WAD. Used for Heretic, whose SKY1..SKY3 texture names collide with
+// Doom's generated sky PNGs — a Doom sky over a Heretic level.
+func (t *Textures) DropHiresOverrides(names ...string) {
+	for _, n := range names {
+		delete(t.hiresWalls, n)
+		delete(t.hiresFlats, n)
+		delete(t.hiresSprites, n)
+		delete(t.quakeWalls, n)
+		delete(t.quakeFlats, n)
+		delete(t.hereticWalls, n)
+		delete(t.hereticFlats, n)
+	}
+}
 
 // Inject registers an already-decoded bitmap under a name so a later
 // Flat(name) (flat=true) or WallTexture(name) (flat=false) returns it with
@@ -250,6 +321,20 @@ func (t *Textures) WallTexture(name string) (*RGBA, bool) {
 	}
 
 	def, ok := t.texDefs[name]
+
+	if t.heretic {
+		if path, hok := t.hereticWalls[name]; hok {
+			origW := 0.0
+			if ok {
+				origW = float64(def.Width)
+			}
+			if im := loadHiresOverride(path, origW); im != nil {
+				t.walls[name] = im
+				return im, true
+			}
+			// decode failed — fall through to the other override paths
+		}
+	}
 
 	if t.quake1 {
 		if path, qok := t.quakeWalls[name]; qok {
@@ -308,6 +393,15 @@ func (t *Textures) Flat(name string) (*RGBA, bool) {
 		t.flats[name] = im
 		return im, true
 	}
+	if t.heretic {
+		if path, hok := t.hereticFlats[name]; hok {
+			if im := loadHiresOverride(path, 64); im != nil {
+				t.flats[name] = im
+				return im, true
+			}
+			// decode failed — fall through to the other override paths
+		}
+	}
 	if t.quake1 {
 		if path, qok := t.quakeFlats[name]; qok {
 			if im := loadHiresOverride(path, 64); im != nil {
@@ -363,6 +457,18 @@ func (t *Textures) Sprite(name string) (*RGBA, bool) {
 	}
 
 	raw, hasLump := t.w.Find(name)
+	// A sprite the played WAD doesn't ship — for switchWeapons, the other
+	// game's weapon / projectile / puff sprite. Decode it with that game's
+	// own palette (spritePal below).
+	spritePal := t.pal
+	if !hasLump && t.fallbackW != nil {
+		if fr, ok := t.fallbackW.Find(name); ok {
+			raw, hasLump = fr, true
+			if t.fallbackPal != nil {
+				spritePal = *t.fallbackPal
+			}
+		}
+	}
 	var patch *wad.Patch
 	if hasLump {
 		if p, err := wad.DecodePatch(raw); err == nil {
@@ -398,7 +504,7 @@ func (t *Textures) Sprite(name string) (*RGBA, bool) {
 		// decode failed — fall through to the WAD's own sprite
 	}
 
-	im := fromIndexed(patch.Width, patch.Height, patch.Pixels, t.pal)
+	im := fromIndexed(patch.Width, patch.Height, patch.Pixels, spritePal)
 	im.OffsetX, im.OffsetY = patch.LeftOffset, patch.TopOffset
 	t.sprites[name] = im
 	return im, true

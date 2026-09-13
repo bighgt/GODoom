@@ -40,7 +40,17 @@ layout(push_constant) uniform PC {
     // pixels, w = player-occlusion fade radius in those same pixels — see
     // playerFade() below.
     vec4 amb;
+    // reveal.x > 0 marks the OCCLUDED-SILHOUETTE pass: a second, GREATER-
+    // depth / no-write / blended draw of just the sprite billboards, so a
+    // monster/item hidden behind a wall or a higher floor still shows as a
+    // flat ISO_REVEAL_TINT ghost at reveal.x alpha. Ignored (0) on the
+    // normal pass.
+    vec4 reveal;
 } pc;
+
+// ISO_REVEAL_TINT is the flat colour an occluded thing's silhouette is
+// drawn in — a warm gold that reads clearly over stone/metal walls.
+const vec3 ISO_REVEAL_TINT = vec3(1.0, 0.80, 0.38);
 
 const uint KIND_WALL        = 0u;
 const uint KIND_MASKED      = 1u;
@@ -82,14 +92,14 @@ float bayer4x4(vec2 fragCoord) {
 // depth = 0.5) and the R.points loop below (one monster/item/barrel/etc a
 // frame) so a wall fades identically for either kind of occluded thing.
 // Returns true if this fragment should be discarded.
-bool occluderFadeAt(vec2 screenPos, float depth) {
+bool occluderFadeAt(vec2 screenPos, float depth, float radius, float maxAmt) {
     if (gl_FragCoord.z >= depth) return false; // not nearer to the camera than the thing
     float dist = length(gl_FragCoord.xy - screenPos);
-    if (dist >= pc.amb.w) return false;
+    if (dist >= radius) return false;
     // Capped well under half so the surviving wall pixels always outnumber
     // the discarded ones — a clearly-still-there, gently-faded wall rather
     // than a hole-punched one.
-    float amt = mix(0.35, 0.0, dist / pc.amb.w);
+    float amt = mix(maxAmt, 0.0, dist / radius);
     return bayer4x4(gl_FragCoord.xy) < amt;
 }
 
@@ -112,11 +122,17 @@ bool occluderFadeAt(vec2 screenPos, float depth) {
 // camera and the player already does.
 void occluderFade() {
     if (vKind != KIND_WALL && vKind != KIND_MASKED) return;
+    // The player: a wide, up-to-35% fade so a near wall never hides where
+    // you are.
     vec2 center = pc.amb.yz * 0.5;
-    if (occluderFadeAt(center, 0.5)) { discard; return; }
+    if (occluderFadeAt(center, 0.5, pc.amb.w, 0.35)) { discard; return; }
+    // Nearby monsters/items (the reveal list, player-proximity filtered
+    // CPU-side): just a tight, gentle shimmer at each — enough to say
+    // "something's here", the occluded-silhouette pass does the rest.
+    // pc.reveal.z is the halo radius (px).
     int n = min(int(R.count.x), 64);
     for (int i = 0; i < n; i++) {
-        if (occluderFadeAt(R.points[i].xy, R.points[i].z)) { discard; return; }
+        if (occluderFadeAt(R.points[i].xy, R.points[i].z, pc.reveal.z, 0.24)) { discard; return; }
     }
 }
 
@@ -128,6 +144,23 @@ void main() {
     } else if (vKind == KIND_SPRITE || vKind == KIND_SPRITE_FULL) {
         if (tex.a < 0.5) discard;
     }
+
+    // Occluded-silhouette pass: the GREATER-depth pipeline only lets a
+    // fragment here that something already drawn is in front of, so every
+    // survivor is a hidden bit of a monster/item — paint it the flat tint,
+    // but only near the player (screen centre) so a distant thing behind a
+    // dozen walls doesn't dot the whole map. The tint fades out over the
+    // last third of that radius.
+    if (pc.reveal.x > 0.0) {
+        if (vKind != KIND_SPRITE && vKind != KIND_SPRITE_FULL) { discard; }
+        vec2 c = pc.amb.yz * 0.5;
+        float dist = length(gl_FragCoord.xy - c);
+        if (dist >= pc.reveal.y) discard;
+        float edge = 1.0 - smoothstep(pc.reveal.y * 0.66, pc.reveal.y, dist);
+        outColor = vec4(ISO_REVEAL_TINT, tex.a * pc.reveal.x * edge);
+        return;
+    }
+
     occluderFade();
 
     if (vKind == KIND_SPRITE_FULL) {

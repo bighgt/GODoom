@@ -48,7 +48,7 @@ func (g *Game) dm() *dehMisc {
 // is the live copy a DEH `Ammo N` "Max ammo" edits (DefaultPlayerStats and
 // backpack doubling both read it).
 var (
-	dehMaxAmmoDefault = [4]int{200, 50, 300, 50}
+	dehMaxAmmoDefault = [numAmmoTypes]int{200, 50, 300, 50, 20, 150}
 	dehMaxAmmo        = dehMaxAmmoDefault
 )
 

@@ -100,7 +100,7 @@ func TestAllSharewareItemsCollectable(t *testing.T) {
 			// Reset the counters this item feeds so "no room" can't mask a
 			// real "won't collect" bug.
 			g.Player.Health, g.Player.Armor, g.Player.ArmorType = 1, 0, 0
-			g.Player.Ammo = [4]int{}
+			g.Player.Ammo = [numAmmoTypes]int{}
 			g.Player.Backpack = false
 			g.Player.Keys = [6]bool{}
 			g.Player.Powers = [numPowers]int{}

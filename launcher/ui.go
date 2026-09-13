@@ -30,6 +30,11 @@ type UI struct {
 
 	openDropdown string // id of the open dropdown, "" = none
 	deferred     *deferredDropdown
+
+	// tip is this frame's pending hover tooltip, drawn on top of everything
+	// by End (before the dropdown overlay, so an open dropdown still wins).
+	// Set by Hint; last setter this frame wins.
+	tip *tooltip
 	// dropdownScroll is, per dropdown id, the index of the first option
 	// currently visible — a dropdown with more options than dropdownMaxRows
 	// scrolls instead of squeezing every row into the same fixed-height box
@@ -42,6 +47,13 @@ type UI struct {
 // several dozen) scrolls through the rest via the mouse wheel rather than
 // this shrinking every row to fit them all in the same space.
 const dropdownMaxRows = 8
+
+// tooltip is a one-line hint box anchored under (or, near the panel bottom,
+// over) a settings row.
+type tooltip struct {
+	anchor Rect
+	text   string
+}
 
 type deferredDropdown struct {
 	id            string
@@ -74,6 +86,11 @@ func (ui *UI) Begin(in Input) { ui.In = in }
 // — screen.go doesn't need to do anything with the return value beyond
 // knowing a redraw/validation pass is worth doing sooner rather than later.
 func (ui *UI) End() (changed bool) {
+	if ui.tip != nil {
+		ui.drawTooltip(ui.tip)
+		ui.tip = nil
+	}
+
 	d := ui.deferred
 	ui.deferred = nil
 	if d == nil {
@@ -152,9 +169,55 @@ func (ui *UI) End() (changed bool) {
 }
 
 // hover reports whether the mouse is over r — every widget uses this for
-// its rollover highlight.
+// its rollover highlight AND its click test. It returns false whenever the
+// pointer is inside an open dropdown's overlay list: that list is drawn on
+// top by End and its rows sit directly over whatever widgets follow it in
+// the layout (the Renderer list's first option lands exactly on the
+// Lighting Mode box), so without this a click meant for an option would
+// also toggle the widget beneath it — and, being processed first, that
+// widget would steal the openDropdown slot and the option click would be
+// lost. Options arms ui.deferred before any covered widget runs (dropdowns
+// only ever open downward, onto later rows), so this is set in time.
 func (ui *UI) hover(r Rect) bool {
+	if ui.deferred != nil && ui.deferred.list.Contains(int(ui.In.MouseX), int(ui.In.MouseY)) {
+		return false
+	}
 	return r.Contains(int(ui.In.MouseX), int(ui.In.MouseY))
+}
+
+// Hint queues text to be shown as a hover tooltip for anchor — a no-op
+// unless the mouse is over anchor this frame. Called after a row's widget
+// is drawn (screen.go), it's what turns each fields.go hint into an
+// explanation on rollover. The last Hint call of the frame wins, so the
+// row the mouse is actually over is the one that shows.
+func (ui *UI) Hint(anchor Rect, text string) {
+	if text == "" || !ui.hover(anchor) {
+		return
+	}
+	ui.tip = &tooltip{anchor: anchor, text: text}
+}
+
+// drawTooltip paints t just below its anchor row, flipping above it near
+// the panel bottom and clamping to the window horizontally.
+func (ui *UI) drawTooltip(t *tooltip) {
+	const pad = 6
+	w := TextWidth(t.text) + pad*2
+	h := glyphHeight + pad*2
+	x := t.anchor.X + labelWidth
+	y := t.anchor.Y + t.anchor.H + 4
+	if y+h > windowH-bottomBarH {
+		y = t.anchor.Y - h - 4
+	}
+	if x+w > windowW-panelPad {
+		x = windowW - panelPad - w
+	}
+	if x < panelPad {
+		x = panelPad
+	}
+	r := Rect{x, y, w, h}
+	ui.C.FillRect(r, theme.Panel)
+	ui.C.StrokeRect(r, theme.Accent, 1)
+	ui.C.TextLeft(r, t.text, theme.Text)
 }
 
 // Label draws plain text left-aligned in r, no interaction.
@@ -164,12 +227,6 @@ func (ui *UI) Label(r Rect, text string, dim bool) {
 		col = theme.TextDim
 	}
 	ui.C.TextLeft(r, text, col)
-}
-
-// SectionHeader draws a section title with a rule beneath it.
-func (ui *UI) SectionHeader(r Rect, title string) {
-	ui.C.Text(r.X, r.Y+r.H-6, strings.ToUpper(title), theme.Accent)
-	ui.C.FillRect(Rect{r.X, r.Y + r.H - 2, r.W, 1}, theme.Border)
 }
 
 // ButtonStyle picks a button's fill colours.

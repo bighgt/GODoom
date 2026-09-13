@@ -113,6 +113,13 @@ func (g *Game) ApplyMapInfo() {
 			}
 		}
 	}
+	// Heretic ships only SKY1..SKY3 and picks them by episode differently
+	// from Doom's SKY1..SKY4 — without this E4/E5/E6 ask for a non-existent
+	// SKY4 and render the missing-texture checkerboard. A UMAPINFO
+	// skytexture still wins.
+	if sky == "" && g.heretic && g.Level != nil {
+		sky = hereticSkyTexture(g.Level.Name)
+	}
 	g.parTime = par
 	if g.Raster != nil {
 		g.Raster.SetSkyName(sky)

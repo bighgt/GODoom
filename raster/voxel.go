@@ -81,14 +81,14 @@ func pixCover(p, lo, hi float64) float64 {
 // minVoxelHeightPx on screen or is otherwise not drawable — the caller then
 // falls back to raster.DrawThing.
 func (r *Renderer) DrawVoxel(cam Camera, wx, wy, wz, angle float64, sectorLight int16, fullBright bool, angleOffsetDeg float64, m *assets.VoxelModel) bool {
-	return r.drawVoxel(cam, wx, wy, wz, angle, sectorLight, fullBright, angleOffsetDeg, m, r.fullBand())
+	return r.drawVoxel(cam, wx, wy, wz, angle, sectorLight, fullBright, angleOffsetDeg, m, 1, r.fullBand())
 }
 
 // voxelOnScreenOK reports whether model m at world (wx,wy) is in front of the
 // camera and big enough on screen to be worth splatting (vs. the flat
 // sprite). Band-independent, so DrawThings can resolve voxel-vs-sprite once
 // before fanning the splat out across workers.
-func (r *Renderer) voxelOnScreenOK(cam Camera, wx, wy float64, m *assets.VoxelModel) bool {
+func (r *Renderer) voxelOnScreenOK(cam Camera, wx, wy float64, m *assets.VoxelModel, scaleMul float64) bool {
 	if m == nil || r.focal <= 0 {
 		return false
 	}
@@ -100,17 +100,23 @@ func (r *Renderer) voxelOnScreenOK(cam Camera, wx, wy float64, m *assets.VoxelMo
 	if vmu <= 0 {
 		vmu = 1
 	}
+	if scaleMul > 0 {
+		vmu *= scaleMul
+	}
 	return float64(m.ZSiz)*vmu*r.focal/centerDepth >= minVoxelHeightPx
 }
 
-func (r *Renderer) drawVoxel(cam Camera, wx, wy, wz, angle float64, sectorLight int16, fullBright bool, angleOffsetDeg float64, m *assets.VoxelModel, band draw2DCtx) bool {
-	if !r.voxelOnScreenOK(cam, wx, wy, m) {
+func (r *Renderer) drawVoxel(cam Camera, wx, wy, wz, angle float64, sectorLight int16, fullBright bool, angleOffsetDeg float64, m *assets.VoxelModel, scaleMul float64, band draw2DCtx) bool {
+	if !r.voxelOnScreenOK(cam, wx, wy, m, scaleMul) {
 		return false // too small / behind camera — let the sprite path handle it
 	}
 	centerDepth, _ := r.toCameraSpace(&cam, wx, wy)
 	vmu := r.voxelScale
 	if vmu <= 0 {
 		vmu = 1
+	}
+	if scaleMul > 0 {
+		vmu *= scaleMul
 	}
 
 	// Constant across the model (single centre depth), like a wall column.

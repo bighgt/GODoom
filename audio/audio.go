@@ -57,3 +57,21 @@ func (d *Device) PlaySoundVol(s *wad.Sound, volume float64) {
 	}
 	d.m.playSFX(s.Samples, s.SampleRate, float32(volume))
 }
+
+// SetVolume sets the background-music loudness multiplier (config
+// musicVolume): 1 is the mixer's normal music level, 0 mutes, 2 doubles.
+// It works on any MusicPlayer whose synth is rendered through the shared
+// mixer (FluidSynth on Linux and Windows) and is a harmless no-op on the
+// winmm fallback and the stub player. Safe on a nil receiver and callable
+// from any goroutine; the value persists on the shared mixer across trips
+// through the pre-game launcher.
+func (m *MusicPlayer) SetVolume(volume float64) {
+	if m == nil {
+		return
+	}
+	mx, err := sharedAudio()
+	if err != nil {
+		return
+	}
+	mx.setMusicVolume(volume)
+}

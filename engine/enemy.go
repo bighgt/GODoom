@@ -354,7 +354,7 @@ func aPosAttack(g *Game, mo *Mobj) {
 	}
 	aFaceTarget(g, mo)
 	g.playSound("DSPISTOL")
-	g.pLineAttack(mo, mo.Angle+bulletSpread(), pAimSlope(mo, mo.Target), missileRange, (pRandom()%5+1)*3)
+	g.pLineAttack(mo, mo.Angle+bulletSpread(), pAimSlope(mo, mo.Target), missileRange, (pRandom()%5+1)*3, "")
 }
 
 func aSPosAttack(g *Game, mo *Mobj) {
@@ -365,7 +365,7 @@ func aSPosAttack(g *Game, mo *Mobj) {
 	g.playSound("DSSHOTGN")
 	slope := pAimSlope(mo, mo.Target)
 	for i := 0; i < 3; i++ {
-		g.pLineAttack(mo, mo.Angle+bulletSpread(), slope, missileRange, (pRandom()%5+1)*3)
+		g.pLineAttack(mo, mo.Angle+bulletSpread(), slope, missileRange, (pRandom()%5+1)*3, "")
 	}
 }
 
@@ -375,7 +375,7 @@ func aCPosAttack(g *Game, mo *Mobj) {
 	}
 	g.playSound("DSSHOTGN")
 	aFaceTarget(g, mo)
-	g.pLineAttack(mo, mo.Angle+bulletSpread(), pAimSlope(mo, mo.Target), missileRange, (pRandom()%5+1)*3)
+	g.pLineAttack(mo, mo.Angle+bulletSpread(), pAimSlope(mo, mo.Target), missileRange, (pRandom()%5+1)*3, "")
 }
 
 func aCPosRefire(g *Game, mo *Mobj) {

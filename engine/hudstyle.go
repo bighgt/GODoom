@@ -50,11 +50,23 @@ func (g *Game) cycleHUD() {
 // drawHUD renders the selected HUD onto the overlay. Call from renderFrame
 // after the world/weapon/crosshair, before the debug text.
 func (g *Game) drawHUD() {
+	hs := g.Player.toHUD()
+	if g.heretic {
+		hs.Arti, hs.ArtiCount = g.currentArtifactIcon()
+	}
 	switch g.hudStyle {
 	case hudDoom:
-		g.Raster.DrawStatusBar(g.Player.toHUD())
+		if g.heretic {
+			g.Raster.DrawHereticStatusBar(hs)
+		} else {
+			g.Raster.DrawStatusBar(hs)
+		}
 	case hudQuake2:
-		g.Raster.DrawQuakeHUD(g.Player.toHUD())
+		if g.heretic {
+			g.Raster.DrawHereticQuakeHUD(hs)
+		} else {
+			g.Raster.DrawQuakeHUD(hs)
+		}
 	case hudNone:
 		// nothing
 	}
