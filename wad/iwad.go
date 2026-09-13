@@ -95,36 +95,7 @@ func resolveIWAD(pickedPath string, picked *WAD, explicit string) (*WAD, string,
 		}
 	}
 
-	// Base directories to search, in priority order.
-	var dirs []string
-	seenDir := map[string]bool{}
-	addDir := func(d string) {
-		if d == "" {
-			return
-		}
-		for _, sub := range []string{"", "wad", "wads", "IWADs", "iwads", "testdata"} {
-			p := filepath.Join(d, sub)
-			if !seenDir[p] {
-				seenDir[p] = true
-				dirs = append(dirs, p)
-			}
-		}
-	}
-	dir := filepath.Dir(pickedPath)
-	for i := 0; i < 5 && dir != "" && dir != string(filepath.Separator); i++ {
-		addDir(dir)
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		dir = parent
-	}
-	if wd, err := os.Getwd(); err == nil {
-		addDir(wd)
-	}
-	if exe, err := os.Executable(); err == nil {
-		addDir(filepath.Dir(exe))
-	}
+	dirs := iwadSearchDirs(pickedPath)
 
 	// Try the format's IWADs first, then the other format's (a WAD may
 	// mis-detect, and a Doom II IWAD still opens a Doom II PWAD).
@@ -154,4 +125,77 @@ func resolveIWAD(pickedPath string, picked *WAD, explicit string) (*WAD, string,
 	}
 	return nil, "", fmt.Errorf("wad: %s is a patch WAD and needs its base IWAD — put %s next to it, or set \"iwad\": \"C:\\path\\to\\%s\" in config.json",
 		filepath.Base(pickedPath), want, strings.SplitN(want, " ", 2)[0])
+}
+
+// iwadSearchDirs is the ordered list of directories an IWAD might live in,
+// relative to the WAD at pickedPath: the WAD's own directory and up to five
+// parents of it, the working directory, and the executable's directory —
+// each also probed with wad/ wads/ IWADs/ iwads/ testdata/ subdirs.
+func iwadSearchDirs(pickedPath string) []string {
+	var dirs []string
+	seen := map[string]bool{}
+	addDir := func(d string) {
+		if d == "" {
+			return
+		}
+		for _, sub := range []string{"", "wad", "wads", "IWADs", "iwads", "testdata"} {
+			p := filepath.Join(d, sub)
+			if !seen[p] {
+				seen[p] = true
+				dirs = append(dirs, p)
+			}
+		}
+	}
+	dir := filepath.Dir(pickedPath)
+	for i := 0; i < 5 && dir != "" && dir != string(filepath.Separator); i++ {
+		addDir(dir)
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	if wd, err := os.Getwd(); err == nil {
+		addDir(wd)
+	}
+	if exe, err := os.Executable(); err == nil {
+		addDir(filepath.Dir(exe))
+	}
+	return dirs
+}
+
+// hereticIWADNames is the Heretic IWAD filenames OtherGameIWAD looks for.
+var hereticIWADNames = []string{
+	"HERETIC.WAD", "heretic.wad", "Heretic.wad",
+	"HERETIC1.WAD", "heretic1.wad", "HERETIC.wad",
+}
+
+// OtherGameIWAD finds the *other* game's IWAD next to the WAD at playedPath:
+// a Doom IWAD when `played` is a Heretic WAD, or a Heretic IWAD otherwise.
+// Used for config's switchWeapons, so a Doom session can borrow Heretic's
+// weapon / projectile sprites and sounds (and vice versa). Returns
+// ok == false (no error) when none is found — the caller swaps the arsenal
+// anyway, the art just resolves blank.
+func OtherGameIWAD(playedPath string, played *WAD) (iwad *WAD, path string, ok bool) {
+	var names []string
+	if played != nil && played.IsHeretic() {
+		names = append(append([]string{}, iwadNames["doom2"]...), iwadNames["doom1"]...)
+	} else {
+		names = hereticIWADNames
+	}
+	playedAbs, _ := filepath.Abs(playedPath)
+	for _, name := range names {
+		for _, d := range iwadSearchDirs(playedPath) {
+			p := filepath.Join(d, name)
+			if abs, _ := filepath.Abs(p); abs != "" && abs == playedAbs {
+				continue // that's the file we're already playing
+			}
+			iw, err := Load(p)
+			if err != nil || iw.Header.Magic != "IWAD" || !hasLump(iw, "PLAYPAL") {
+				continue
+			}
+			return iw, p, true
+		}
+	}
+	return nil, "", false
 }

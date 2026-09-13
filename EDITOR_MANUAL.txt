@@ -1,0 +1,249 @@
+TWOPOINTFIVE LEVEL EDITOR — USER MANUAL
+========================================
+
+cmd/editor is a Doom/Heretic level editor built into this project: a single
+window with a 2D top-down map on the left and a live 3D view (the engine's
+own software renderer) on the right, so a change you make in one shows up
+in the other immediately. Textures, flats and things are drawn from every
+WAD the editor can find under wad/Game WADs/, wad/, and assets/, plus
+whichever WAD you're editing.
+
+This is a working v1, not a finished product — see LIMITATIONS at the end
+for what isn't there yet.
+
+
+1. STARTING THE EDITOR
+-----------------------
+From the repo root:
+
+    go run ./cmd/editor                     open the first WAD (with maps)
+                                             found under wad/Game WADs/,
+                                             wad/, or assets/, at its first
+                                             map (MAP01 / E1M1 if present)
+
+    go run ./cmd/editor path/to.wad         open a specific WAD instead
+
+    go run ./cmd/editor -new                start empty: one small room,
+                                             ready to build on (see below)
+
+    go run ./cmd/editor -new path/to.wad    same, but pull textures/things
+                                             from that WAD's asset set
+
+    go run ./cmd/editor -fullscreen         open borderless-fullscreen on
+                                             the primary monitor instead of
+                                             the default window
+
+-new still loads a WAD (for its textures and palette) but ignores its
+maps — you get a blank canvas rather than that WAD's first level. This is
+also exactly what File -> New Level does once the editor is already open.
+
+The window is a fixed 1600x900 when not fullscreen (see LIMITATIONS on
+free resizing). Press F11 at any time, or View -> Toggle Fullscreen, to
+switch between that and fullscreen — the extra screen space makes the
+2D/3D split and the texture browser noticeably easier to work in.
+Toggling tears down and reopens the window and its renderer, so there's
+a brief flash; your map, selection, camera and tool state all carry
+through unaffected.
+
+
+2. THE WINDOW
+--------------
+    File  Map  View                                    <- menu bar
+    +------------------------+-------------+----------+
+    | [V][L][S][T] [DRAW]     |             |  Walls   |
+    |                         |   3D view   |  Flats   |
+    |      2D map view        |             |  Things  |
+    |                         |             |  Info    |
+    |                         |             +----------+
+    |                         |             | (browser |
+    |                         |             |  panel)  |
+    +------------------------+-------------+----------+
+    status: file  map  x y  grid  mode                 <- status bar
+
+- The vertical bar between the 2D and 3D views is a draggable SPLITTER —
+  click and drag it to resize the two panes.
+- The 2D pane has its own small toolbar, top-left: four mode buttons
+  (Vertices / Linedefs / Sectors / Things — see section 4) and a DRAW
+  button (section 5).
+- The right-hand panel has four tabs: Walls, Flats, Things (drag-and-drop
+  sources — section 6) and Info (a read-out of the current map's counts
+  and selection, for now).
+- The status bar always shows the world (x, y) under the mouse, the
+  current grid spacing, and the current 2D mode.
+
+
+3. STARTING A NEW LEVEL
+-------------------------
+File -> New level (Ctrl+N), or launch with -new. You get:
+
+  - one 512x512 room, floor 0, ceiling 128, walls/floor/ceiling textured
+    from whatever the loaded WAD's asset set actually has (it won't try
+    to use a texture name that doesn't exist)
+  - a Player 1 start at the centre, facing north
+
+That's a real, immediately playable map — File -> Play this map works on
+it right away. Build outward from there with the DRAW tool (section 5)
+and the Things palette (section 6).
+
+File -> Reload map reloads the current map fresh from its source WAD
+(discards edits); it does nothing for a New Level, which has no source
+map to reload.
+
+
+4. THE 2D VIEW: NAVIGATION AND SELECTION
+------------------------------------------
+Navigation (works in every mode):
+    scroll wheel            zoom in/out, centred on the cursor
+    middle-drag             pan
+    [ / ]                   halve / double the grid spacing
+    Home, or View -> Frame map   re-fit and re-centre the whole map
+
+Modes — click a toolbar button, or press 1/2/3/4:
+    1  Vertices     2  Linedefs     3  Sectors     4  Things
+
+In any mode, left-click an element to select it (shown highlighted in
+orange) and clear any other selection. Click empty space to deselect.
+Selecting something also re-aims the 3D camera at it — see section 7.
+
+  - Vertices mode also always shows every vertex as a small square
+    (other modes only show them once you're zoomed in reasonably close).
+  - Linedefs: white = one-sided (a solid wall), grey = two-sided, green =
+    has a special (door/lift/switch/etc.). A short tick on each line
+    points into its front sector.
+  - Sectors: clicking anywhere inside a sector's floor selects it (all of
+    its bounding linedefs highlight).
+  - Things: each is a small square coloured by category (see section 6),
+    with a short line showing which way it faces.
+
+
+5. CREATING WALLS AND ROOMS (THE DRAW TOOL)
+----------------------------------------------
+Click DRAW in the 2D toolbar, or press G, to enter draw mode (press either
+again, or Esc, to cancel a room in progress and leave draw mode).
+
+  1. Click in the 2D view to drop a vertex. Each click snaps to the
+     nearest existing vertex within about 10 screen pixels, or otherwise
+     to the current grid — so adjoining a new room to an existing wall is
+     just clicking near its corner.
+  2. Keep clicking to add more vertices; you'll see the in-progress
+     outline drawn in yellow.
+  3. Click back near your FIRST point (within about 3 grid squares on
+     screen) to close the loop. That commits a brand new sector: floor 0,
+     ceiling 128, one-sided walls all the way around, using whichever
+     wall texture and floor flat are currently selected in the Walls/
+     Flats browser tabs (section 6) — or a sensible default if you
+     haven't picked one yet.
+
+The new sector is selected immediately afterward, and the 3D view
+rebuilds and shows it (there's a brief pause — well under a second on a
+normal room — while the node builder re-triangulates the map; watch the
+status bar for a node-builder error if something is badly malformed).
+
+You need at least 3 points to close a room. The points can be wound
+either direction — the tool figures out which way the walls need to face
+to be solid from the inside; you never need to think about winding.
+
+This only builds simple, self-contained rooms (an outer loop, one
+sector, one-sided walls). It does not yet split an existing sector when
+your new loop overlaps one, and it does not yet build two-sided walls
+between adjoining rooms — see LIMITATIONS.
+
+
+6. TEXTURES, FLATS AND THINGS: DRAG AND DROP
+-----------------------------------------------
+The right-hand panel's Walls / Flats / Things tabs are the source for
+almost everything you place — drag from them straight onto the map:
+
+  - WALLS tab: a scrollable, filterable grid of every composite wall
+    texture the asset set has (type in the filter box to narrow it).
+    Drag a thumbnail onto a linedef in the 2D view (or click one first to
+    just set it as "current," which is what DRAW uses for new rooms) to
+    texture that wall. A one-sided wall gets its middle texture set; a
+    two-sided wall gets both its upper and lower set.
+
+  - FLATS tab: same, for floor/ceiling flats. Drag one onto a SECTOR
+    (click anywhere inside it, in the 2D view) to set that sector's
+    floor texture.
+
+  - THINGS tab: a filterable, categorised list of monsters, weapons,
+    ammo, health & armor, keys, powerups, and lamps/decorations (colour-
+    coded, matching the 2D view's thing colours). Drag an entry onto the
+    2D map to place one there, snapped the same way the draw tool snaps.
+
+While a drag is in progress, hovering over a valid drop target (a
+linedef for a wall texture, a sector for a flat, anywhere on the map for
+a thing) outlines it in green so you can see where it'll land before you
+release the mouse button.
+
+
+7. THE 3D VIEW
+---------------
+    RMB + drag     look around
+    W / S          move forward / back
+    A / D          strafe left / right
+    Q / E          move down / up
+    Shift           hold to move faster
+
+The 3D view always renders whatever the 2D view's Doc currently holds,
+rebuilt through the editor's own node builder after any geometry edit —
+so it reflects your edits, not just the map as originally loaded.
+
+Selecting anything in the 2D view (section 4) glides the 3D camera to
+look at it: it eases toward a point a short distance back from whatever
+you picked, at eye height, and turns to face it — so clicking a distant
+room's linedef, sector, thing or vertex brings it into view in 3D without
+you needing to fly there by hand. Moving the 3D camera yourself (WASD, or
+right-drag to look) cancels an in-progress glide.
+
+If the status bar reports "[3D: ...]" or the 3D pane says "3D preview
+unavailable," the node builder couldn't make sense of the current
+geometry (see LIMITATIONS on what to avoid) — the editor falls back to
+the map's originally-shipped NODES if it has any, otherwise it keeps the
+last good 3D view until you fix the geometry.
+
+
+8. SAVING AND PLAYTESTING
+---------------------------
+    File -> Save map as PWAD    Ctrl+S
+    File -> Play this map       F5
+
+Save writes a single-map PWAD next to the source WAD, named
+"<wad>_<map>.wad" (e.g. doom2_MAP01.wad) — the raw geometry lumps plus a
+freshly built BSP (SEGS/SSECTORS/NODES), a generated BLOCKMAP, and an
+empty REJECT (valid — it just means no sight-check shortcuts). This loads
+directly in this project's engine (cmd/engine). It has not been tested
+against other source ports or Doom editors, and the node builder doesn't
+try to match any particular vanilla tool's output — see LIMITATIONS.
+
+Play saves to a temporary PWAD the same way and launches the engine
+binary on it directly, so you can playtest without leaving the editor.
+It looks for the engine binary at bin/linux_engine (bin/windows_engine.exe
+on Windows) relative to the working directory, or "engine" on your PATH;
+build it first with `go build -o bin/linux_engine ./cmd/engine` (adjust
+the name/extension for your platform) if Play reports it can't find one.
+
+Map -> <name> switches to a different map from the SAME source WAD (not
+available on a New Level, which has none).
+
+
+9. LIMITATIONS (this is a v1)
+-------------------------------
+  - The window is one of two fixed sizes — 1600x900 windowed, or the
+    monitor's native resolution fullscreen (F11 toggles) — it doesn't
+    support freely dragging an edge to resize yet.
+  - The draw tool only creates new, self-contained one-sided rooms. It
+    doesn't split an existing sector, join two loops into a shared
+    two-sided wall, or merge/delete vertices and lines yet — there's no
+    dedicated move/delete tool for vertices, linedefs or sectors yet
+    either (selecting works; editing an existing shape doesn't).
+  - No inspector fields yet for a selected linedef/sector/thing's
+    numeric properties (heights, light level, special/tag, angle, flags)
+    beyond what dragging a texture/flat/thing sets — that's next.
+  - No undo/redo yet. Save early and often (or just don't be afraid of
+    File -> Reload Map / New Level if something goes wrong).
+  - No "Open WAD..." file-picker dialog yet — pass the WAD as a command-
+    line argument, or use the Map menu to switch maps within the WAD
+    already open.
+  - REJECT is always empty and BLOCKMAP is a straightforward generated
+    grid — fine for this engine, not guaranteed to match what another
+    port or editor's own node builder would produce.

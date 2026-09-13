@@ -206,6 +206,21 @@ func (w *WAD) ListMaps() []string {
 	return maps
 }
 
+// IsHeretic reports whether this WAD is a Heretic IWAD (or a PWAD already
+// merged onto one). Heretic's per-map music lumps carry a "MUS_" prefix,
+// which Doom / Doom II never use, and it ships a Heretic-only main-menu
+// graphic (M_HTIC) — the pair is an unambiguous signature. cmd/engine uses
+// it to pick the Heretic voxel pack; the engine uses it to switch on the
+// Heretic thing table and the door / sky / liquid fixes (engine/heretic.go).
+func (w *WAD) IsHeretic() bool {
+	if w == nil {
+		return false
+	}
+	_, mus := w.Find("MUS_E1M1")
+	_, htic := w.Find("M_HTIC")
+	return mus && htic
+}
+
 // PreferredStartMap picks the conventional first level of whichever format
 // maps (as returned by ListMaps) uses — "E1M1" for Doom/Ultimate Doom,
 // "MAP01" for Doom II and most PWADs — falling back to whatever map is
