@@ -197,6 +197,13 @@ func (w *Window) HUDCyclePressed() bool { return w.handle.GetKey(glfw.KeyF1) == 
 // key doesn't retoggle every frame.
 func (w *Window) FlashlightPressed() bool { return w.handle.GetKey(glfw.KeyF) == glfw.Press }
 
+// Heretic inventory keys (engine/heretic_arti.go): Enter uses the selected
+// artifact, [ and ] cycle the selection. All edge-detected in the artifact
+// system so a held key acts once.
+func (w *Window) UseArtifactPressed() bool { return w.handle.GetKey(glfw.KeyEnter) == glfw.Press }
+func (w *Window) InvPrevPressed() bool     { return w.handle.GetKey(glfw.KeyLeftBracket) == glfw.Press }
+func (w *Window) InvNextPressed() bool     { return w.handle.GetKey(glfw.KeyRightBracket) == glfw.Press }
+
 // WeaponKeyPressed reports whether the number key for weapon slot n (1-7,
 // the classic Doom layout) is currently held.
 func (w *Window) WeaponKeyPressed(n int) bool {
