@@ -675,11 +675,12 @@ func (g *Game) checkPlayerCrush() {
 	if g.playerDead || g.playerMobj == nil {
 		return
 	}
-	sec := bsp.PointSector(g.BSP, g.Level, float32(g.Camera.X), float32(g.Camera.Y))
-	if sec == nil {
+	secIdx := bsp.PointSectorIndex(g.BSP, g.Level, float32(g.Camera.X), float32(g.Camera.Y))
+	if secIdx < 0 {
 		return
 	}
-	if float64(sec.CeilingHeight)-float64(sec.FloorHeight) < playerHeight-1 {
+	floor, ceil, _ := g.planeAt(secIdx, g.Camera.X, g.Camera.Y, g.PlayerZ)
+	if ceil-floor < playerHeight-1 {
 		g.crushPlayer()
 	}
 }
@@ -691,16 +692,32 @@ func (g *Game) playerInSpecialSector() {
 	if g.playerMobj == nil || g.Player.Health <= 0 {
 		return
 	}
-	sec := bsp.PointSector(g.BSP, g.Level, float32(g.Camera.X), float32(g.Camera.Y))
-	if sec == nil {
+	secIdx := bsp.PointSectorIndex(g.BSP, g.Level, float32(g.Camera.X), float32(g.Camera.Y))
+	if secIdx < 0 {
 		return
 	}
+	sec := &g.Level.Sectors[secIdx]
 	if g.heretic {
 		g.hereticWindThrust(int(sec.SpecialType)) // wind pushes airborne too
 	}
-	// The damage floors / secret / exit below only fire on the floor.
-	if g.Camera.Z-EyeHeight > float64(sec.FloorHeight)+1 {
+	// The damage floors / secret / exit below only fire while the player's
+	// feet are actually resting on the floor. onGround is the physical
+	// contact flag fallStep maintains each tic — checking it directly (
+	// rather than deriving "airborne" from Camera.Z-EyeHeight) matters
+	// because Camera.Z also carries viewDip, the cosmetic landing-squat
+	// nudge: right after a hard landing elsewhere, viewDip is still
+	// negative, which pulled the derived height below the real PlayerZ and
+	// could misread a player jumping over lava/acid as still touching the
+	// floor.
+	if !g.onGround {
 		return
+	}
+	// Standing on a room-over-room extra floor puts the player logically
+	// inside its CONTROL sector's airspace (see planeAt) — the damage
+	// floor / secret / exit below should key off whichever sector that
+	// actually is, not always the base one.
+	if _, _, activeIdx := g.planeAt(secIdx, g.Camera.X, g.Camera.Y, g.PlayerZ); activeIdx != secIdx {
+		sec = &g.Level.Sectors[activeIdx]
 	}
 	radsuit := g.Player.Powers[pwIronFeet] > 0 || g.Player.godMode()
 

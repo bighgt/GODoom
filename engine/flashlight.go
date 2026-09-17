@@ -6,14 +6,10 @@ import (
 	"twopointfive/raster"
 )
 
-// Head-mounted flashlight: F toggles it. In the enhanced/hardware render
-// tiers (real per-pixel dynamic lights) it's a forward cone with a
-// hotspot-to-spill falloff, a subtle battery flicker, and a slight
-// handheld sway — see flashlightSpot, read by engine/lights.go's
-// buildFrame and game.go's hardware render block. Vanilla has no
-// per-pixel dynamic lights at all, so there it's a flat raster.ExtraLight
-// bump instead (id's "extralight" — the same lever PrBoom's light-amp
-// goggles use, a plain uniform brightening with no beam shape).
+// Head-mounted flashlight: F toggles it. It's a real per-pixel forward cone
+// with a hotspot-to-spill falloff, a subtle battery flicker, and a slight
+// handheld sway — see flashlightSpot, read by game.go's hardware render
+// block.
 //
 // Not implemented: battery drain / limited duration. It's a persistent
 // on/off toggle, same as any other HUD/render toggle in this engine (see
@@ -41,10 +37,6 @@ const (
 	// gun-mounted.
 	flashlightForward = 10.0
 	flashlightUp      = 6.0
-	// flashlightExtraLight is the vanilla-path raster.ExtraLight bump.
-	// Flat, not flickered: ExtraLight moves brightness a whole sector-light
-	// row at a time, so animating it would band rather than flicker.
-	flashlightExtraLight = 2
 	// flashlightSeed distinguishes the beam's flicker from any map light's
 	// (flickerWobble, maplights.go) sharing the same levelTime clock.
 	flashlightSeed = 9001
@@ -69,13 +61,11 @@ func (flashlightSystem) Update(g *Game, dt float32) {
 		}
 		g.flashlightKeyDown = down
 	}
-	// The GPU-lit tiers get a real cone (flashlightSpot) instead — don't
-	// also brighten the whole screen there.
-	if !g.flashlightOn || g.LitMode || g.HardwareMode {
-		raster.ExtraLight = 0
-	} else {
-		raster.ExtraLight = flashlightExtraLight
-	}
+	// The flashlight is a real cone (flashlightSpot), not a screen-wide
+	// brighten — leave raster.ExtraLight at 0 here so a later system in the
+	// per-frame order (artifactSystem, for Heretic's Torch/Tome) can still
+	// bump it for its own reason.
+	raster.ExtraLight = 0
 }
 
 // flashlightSpotLight is the beam's current shape/brightness — computed

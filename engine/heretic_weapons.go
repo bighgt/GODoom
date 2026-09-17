@@ -116,51 +116,51 @@ func applyHereticWeapons() {
 	Weapons[wpFist] = WeaponDef{
 		Name: "Staff", SpritePrefix: "STFF", FireSound: "STFHIT",
 		AmmoType: -1, AmmoCost: 0, Melee: true,
-		FireFrames:     []WeaponFrame{{'B', 6}, {'C', 8}, {'B', 8}},
+		FireFrames:     []WeaponFrame{{Frame: 'B', Tics: 6}, {Frame: 'C', Tics: 8}, {Frame: 'B', Tics: 8}},
 		PoweredMeleeMul: 4,
 	}
 	Weapons[wpChainsaw] = WeaponDef{
 		Name: "Gauntlets", SpritePrefix: "GAUN", FireSound: "GNTFUL",
 		AmmoType: -1, AmmoCost: 0, Melee: true,
-		FireFrames:      []WeaponFrame{{'B', 4}, {'C', 4}, {'D', 4}, {'E', 4}, {'F', 4}, {'C', 4}},
-		IdleFrames:      []WeaponFrame{{'A', 4}},
+		FireFrames:      []WeaponFrame{{Frame: 'B', Tics: 4}, {Frame: 'C', Tics: 4}, {Frame: 'D', Tics: 4}, {Frame: 'E', Tics: 4}, {Frame: 'F', Tics: 4}, {Frame: 'C', Tics: 4}},
+		IdleFrames:      []WeaponFrame{{Frame: 'A', Tics: 4}},
 		IdleSound:       "GNTACT",
 		PoweredMeleeMul: 2, PoweredLeech: true,
 	}
 	Weapons[wpPistol] = WeaponDef{
 		Name: "Elven Wand", SpritePrefix: "GWND", FireSound: "GLDHIT",
 		AmmoType: 0, AmmoCost: 1,
-		FireFrames: []WeaponFrame{{'B', 3}, {'C', 5}, {'D', 3}},
+		FireFrames: []WeaponFrame{{Frame: 'B', Tics: 3}, {Frame: 'C', Tics: 5}, {Frame: 'D', Tics: 3}},
 		Projectile: &hFXWand, Powered: &hFXWandP,
 	}
 	Weapons[wpShotgun] = WeaponDef{
 		Name: "Ethereal Crossbow", SpritePrefix: "CRBW", FireSound: "BOWSHT",
 		AmmoType: 1, AmmoCost: 1,
-		FireFrames: []WeaponFrame{{'D', 6}, {'E', 3}, {'F', 3}, {'G', 3}, {'H', 3}, {'A', 4}, {'B', 4}, {'C', 5}},
+		FireFrames: []WeaponFrame{{Frame: 'D', Tics: 6}, {Frame: 'E', Tics: 3}, {Frame: 'F', Tics: 3}, {Frame: 'G', Tics: 3}, {Frame: 'H', Tics: 3}, {Frame: 'A', Tics: 4}, {Frame: 'B', Tics: 4}, {Frame: 'C', Tics: 5}},
 		Projectile: &hFXCrossbow, Powered: &hFXCrossbowP,
 	}
 	Weapons[wpChaingun] = WeaponDef{
 		Name: "Dragon Claw", SpritePrefix: "BLSR", FireSound: "BLSSHT",
 		AmmoType: 2, AmmoCost: 1,
-		FireFrames: []WeaponFrame{{'B', 3}, {'C', 3}, {'D', 2}, {'C', 2}, {'B', 2}},
+		FireFrames: []WeaponFrame{{Frame: 'B', Tics: 3}, {Frame: 'C', Tics: 3}, {Frame: 'D', Tics: 2}, {Frame: 'C', Tics: 2}, {Frame: 'B', Tics: 2}},
 		Projectile: &hFXDragonClaw, Powered: &hFXDragonClawP,
 	}
 	Weapons[wpPlasma] = WeaponDef{
 		Name: "Hellstaff", SpritePrefix: "HROD", FireSound: "HRNHIT",
 		AmmoType: 3, AmmoCost: 1,
-		FireFrames: []WeaponFrame{{'A', 4}, {'B', 4}},
+		FireFrames: []WeaponFrame{{Frame: 'A', Tics: 4}, {Frame: 'B', Tics: 4}},
 		Projectile: &hFXHellstaff, Powered: &hFXHellstaffP,
 	}
 	Weapons[wpMissile] = WeaponDef{
 		Name: "Phoenix Rod", SpritePrefix: "PHNX", FireSound: "PHOPOW",
 		AmmoType: 4, AmmoCost: 1,
-		FireFrames: []WeaponFrame{{'B', 5}, {'C', 7}, {'D', 4}, {'B', 4}},
+		FireFrames: []WeaponFrame{{Frame: 'B', Tics: 5}, {Frame: 'C', Tics: 7}, {Frame: 'D', Tics: 4}, {Frame: 'B', Tics: 4}},
 		Projectile: &hFXPhoenix, Powered: &hFXPhoenixP,
 	}
 	Weapons[wpBFG] = WeaponDef{
 		Name: "Firemace", SpritePrefix: "MACE", FireSound: "LOBSHT",
 		AmmoType: 5, AmmoCost: 1,
-		FireFrames: []WeaponFrame{{'B', 4}, {'C', 3}, {'D', 3}, {'E', 3}, {'F', 3}, {'C', 4}},
+		FireFrames: []WeaponFrame{{Frame: 'B', Tics: 4}, {Frame: 'C', Tics: 3}, {Frame: 'D', Tics: 3}, {Frame: 'E', Tics: 3}, {Frame: 'F', Tics: 3}, {Frame: 'C', Tics: 4}},
 		Projectile: &hFXMace, Powered: &hFXMaceP,
 	}
 	// wpSuperShotgun is left as its Doom self — Heretic never spawns one.

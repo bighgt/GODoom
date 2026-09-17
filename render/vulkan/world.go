@@ -17,13 +17,12 @@ import (
 	"twopointfive/window"
 )
 
-// Hardware (GPU-geometry) renderer — the "Tier 2" path. The CPU walks the
-// BSP into a per-texture-grouped triangle list (render/worldgeo) and the GPU
-// does rasterisation, perspective-correct texturing, mip/anisotropic
-// filtering, the depth test, and a continuous vanilla-style sector/distance
-// fade (world.frag's fade()). One draw call per texture — plain Vulkan 1.0,
-// no bindless. Selected by config "renderer": "hardware"; the CPU software
-// rasterizer stays the default and the fallback.
+// Hardware (GPU-geometry) renderer — the game's only rendering path. The CPU
+// walks the BSP into a per-texture-grouped triangle list (render/worldgeo)
+// and the GPU does rasterisation, perspective-correct texturing, mip/
+// anisotropic filtering, the depth test, and a continuous vanilla-style
+// sector/distance fade (world.frag's fade()). One draw call per texture —
+// plain Vulkan 1.0, no bindless.
 //
 // Per frame DrawWorld records into one command buffer:
 //

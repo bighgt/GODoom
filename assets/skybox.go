@@ -17,8 +17,10 @@ const skyboxPath = "assets/skybox/mars_sky.png"
 // LoadSkybox loads the Mars sky texture (see tools/gensky,
 // game_design.txt) from disk into an RGBA bitmap, the same format every
 // other texture in this package uses. Returns an error if it can't be
-// found/decoded — non-fatal to the caller (raster.New logs it and falls
-// back to the WAD's own sky texture; see raster/sky.go).
+// found/decoded — meant to be non-fatal to the caller. Currently unused:
+// nothing calls this or the matching worldgeo.Builder.SetSky any more
+// (see game_design.txt section 10) — every level shows its own WAD sky
+// texture instead of the panorama.
 func LoadSkybox() (*RGBA, error) {
 	dir, ok := findAssetDir(filepath.Dir(skyboxPath))
 	if !ok {

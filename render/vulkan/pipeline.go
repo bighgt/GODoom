@@ -136,3 +136,180 @@ func (r *Renderer) destroyPipeline() {
 		r.pipelineLayout = nil
 	}
 }
+
+// litImage is a device-local image + its memory + one full-image view — the
+// shape every offscreen render target here (world's ambient/bloom/HDR
+// targets, the iso viewer's offscreen scene) is built from. litMakeImage
+// builds one.
+type litImage struct {
+	image  vk.Image
+	memory vk.DeviceMemory
+	view   vk.ImageView
+}
+
+// litMakeImage creates a w x h device-local 2D image (format/usage as
+// given), backs it with freshly allocated device-local memory, and builds
+// one full-image view over it.
+func (r *Renderer) litMakeImage(w, h int, format vk.Format, usage vk.ImageUsageFlags) (litImage, error) {
+	var li litImage
+	info := vk.ImageCreateInfo{
+		SType:         vk.StructureTypeImageCreateInfo,
+		ImageType:     vk.ImageType2d,
+		Format:        format,
+		Extent:        vk.Extent3D{Width: uint32(w), Height: uint32(h), Depth: 1},
+		MipLevels:     1,
+		ArrayLayers:   1,
+		Samples:       vk.SampleCount1Bit,
+		Tiling:        vk.ImageTilingOptimal,
+		Usage:         usage,
+		SharingMode:   vk.SharingModeExclusive,
+		InitialLayout: vk.ImageLayoutUndefined,
+	}
+	if res := vk.CreateImage(r.device, &info, nil, &li.image); res != vk.Success {
+		return li, fmt.Errorf("vulkan: create image: %s", vk.Error(res))
+	}
+	var memReq vk.MemoryRequirements
+	vk.GetImageMemoryRequirements(r.device, li.image, &memReq)
+	memReq.Deref()
+	mt, err := r.findMemoryType(memReq.MemoryTypeBits, vk.MemoryPropertyFlags(vk.MemoryPropertyDeviceLocalBit))
+	if err != nil {
+		return li, fmt.Errorf("vulkan: image memory: %w", err)
+	}
+	alloc := vk.MemoryAllocateInfo{SType: vk.StructureTypeMemoryAllocateInfo, AllocationSize: memReq.Size, MemoryTypeIndex: mt}
+	if res := vk.AllocateMemory(r.device, &alloc, nil, &li.memory); res != vk.Success {
+		return li, fmt.Errorf("vulkan: image alloc: %s", vk.Error(res))
+	}
+	if res := vk.BindImageMemory(r.device, li.image, li.memory, 0); res != vk.Success {
+		return li, fmt.Errorf("vulkan: image bind: %s", vk.Error(res))
+	}
+	viewInfo := vk.ImageViewCreateInfo{
+		SType:            vk.StructureTypeImageViewCreateInfo,
+		Image:            li.image,
+		ViewType:         vk.ImageViewType2d,
+		Format:           format,
+		Components:       vk.ComponentMapping{R: vk.ComponentSwizzleIdentity, G: vk.ComponentSwizzleIdentity, B: vk.ComponentSwizzleIdentity, A: vk.ComponentSwizzleIdentity},
+		SubresourceRange: vk.ImageSubresourceRange{AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit), LevelCount: 1, LayerCount: 1},
+	}
+	if res := vk.CreateImageView(r.device, &viewInfo, nil, &li.view); res != vk.Success {
+		return li, fmt.Errorf("vulkan: image view: %s", vk.Error(res))
+	}
+	return li, nil
+}
+
+// samplerBinding is a combined-image-sampler descriptor binding at binding
+// slot n, fragment-stage only — the shape every offscreen pass here (world's
+// ambient/bloom/blit passes, the iso viewer's present pass) samples its
+// source image(s) through. Named "sampler" rather than after any one
+// caller since every one of them needs exactly this.
+func samplerBinding(n uint32) vk.DescriptorSetLayoutBinding {
+	return vk.DescriptorSetLayoutBinding{
+		Binding:         n,
+		DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+		DescriptorCount: 1,
+		StageFlags:      vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+	}
+}
+
+// fullViewport / fullScissor are the dynamic viewport/scissor for a pass
+// that draws over its whole w x h target — every fullscreen-triangle pass
+// (world's ambient/bloom/blit, the iso viewer's present) sets these once
+// per command buffer since none of them ever draws to a sub-rectangle.
+func fullViewport(w, h int) vk.Viewport {
+	return vk.Viewport{Width: float32(w), Height: float32(h), MinDepth: 0, MaxDepth: 1}
+}
+
+func fullScissor(w, h int) vk.Rect2D {
+	return vk.Rect2D{Extent: vk.Extent2D{Width: uint32(w), Height: uint32(h)}}
+}
+
+// litPipelineLayout builds a pipeline layout with one descriptor set and an
+// optional fragment-stage push-constant range — every offscreen fullscreen-
+// triangle pass here (world's ambient/bloom/blit passes) shares this exact
+// shape, varying only the descriptor set layout and push-constant size.
+func (r *Renderer) litPipelineLayout(setLayout vk.DescriptorSetLayout, pushSize uint32) (vk.PipelineLayout, error) {
+	info := vk.PipelineLayoutCreateInfo{
+		SType:          vk.StructureTypePipelineLayoutCreateInfo,
+		SetLayoutCount: 1,
+		PSetLayouts:    []vk.DescriptorSetLayout{setLayout},
+	}
+	if pushSize > 0 {
+		info.PushConstantRangeCount = 1
+		info.PPushConstantRanges = []vk.PushConstantRange{{
+			StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit), Offset: 0, Size: pushSize,
+		}}
+	}
+	var l vk.PipelineLayout
+	if res := vk.CreatePipelineLayout(r.device, &info, nil, &l); res != vk.Success {
+		return nil, fmt.Errorf("vulkan: pipeline layout: %s", vk.Error(res))
+	}
+	return l, nil
+}
+
+// litPipeline builds a graphics pipeline that draws blitVertSPV's synthesized
+// fullscreen triangle through fragSPV into renderPass, with layout — the one
+// shape every offscreen fullscreen-triangle pass here (world's ambient/
+// bloom/blit passes) needs, varying only the fragment shader/render pass/
+// layout. No vertex buffers, no depth test, dynamic viewport/scissor.
+func (r *Renderer) litPipeline(fragSPV []byte, renderPass vk.RenderPass, layout vk.PipelineLayout) (vk.Pipeline, error) {
+	vert, err := r.createShaderModule(blitVertSPV)
+	if err != nil {
+		return nil, fmt.Errorf("vulkan: fullscreen vert module: %w", err)
+	}
+	defer vk.DestroyShaderModule(r.device, vert, nil)
+	frag, err := r.createShaderModule(fragSPV)
+	if err != nil {
+		return nil, fmt.Errorf("vulkan: fullscreen frag module: %w", err)
+	}
+	defer vk.DestroyShaderModule(r.device, frag, nil)
+
+	stages := []vk.PipelineShaderStageCreateInfo{
+		{SType: vk.StructureTypePipelineShaderStageCreateInfo, Stage: vk.ShaderStageVertexBit, Module: vert, PName: nz("main")},
+		{SType: vk.StructureTypePipelineShaderStageCreateInfo, Stage: vk.ShaderStageFragmentBit, Module: frag, PName: nz("main")},
+	}
+	vertexInput := vk.PipelineVertexInputStateCreateInfo{SType: vk.StructureTypePipelineVertexInputStateCreateInfo}
+	inputAssembly := vk.PipelineInputAssemblyStateCreateInfo{
+		SType: vk.StructureTypePipelineInputAssemblyStateCreateInfo, Topology: vk.PrimitiveTopologyTriangleList,
+	}
+	viewportState := vk.PipelineViewportStateCreateInfo{
+		SType: vk.StructureTypePipelineViewportStateCreateInfo, ViewportCount: 1, ScissorCount: 1,
+	}
+	rasterizer := vk.PipelineRasterizationStateCreateInfo{
+		SType: vk.StructureTypePipelineRasterizationStateCreateInfo, PolygonMode: vk.PolygonModeFill,
+		CullMode: vk.CullModeFlags(vk.CullModeNone), FrontFace: vk.FrontFaceClockwise, LineWidth: 1,
+	}
+	multisample := vk.PipelineMultisampleStateCreateInfo{
+		SType: vk.StructureTypePipelineMultisampleStateCreateInfo, RasterizationSamples: vk.SampleCount1Bit,
+	}
+	cba := vk.PipelineColorBlendAttachmentState{
+		ColorWriteMask: vk.ColorComponentFlags(vk.ColorComponentRBit) | vk.ColorComponentFlags(vk.ColorComponentGBit) |
+			vk.ColorComponentFlags(vk.ColorComponentBBit) | vk.ColorComponentFlags(vk.ColorComponentABit),
+	}
+	colorBlend := vk.PipelineColorBlendStateCreateInfo{
+		SType: vk.StructureTypePipelineColorBlendStateCreateInfo, AttachmentCount: 1,
+		PAttachments: []vk.PipelineColorBlendAttachmentState{cba},
+	}
+	dynamic := vk.PipelineDynamicStateCreateInfo{
+		SType: vk.StructureTypePipelineDynamicStateCreateInfo, DynamicStateCount: 2,
+		PDynamicStates: []vk.DynamicState{vk.DynamicStateViewport, vk.DynamicStateScissor},
+	}
+	info := vk.GraphicsPipelineCreateInfo{
+		SType:               vk.StructureTypeGraphicsPipelineCreateInfo,
+		StageCount:          2,
+		PStages:             stages,
+		PVertexInputState:   &vertexInput,
+		PInputAssemblyState: &inputAssembly,
+		PViewportState:      &viewportState,
+		PRasterizationState: &rasterizer,
+		PMultisampleState:   &multisample,
+		PColorBlendState:    &colorBlend,
+		PDynamicState:       &dynamic,
+		Layout:              layout,
+		RenderPass:          renderPass,
+		Subpass:             0,
+	}
+	out := make([]vk.Pipeline, 1)
+	if res := vk.CreateGraphicsPipelines(r.device, nil, 1, []vk.GraphicsPipelineCreateInfo{info}, nil, out); res != vk.Success {
+		return nil, fmt.Errorf("vulkan: fullscreen pipeline: %s", vk.Error(res))
+	}
+	return out[0], nil
+}

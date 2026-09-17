@@ -1,16 +1,26 @@
 package editor
 
 import (
+	"fmt"
 	"image"
+	"path/filepath"
 	"strings"
 
 	"twopointfive/imkit"
+	"twopointfive/window"
 )
 
 // panelState is the right-docked tabbed panel: texture / flat browsers, the
 // thing palette, and an inspector for the current selection.
 type panelState struct {
 	tab int
+
+	// pending is a deferred action (a native file/folder dialog, which must
+	// run after the frame presents — see App.pending's own doc comment)
+	// that reports a status-bar message when it actually did something,
+	// e.g. imported a texture. false from the bool means "say nothing"
+	// (the dialog was cancelled) rather than blanking the status bar.
+	pending func() (msg string, ok bool)
 
 	wallFilter string
 	wallSel    string
@@ -52,8 +62,19 @@ func (p *panelState) draw(ui *imkit.UI, area imkit.Rect, d *Doc, bank *Bank) {
 func (p *panelState) drawTexBrowser(ui *imkit.UI, area imkit.Rect, bank *Bank, id string,
 	filter, sel *string, scroll *int, names []string, thumb func(string) *image.RGBA) {
 
-	fr := imkit.Rect{X: area.X, Y: area.Y, W: area.W, H: 20}
+	const btnW = 44
+	fr := imkit.Rect{X: area.X, Y: area.Y, W: area.W - 2*(btnW+4), H: 20}
 	ui.FilterBox(id+"-filter", fr, filter)
+
+	flat := id == "flats"
+	fileBtn := imkit.Rect{X: fr.X + fr.W + 4, Y: area.Y, W: btnW, H: 20}
+	dirBtn := imkit.Rect{X: fileBtn.X + btnW + 4, Y: area.Y, W: btnW, H: 20}
+	if ui.IconButton(fileBtn, "File", false) {
+		p.pending = func() (string, bool) { return importTextureFile(bank, flat) }
+	}
+	if ui.IconButton(dirBtn, "Folder", false) {
+		p.pending = func() (string, bool) { return importTextureFolder(bank, flat) }
+	}
 
 	items := make([]imkit.ThumbItem, 0, len(names))
 	f := strings.ToUpper(strings.TrimSpace(*filter))
@@ -119,6 +140,58 @@ func (p *panelState) drawInfo(ui *imkit.UI, area imkit.Rect, d *Doc) {
 	for i, ln := range lines {
 		ui.C.Text(area.X, area.Y+10+i*18, ln, imkit.Theme.Text)
 	}
+}
+
+// ---- texture import (File/Folder buttons on the Walls/Flats browsers) ----
+
+// importTextureFile pops a native "open file" dialog (blocking — run from
+// panelState.pending, after the frame presents) and imports the chosen PNG
+// as a wall texture, or a flat if flat is true.
+func importTextureFile(bank *Bank, flat bool) (string, bool) {
+	path, err := window.PickImageFile()
+	if err != nil {
+		if err == window.ErrPickCancelled {
+			return "", false
+		}
+		return "import: " + err.Error(), true
+	}
+	var name string
+	if flat {
+		name, err = bank.ImportFlat(path)
+	} else {
+		name, err = bank.ImportWallTexture(path)
+	}
+	if err != nil {
+		return "import " + name + ": " + err.Error(), true
+	}
+	kind := "wall texture"
+	if flat {
+		kind = "flat"
+	}
+	return fmt.Sprintf("imported %s %s from %s", kind, name, filepath.Base(path)), true
+}
+
+// importTextureFolder pops a native "choose folder" dialog and imports
+// every *.png found recursively under it, as wall textures or (flat)
+// flats.
+func importTextureFolder(bank *Bank, flat bool) (string, bool) {
+	dir, err := window.PickFolder()
+	if err != nil {
+		if err == window.ErrPickCancelled {
+			return "", false
+		}
+		return "import: " + err.Error(), true
+	}
+	n, ferr := bank.ImportFolder(dir, flat)
+	kind := "wall texture"
+	if flat {
+		kind = "flat"
+	}
+	msg := fmt.Sprintf("imported %d %s(s) from %s", n, kind, dir)
+	if ferr != nil {
+		msg += "  (" + ferr.Error() + ")"
+	}
+	return msg, true
 }
 
 // payload types carried by drags out of the panel.

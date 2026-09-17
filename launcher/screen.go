@@ -112,9 +112,6 @@ func drawTopBar(ui *UI, m *Model) {
 	// kind of choice worth seeing before you scroll past it, not after.
 	cartoonRow := Rect{16, mapY + rowHeight + 8, windowW - 32, rowHeight}
 	ui.Checkbox("cartoonShading", cartoonRow, "Cartoon Shading", &m.Cfg.CartoonShading)
-	if m.Cfg.Renderer != config.RendererHardware {
-		ui.Label(Rect{16 + labelWidth + 28, cartoonRow.Y, windowW - 32 - labelWidth - 28, rowHeight}, "(needs Renderer: Hardware, below)", true)
-	}
 }
 
 func drawBottomBar(ui *UI, m *Model) {

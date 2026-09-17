@@ -7,14 +7,14 @@ import (
 	"twopointfive/bsp"
 )
 
-// Liquid glow for the enhanced / hardware lighting paths. Vanilla Doom
-// draws lava and nukage as plain animated flats — no light comes off them.
-// Here every lava sector seeds one or more warm point lights so the pool
-// throws orange light onto the walls, monsters and the player around it,
-// and every nukage/slime sector seeds a dim sickly-green light so a toxic
-// room reads green even in the dark. Water and blood get nothing (water's
-// look is the reflective-flat effect in the software rasterizer, not a
-// light; blood is just decor).
+// Liquid glow for the hardware lighting path. Vanilla Doom draws lava and
+// nukage as plain animated flats — no light comes off them. Here every
+// lava sector seeds one or more warm point lights so the pool throws
+// orange light onto the walls, monsters and the player around it, and
+// every nukage/slime sector seeds a dim sickly-green light so a toxic room
+// reads green even in the dark. Water and blood get nothing (blood is just
+// decor; water has no distinct look of its own beyond its flat's own
+// animation).
 //
 // Built once per level by buildStaticLights (after the decoration lights)
 // and sampled every frame by collectLights like any other static emitter,
@@ -137,12 +137,11 @@ func (g *Game) appendLiquidLights(firstSeed int) int {
 		if radius > baseRad*1.9 {
 			radius = baseRad * 1.9
 		}
-		z := float64(s.FloorHeight) + 16
-
 		for _, p := range sampleSectorPoints(minX, minY, maxX, maxY) {
 			if added >= maxLiquidLights {
 				break
 			}
+			z := s.FloorZAt(p[0], p[1]) + 16
 			g.staticLights = append(g.staticLights, staticLight{
 				x: p[0], y: p[1], z: z,
 				r: r, g: gg, b: b,

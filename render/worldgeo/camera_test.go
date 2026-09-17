@@ -33,12 +33,17 @@ func applyVP(m [16]float32, wx, wy, wz float64) (px, py, ndcZ, clipW float64) {
 	return (ndcX + 1) / 2, (ndcY + 1) / 2, ndcZ, clipW // px,py in 0..1 of the viewport
 }
 
+// TestViewProjMatchesRasterProjection checks agreement with the software
+// renderer's projection at Pitch == 0 only. Above that, hardware mode now
+// rotates the camera for real (CameraBasis) while raster still shears the
+// projection (raster/camera.go) — the two are DELIBERATELY different at
+// nonzero pitch, so this test must not (and no longer does) assert they
+// match there. See TestViewProjTruePitchRotation for what hardware mode's
+// real rotation should do instead.
 func TestViewProjMatchesRasterProjection(t *testing.T) {
 	cams := []Camera{
 		{X: 0, Y: 0, Z: 41, Angle: 0, Pitch: 0, FOVDeg: 90},
 		{X: 128, Y: -256, Z: 50, Angle: 1.1, Pitch: 0, FOVDeg: 100},
-		{X: -500, Y: 300, Z: 41, Angle: -2.3, Pitch: 0.3, FOVDeg: 95},
-		{X: 64, Y: 64, Z: 60, Angle: math.Pi, Pitch: -0.4, FOVDeg: 110},
 	}
 	pts := [][3]float64{
 		{100, 0, 0}, {200, 150, 64}, {-300, 400, -32},
@@ -68,6 +73,55 @@ func TestViewProjMatchesRasterProjection(t *testing.T) {
 				t.Errorf("cam %d pt %d: ndcZ %.4f outside [0,1]", ci, pi, ndcZ)
 			}
 		}
+	}
+}
+
+func vecClose(a, b [3]float64, eps float64) bool {
+	return math.Abs(a[0]-b[0]) < eps && math.Abs(a[1]-b[1]) < eps && math.Abs(a[2]-b[2]) < eps
+}
+
+// TestCameraBasisReducesToYawOnly: at Pitch == 0, CameraBasis must match
+// ViewProj's historical hand-derived (right, up, forward) triple exactly —
+// see rasterProject's sinA/cosA rows and camera_iso.go's IsoBasis, whose own
+// zero-elevation reduction this mirrors.
+func TestCameraBasisReducesToYawOnly(t *testing.T) {
+	const eps = 1e-9
+	for _, angle := range []float64{0, 0.5, 1.1, math.Pi, -2.3, 5.9} {
+		right, up, forward := CameraBasis(Camera{Angle: angle, Pitch: 0})
+		wantRight := [3]float64{math.Sin(angle), -math.Cos(angle), 0}
+		wantUp := [3]float64{0, 0, 1}
+		wantForward := [3]float64{math.Cos(angle), math.Sin(angle), 0}
+		if !vecClose(right, wantRight, eps) {
+			t.Errorf("angle %.2f: right = %v, want %v", angle, right, wantRight)
+		}
+		if !vecClose(up, wantUp, eps) {
+			t.Errorf("angle %.2f: up = %v, want %v", angle, up, wantUp)
+		}
+		if !vecClose(forward, wantForward, eps) {
+			t.Errorf("angle %.2f: forward = %v, want %v", angle, forward, wantForward)
+		}
+	}
+}
+
+// TestViewProjTruePitchRotation proves hardware mode's pitch is a real
+// camera rotation, not a shear: pitched almost straight up (89 deg), a
+// point directly ABOVE the camera (same X,Y, far higher Z) projects near
+// screen centre. A shear can only ever slide the horizon line vertically —
+// it can never bring an overhead point to the centre of the screen the way
+// an actual rotation does.
+func TestViewProjTruePitchRotation(t *testing.T) {
+	cam := Camera{X: 0, Y: 0, Z: 0, Angle: 0, Pitch: 89 * math.Pi / 180, FOVDeg: 90}
+	const w, h = 1920, 1080
+	m := ViewProj(cam, w, h)
+	nx, ny, ndcZ, clipW := applyVP(m, 0, 0, 1000)
+	if clipW <= 0 {
+		t.Fatalf("point above the camera fell behind it: clip.w = %.3f", clipW)
+	}
+	if ndcZ < 0 || ndcZ > 1 {
+		t.Fatalf("point above the camera outside the depth range: ndcZ = %.4f", ndcZ)
+	}
+	if math.Abs(nx-0.5) > 0.05 || math.Abs(ny-0.5) > 0.05 {
+		t.Errorf("looking nearly straight up, an overhead point projected to (%.3f,%.3f), want near screen centre (0.5,0.5) — pitch is behaving like a shear, not a rotation", nx, ny)
 	}
 }
 

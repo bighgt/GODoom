@@ -86,7 +86,7 @@ func TestAimDirection(t *testing.T) {
 }
 
 func TestFrameAt(t *testing.T) {
-	frames := []WeaponFrame{{'A', 4}, {'B', 6}, {'C', 4}}
+	frames := []WeaponFrame{{Frame: 'A', Tics: 4}, {Frame: 'B', Tics: 6}, {Frame: 'C', Tics: 4}}
 	cases := []struct {
 		tics  float64
 		frame byte

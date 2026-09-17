@@ -1,8 +1,8 @@
 // Package worldgeo turns a BSP-walked level into a flat triangle list with
 // per-vertex texture / light / kind attributes — the backend-agnostic
-// input a hardware (GPU-geometry) renderer needs, the same shape PrBoom-GL
-// and GZDoom build from their BSP walk. It does no drawing: the CPU
-// software rasterizer (package raster) is untouched and stays the default.
+// input the hardware (GPU-geometry) renderer needs, the same shape
+// PrBoom-GL and GZDoom build from their BSP walk. It does no drawing: the
+// GPU (package render/vulkan) does the actual rasterization from this data.
 //
 // The BSP is still walked on the CPU (front-to-back, for early-Z), but only
 // to *collect* geometry; the GPU then does the per-pixel rasterization,
@@ -179,6 +179,7 @@ func skyTextureForMap(mapName string) string {
 }
 
 // SetSky overrides the resolved WAD sky with a panorama (assets.LoadSkybox).
+// Currently unused by any caller — see assets.LoadSkybox's doc comment.
 func (b *Builder) SetSky(t *assets.RGBA) {
 	if t != nil {
 		b.g.Sky = t
@@ -224,6 +225,26 @@ type Builder struct {
 	// Invalidate again itself: `b := New(...); b.SkipCeilings = true;
 	// b.Invalidate()`.
 	SkipCeilings bool
+
+	// extraFloors is this level's room-over-room "3D floor" bands — target
+	// sector index -> the control sector indices it borrows a platform
+	// from (engine.ExtraFloor, one per entry) — set via SetExtraFloors.
+	// nil (New's default) draws every sector as the plain vanilla single
+	// floor/ceiling pair, unchanged from before this feature existed.
+	extraFloors map[int][]int
+}
+
+// SetExtraFloors installs this level's room-over-room bands for the static
+// mesh builder to emit (see emitExtraFloors) and invalidates the cached
+// geometry so the next Build picks them up. m is target sector index ->
+// control sector indices (engine.Game.extraFloors, flattened); nil clears
+// it back to "no room-over-room platforms." The engine calls this once
+// per level load, right after (re)wiring WorldBuilder — see
+// engine.ApplyMapInfo's doc comment for why that's a separate step from
+// NewGame/loadMap themselves (WorldBuilder isn't always built yet then).
+func (b *Builder) SetExtraFloors(m map[int][]int) {
+	b.extraFloors = m
+	b.Invalidate()
 }
 
 // New binds a builder to a level. tex resolves texture / flat names to the
@@ -606,6 +627,9 @@ func (b *Builder) emitSubsectorIdx(idx int) {
 	if !b.SkipCeilings {
 		b.emitFlat(poly, frontSec, true) // ceiling, faces down
 	}
+	if len(b.extraFloors) > 0 {
+		b.emitExtraFloors(poly, int(frontSD.Sector))
+	}
 
 	for _, s := range segs {
 		b.emitSegWalls(s)
@@ -616,58 +640,112 @@ func (b *Builder) emitSubsectorIdx(idx int) {
 func pt(v wad.Vertex) bsp.Point { return bsp.Point{X: float32(v.X), Y: float32(v.Y)} }
 
 // emitFlat fans poly into triangles at the sector's floor (ceiling=false)
-// or ceiling (ceiling=true) height. Winding is reversed for the ceiling so
-// both faces point into the room (the pipeline can then backface-cull).
+// or ceiling (ceiling=true) height — a per-vertex plane evaluation
+// (Sector.FloorZAt/CeilZAt), so a sloped sector fans into a tilted mesh
+// automatically; every vanilla (untilted) sector still gets exactly the
+// same flat polygon as before, since FloorZAt/CeilZAt degenerate to the
+// scalar height there. Thin wrapper over emitFlatPlane — see its own doc
+// comment for why room-over-room needs that lower-level shape directly.
 func (b *Builder) emitFlat(poly []bsp.Point, sec *wad.Sector, ceiling bool) {
+	name := sec.FloorTexture
+	zAt := sec.FloorZAt
+	tiltX, tiltY := sec.FloorTiltX, sec.FloorTiltY
+	if ceiling {
+		name = sec.CeilingTexture
+		zAt = sec.CeilZAt
+		tiltX, tiltY = sec.CeilTiltX, sec.CeilTiltY
+	}
+	light := float32(clampI(int(sec.LightLevel), 0, 255)) / 255
+	b.emitFlatPlane(poly, name, zAt, tiltX, tiltY, !ceiling, light)
+}
+
+// emitFlatPlane fans poly into triangles at a given plane (zAt, tilted by
+// tiltX/tiltY), textured by texName, facing up (faceUp — a floor-like
+// surface, normal winding) or down (a ceiling-like surface, reversed
+// winding so both faces point into the room). This is emitFlat's shared
+// core, generalized so a room-over-room platform's top/bottom (below) can
+// reuse it too: a platform's walkable TOP pairs a control sector's
+// CEILING texture/height with an UP-facing surface, and its underside
+// pairs the control's FLOOR with a DOWN-facing one — exactly the
+// texture/facing mismatch emitFlat's own sec-plus-ceiling-bool shape can't
+// express, since it always pairs a sector's floor with "up" and its
+// ceiling with "down".
+func (b *Builder) emitFlatPlane(poly []bsp.Point, texName string, zAt func(x, y float64) float64, tiltX, tiltY float64, faceUp bool, light float32) {
 	if len(poly) < 3 {
 		return
 	}
-	name := sec.FloorTexture
-	z := float32(sec.FloorHeight)
-	if ceiling {
-		name = sec.CeilingTexture
-		z = float32(sec.CeilingHeight)
-	}
-
 	kind, tex := KindFlat, uint16(0)
 	var tpu, tw, th float64 = 1, 64, 64
-	if name == skyFlatName {
+	if texName == skyFlatName {
 		kind, tex = KindSky, SkyTex
-	} else if rgba, ok := b.tex.Flat(name); ok && rgba != nil {
-		bm, _ := b.tex.Brightmap(name, rgba)
+	} else if rgba, ok := b.tex.Flat(texName); ok && rgba != nil {
+		bm, _ := b.tex.Brightmap(texName, rgba)
 		tex = b.slot(rgba, bm)
 		tpu, tw, th = rgba.TexelsPerUnit, float64(rgba.Width), float64(rgba.Height)
-		if !ceiling {
-			// Only floors get the liquid surface treatment (a liquid
-			// "ceiling" would be an overhead pool — vanilla has none).
-			if lk := liquidKindOfFlat(name); lk != KindFlat {
+		if faceUp {
+			// Only an up-facing (floor-like) surface gets the liquid
+			// treatment — a liquid "ceiling" would be an overhead pool,
+			// which vanilla has none of and a platform's underside isn't.
+			if lk := liquidKindOfFlat(texName); lk != KindFlat {
 				kind = lk
 			}
 		}
 	} else {
 		return // unresolved flat — nothing to draw (matches raster's nil-flat skip)
 	}
-	light := float32(clampI(int(sec.LightLevel), 0, 255)) / 255
-	nz := float32(1) // floor faces up
-	if ceiling {
-		nz = -1 // ceiling faces down
+
+	// Plane normal: (0,0,1) facing up / (0,0,-1) facing down (tiltX==
+	// tiltY==0, the vanilla case) — otherwise the actual tilted plane's
+	// normal, so a sloped surface lights correctly instead of reading as
+	// flat-lit. The up hemisphere is (-tiltX,-tiltY,1) (unnormalized); the
+	// down one is the sign-flipped (tiltX,tiltY,-1) — both reduce to the
+	// vanilla ±Z normal at zero tilt.
+	nx64, ny64, nz64 := -tiltX, -tiltY, 1.0
+	if !faceUp {
+		nx64, ny64, nz64 = tiltX, tiltY, -1.0
 	}
+	nlen := math.Sqrt(nx64*nx64 + ny64*ny64 + nz64*nz64)
+	nx, ny, nz := float32(nx64/nlen), float32(ny64/nlen), float32(nz64/nlen)
 
 	mk := func(p bsp.Point) Vert {
 		x, y := float64(p.X), float64(p.Y)
 		return Vert{
-			X: p.X, Y: p.Y, Z: z,
+			X: p.X, Y: p.Y, Z: float32(zAt(x, y)),
 			U: float32(x * tpu / tw), V: float32(y * tpu / th),
-			Light: light, Nz: nz, Tex: tex, Kind: kind,
+			Light: light, Nx: nx, Ny: ny, Nz: nz, Tex: tex, Kind: kind,
 		}
 	}
 	v0 := mk(poly[0])
 	for i := 1; i+1 < len(poly); i++ {
 		a, c := mk(poly[i]), mk(poly[i+1])
-		if ceiling {
-			b.emit(v0, c, a) // reversed
-		} else {
+		if faceUp {
 			b.emit(v0, a, c)
+		} else {
+			b.emit(v0, c, a) // reversed
+		}
+	}
+}
+
+// emitExtraFloors emits secIdx's room-over-room platforms (if it has any —
+// b.extraFloors[secIdx], set via SetExtraFloors): for each control sector,
+// its ceiling as a walkable TOP (faces up, like a floor) and its floor as
+// the underside acting as a CEILING (faces down) — both fanned over poly,
+// the TARGET sector's own footprint, since a platform's horizontal extent
+// is the whole target sector (the control sector only lends its vertical
+// span + texture/light, not its own shape). SkipCeilings only suppresses
+// the underside, matching how it treats an ordinary ceiling — the
+// walkable top is never optional. See engine.ExtraFloor/planeAt for the
+// runtime (collision/gameplay) side of this same convention.
+func (b *Builder) emitExtraFloors(poly []bsp.Point, secIdx int) {
+	for _, ctrlIdx := range b.extraFloors[secIdx] {
+		if ctrlIdx < 0 || ctrlIdx >= len(b.lvl.Sectors) {
+			continue
+		}
+		ctrl := &b.lvl.Sectors[ctrlIdx]
+		light := float32(clampI(int(ctrl.LightLevel), 0, 255)) / 255
+		b.emitFlatPlane(poly, ctrl.CeilingTexture, ctrl.CeilZAt, ctrl.CeilTiltX, ctrl.CeilTiltY, true, light)
+		if !b.SkipCeilings {
+			b.emitFlatPlane(poly, ctrl.FloorTexture, ctrl.FloorZAt, ctrl.FloorTiltX, ctrl.FloorTiltY, false, light)
 		}
 	}
 }
@@ -703,46 +781,52 @@ func (b *Builder) emitSegWalls(seg wad.Seg) {
 
 	xBase := float64(frontSD.XOffset) + float64(seg.Offset)
 	yOff := float64(frontSD.YOffset)
-	fFloor, fCeil := float64(frontSec.FloorHeight), float64(frontSec.CeilingHeight)
+	// Per-endpoint plane evaluation: for a vanilla (untilted) sector these
+	// two values are always equal, so every existing map's walls are
+	// unaffected; a sloped sector's wall quad tapers between them instead
+	// of assuming one shared height for the whole seg.
+	fFloor1, fFloor2 := frontSec.FloorZAt(x1, y1), frontSec.FloorZAt(x2, y2)
+	fCeil1, fCeil2 := frontSec.CeilZAt(x1, y1), frontSec.CeilZAt(x2, y2)
 
 	if backSec == nil {
 		if rgba, ok := b.tex.WallTexture(frontSD.MiddleTexture); ok && rgba != nil {
 			bm, _ := b.tex.Brightmap(frontSD.MiddleTexture, rgba)
-			anchor := fCeil
+			anchor := fCeil1
 			if flags&wad.LinedefLowerUnpegged != 0 {
-				anchor = fFloor + texHeightUnits(rgba)
+				anchor = fFloor1 + texHeightUnits(rgba)
 			}
-			b.wallQuad(x1, y1, x2, y2, fFloor, fCeil, rgba, bm, anchor, yOff, xBase, segLen, light, KindWall)
+			b.wallQuad(x1, y1, x2, y2, fFloor1, fFloor2, fCeil1, fCeil2, rgba, bm, anchor, yOff, xBase, segLen, light, KindWall)
 		}
 		return
 	}
 
-	bFloor, bCeil := float64(backSec.FloorHeight), float64(backSec.CeilingHeight)
+	bFloor1, bFloor2 := backSec.FloorZAt(x1, y1), backSec.FloorZAt(x2, y2)
+	bCeil1, bCeil2 := backSec.CeilZAt(x1, y1), backSec.CeilZAt(x2, y2)
 
-	// Upper: front ceiling steps down to back ceiling.
-	if bCeil < fCeil {
+	// Upper: front ceiling steps down to back ceiling (needed at either end).
+	if bCeil1 < fCeil1 || bCeil2 < fCeil2 {
 		if rgba, ok := b.tex.WallTexture(frontSD.UpperTexture); ok && rgba != nil {
 			bm, _ := b.tex.Brightmap(frontSD.UpperTexture, rgba)
-			anchor := bCeil + texHeightUnits(rgba)
+			anchor := bCeil1 + texHeightUnits(rgba)
 			if flags&wad.LinedefUpperUnpegged != 0 {
-				anchor = fCeil
+				anchor = fCeil1
 			}
-			b.wallQuad(x1, y1, x2, y2, bCeil, fCeil, rgba, bm, anchor, yOff, xBase, segLen, light, KindWall)
+			b.wallQuad(x1, y1, x2, y2, bCeil1, bCeil2, fCeil1, fCeil2, rgba, bm, anchor, yOff, xBase, segLen, light, KindWall)
 		} else if frontSec.CeilingTexture == skyFlatName {
 			// Sky ceiling with no upper texture: the sky wraps over the step.
-			b.wallQuad(x1, y1, x2, y2, bCeil, fCeil, nil, nil, 0, 0, xBase, segLen, light, KindSky)
+			b.wallQuad(x1, y1, x2, y2, bCeil1, bCeil2, fCeil1, fCeil2, nil, nil, 0, 0, xBase, segLen, light, KindSky)
 		}
 	}
 
-	// Lower: back floor steps up above front floor.
-	if bFloor > fFloor {
+	// Lower: back floor steps up above front floor (needed at either end).
+	if bFloor1 > fFloor1 || bFloor2 > fFloor2 {
 		if rgba, ok := b.tex.WallTexture(frontSD.LowerTexture); ok && rgba != nil {
 			bm, _ := b.tex.Brightmap(frontSD.LowerTexture, rgba)
-			anchor := bFloor
+			anchor := bFloor1
 			if flags&wad.LinedefLowerUnpegged != 0 {
-				anchor = fCeil
+				anchor = fCeil1
 			}
-			b.wallQuad(x1, y1, x2, y2, fFloor, bFloor, rgba, bm, anchor, yOff, xBase, segLen, light, KindWall)
+			b.wallQuad(x1, y1, x2, y2, fFloor1, fFloor2, bFloor1, bFloor2, rgba, bm, anchor, yOff, xBase, segLen, light, KindWall)
 		}
 	}
 
@@ -751,28 +835,33 @@ func (b *Builder) emitSegWalls(seg wad.Seg) {
 	// discards V outside 0..1 in the shader).
 	if rgba, ok := b.tex.WallTexture(frontSD.MiddleTexture); ok && rgba != nil {
 		bm, _ := b.tex.Brightmap(frontSD.MiddleTexture, rgba)
-		openBot := math.Max(fFloor, bFloor)
-		openTop := math.Min(fCeil, bCeil)
-		if openTop > openBot {
-			anchor := openTop
+		openBot1, openBot2 := math.Max(fFloor1, bFloor1), math.Max(fFloor2, bFloor2)
+		openTop1, openTop2 := math.Min(fCeil1, bCeil1), math.Min(fCeil2, bCeil2)
+		if openTop1 > openBot1 || openTop2 > openBot2 {
+			anchor := openTop1
 			if flags&wad.LinedefLowerUnpegged != 0 {
-				anchor = openBot + texHeightUnits(rgba)
+				anchor = openBot1 + texHeightUnits(rgba)
 			}
-			b.wallQuad(x1, y1, x2, y2, openBot, openTop, rgba, bm, anchor, yOff, xBase, segLen, light, KindMasked)
+			b.wallQuad(x1, y1, x2, y2, openBot1, openBot2, openTop1, openTop2, rgba, bm, anchor, yOff, xBase, segLen, light, KindMasked)
 		}
 	}
 }
 
 // wallQuad appends the two triangles for a wall piece: the seg (x1,y1)->
-// (x2,y2) extruded from botZ to topZ. anchorZ is the world height the
-// texture's row 0 maps to (id's rw_*texturemid); tex==nil means a sky
-// quad (kind must be KindSky). U runs along the seg by map units * TPU /
-// pixel width; V is (anchor - worldZ + yOff) * TPU / pixel height.
-func (b *Builder) wallQuad(x1, y1, x2, y2, botZ, topZ float64, tex, bright *assets.RGBA,
+// (x2,y2) extruded from botZ1/botZ2 to topZ1/topZ2 — each endpoint's own
+// bottom/top, so a wall against a sloped sector tapers between them
+// instead of assuming one shared height (every vanilla, untilted sector
+// always passes botZ1==botZ2 and topZ1==topZ2, so this is the same
+// rectangle as before there). anchorZ is the world height the texture's
+// row 0 maps to (id's rw_*texturemid); tex==nil means a sky quad (kind
+// must be KindSky). U runs along the seg by map units * TPU / pixel width;
+// V is (anchor - worldZ + yOff) * TPU / pixel height, evaluated at each
+// vertex's own worldZ.
+func (b *Builder) wallQuad(x1, y1, x2, y2, botZ1, botZ2, topZ1, topZ2 float64, tex, bright *assets.RGBA,
 	anchorZ, yOff, xBase, segLen float64, light float32, kind uint16) {
 
-	if topZ <= botZ {
-		return
+	if topZ1 <= botZ1 && topZ2 <= botZ2 {
+		return // degenerate at both ends — nothing to draw anywhere along the seg
 	}
 	slot := uint16(SkyTex)
 	var tpu, tw, th float64 = 1, 1, 1
@@ -783,12 +872,14 @@ func (b *Builder) wallQuad(x1, y1, x2, y2, botZ, topZ float64, tex, bright *asse
 	u1 := float32(xBase * tpu / tw)
 	u2 := float32((xBase + segLen) * tpu / tw)
 	vAt := func(wz float64) float32 { return float32((anchorZ - wz + yOff) * tpu / th) }
-	vBot, vTop := vAt(botZ), vAt(topZ)
 
 	// Face normal: horizontal, perpendicular to the seg, pointing into the
 	// front sector (toward the viewer). Doom subsector segs wind clockwise,
 	// so the interior is the seg's right-hand side — normalize(dy, -dx). This
-	// matches bsp.SubsectorPolygons' own interior test.
+	// matches bsp.SubsectorPolygons' own interior test. A sloped wall's true
+	// normal would also tilt slightly along the seg, but a wall quad is
+	// still vertical at each end (only its top/bottom Z tapers) so this
+	// horizontal normal remains exactly correct.
 	ndx, ndy := x2-x1, y2-y1
 	nlen := math.Hypot(ndx, ndy)
 	var nx, ny float32
@@ -797,11 +888,11 @@ func (b *Builder) wallQuad(x1, y1, x2, y2, botZ, topZ float64, tex, bright *asse
 		ny = float32(-ndx / nlen)
 	}
 
-	bz, tz := float32(botZ), float32(topZ)
-	A := Vert{X: float32(x1), Y: float32(y1), Z: bz, U: u1, V: vBot, Light: light, Nx: nx, Ny: ny, Tex: slot, Kind: kind}
-	B := Vert{X: float32(x2), Y: float32(y2), Z: bz, U: u2, V: vBot, Light: light, Nx: nx, Ny: ny, Tex: slot, Kind: kind}
-	C := Vert{X: float32(x2), Y: float32(y2), Z: tz, U: u2, V: vTop, Light: light, Nx: nx, Ny: ny, Tex: slot, Kind: kind}
-	D := Vert{X: float32(x1), Y: float32(y1), Z: tz, U: u1, V: vTop, Light: light, Nx: nx, Ny: ny, Tex: slot, Kind: kind}
+	bz1, bz2, tz1, tz2 := float32(botZ1), float32(botZ2), float32(topZ1), float32(topZ2)
+	A := Vert{X: float32(x1), Y: float32(y1), Z: bz1, U: u1, V: vAt(botZ1), Light: light, Nx: nx, Ny: ny, Tex: slot, Kind: kind}
+	B := Vert{X: float32(x2), Y: float32(y2), Z: bz2, U: u2, V: vAt(botZ2), Light: light, Nx: nx, Ny: ny, Tex: slot, Kind: kind}
+	C := Vert{X: float32(x2), Y: float32(y2), Z: tz2, U: u2, V: vAt(topZ2), Light: light, Nx: nx, Ny: ny, Tex: slot, Kind: kind}
+	D := Vert{X: float32(x1), Y: float32(y1), Z: tz1, U: u1, V: vAt(topZ1), Light: light, Nx: nx, Ny: ny, Tex: slot, Kind: kind}
 	b.emit(A, B, C)
 	b.emit(A, C, D)
 }

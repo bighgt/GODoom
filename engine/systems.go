@@ -61,6 +61,18 @@ func (combatSystem) Update(g *Game, dt float32) {
 		}
 		g.weaponKeyDown[slot] = down
 	}
+	// Mouse wheel: one step per frame regardless of how many notches were
+	// accumulated (a fast flick shouldn't skip through several weapons at
+	// once) — up cycles forward through weaponCycleOrder, down backward.
+	// cmd/isoengine already spends the wheel on camera zoom, so this is
+	// first-person only (nothing else in cmd/engine reads it).
+	if _, dy := g.Window.TakeScroll(); dy != 0 {
+		if dy > 0 {
+			g.CycleWeapon(1)
+		} else {
+			g.CycleWeapon(-1)
+		}
+	}
 	// Held, not edge-triggered: real Doom refires every weapon
 	// automatically for as long as the fire button stays down, at whatever
 	// cadence that weapon's own animation allows — FireWeapon already

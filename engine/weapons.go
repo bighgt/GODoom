@@ -1,6 +1,8 @@
 package engine
 
-import "math"
+import (
+	"math"
+)
 
 // WeaponFrame is one frame of a weapon's animation, straight from id's own
 // info.c states[] table: which sprite frame letter to show, and how many
@@ -12,7 +14,27 @@ import "math"
 type WeaponFrame struct {
 	Frame byte // 'A', 'B', 'C', ... -> sprite lump suffix, e.g. "PISG" + 'B' + "0" = PISGB0
 	Tics  int
+	// Prefix overrides the weapon's own default sprite prefix (SpritePrefix
+	// for FireFrames/IdleFrames, FlashPrefix for FlashFrames) for just this
+	// frame; "" (every frame before the HD smooth-weapon port) means "use
+	// the default." A few of that port's animations switch sprite FAMILY
+	// mid-sequence, not just frame letter — id's own info.c never needed
+	// this (one sprite per weapon, or two counting the separate flash), so
+	// this field didn't exist until that pack's fist/chainsaw/super
+	// shotgun sequences did.
+	Prefix string
 }
+
+// flashDelayFrame is FlashFrames' sentinel for "no muzzle flash yet, but
+// hold this long before checking again" — Frame 0 isn't a valid sprite
+// frame letter, so currentSprite treats it as hasFlash=false the same as
+// running past the end of FlashFrames entirely. Some of the HD smooth-
+// weapon port's sequences trigger their actual muzzle flash well after the
+// shot starts (id's own A_GunFlash call site, mid fire-animation) — e.g.
+// the shotgun's brief pump delay, or the BFG's ~30-tic charge-up — and
+// without this, the flash would show for the FULL fire animation instead
+// of just its authored window.
+func flashDelayFrame(tics int) WeaponFrame { return WeaponFrame{Frame: 0, Tics: tics} }
 
 // timedSound is a DS* lump played once when the fire animation reaches
 // AtTic tics from the start of the shot (see WeaponDef.FireSoundSeq).
@@ -160,50 +182,155 @@ var weaponSlots = [8][]int{
 // chaingun firing DSPISTOL and the BFG's 40-cell cost aren't approximations
 // — that's the original's actual data (a well-known bit of Doom trivia in
 // the chaingun's case).
+//
+// Every viewmodel sequence below (SpritePrefix/FlashPrefix/FireFrames/
+// FlashFrames/IdleFrames) is ported from "Smooth HD Weapons for Doom" (
+// assets/weapons/HDSmoothWeapons.pk3, by BohdanZPM/jdrake — a GZDoom
+// ZScript mod, zscript/SmoothWeapons*.zc) rather than id's own info.c —
+// replacing this project's original vanilla-timed tables. Ported means:
+// the actual sprite names, frame letters and tic durations from that
+// mod's state chains, translated 1:1 where this engine's simpler model
+// allows. Three deliberate departures from a byte-for-byte port, kept
+// consistent across every weapon below:
+//
+//  1. ONE shot's worth of frames, not the mod's own multi-shot bundling.
+//     GZDoom's Fire state can loop/rebranch internally (the chaingun's
+//     literally fires two rounds and a "ready wiggle" per Fire visit); this
+//     engine's model is "FireWeapon() plays FireFrames once, then this
+//     project's own auto-refire replays it if the trigger's still held" —
+//     unchanged by this port, so ammo cost/damage/fire rate stay exactly
+//     what they were. Where the mod bundles more than one shot, only the
+//     first is kept.
+//  2. GZDoom-only mechanics this raster engine has no equivalent for are
+//     dropped, not approximated: Decal, A_WeaponOffset recoil-kick
+//     keyframing (beyond this project's own existing weaponBob sway), and
+//     the custom additive-blend/rescaled plasma+BFG projectile actors —
+//     Projectile below still points at this project's original sprite/
+//     speed/damage data, untouched.
+//  3. A weapon's trailing "wind back down to the resting pose" tail is
+//     dropped where it's just idle art repeated (this project's own
+//     IdleFrames/default frame 'A' already takes over the instant
+//     phase != weaponFiring, so replaying the wind-down every single shot
+//     of a sustained burst would only slow the loop down for no visual
+//     gain).
+//
+// A handful of sequences switch sprite FAMILY mid-animation (not just
+// frame letter) — WeaponFrame.Prefix carries that; see its own doc
+// comment. flashDelayFrame marks a muzzle flash that doesn't start at the
+// very first fire frame (the shotgun's brief pump delay, the BFG's long
+// charge-up) — see its own doc comment.
 var Weapons = [numWeapons]WeaponDef{
 	wpFist: {
-		Name: "Fist", SpritePrefix: "PUNG", FireSound: "DSPUNCH",
+		Name: "Fist", SpritePrefix: "FIS0", FireSound: "DSPUNCH",
 		AmmoType: -1, AmmoCost: 0,
-		// S_PUNCH1..5: B C D C B (ready/raise/lower use frame A).
-		FireFrames: []WeaponFrame{{'B', 4}, {'C', 4}, {'D', 5}, {'C', 4}, {'B', 5}},
-		Melee:      true,
+		// SmoothFist Fire: FIS0 A 1; FI10 BCD 1; FIS0 E 3 (A_Punch); FIS0
+		// FGHIJ 2 — the A_WeaponOffset recoil-settle tail after A_Refire is
+		// dropped (frame 'A' repeated at different offsets only, no new art).
+		FireFrames: []WeaponFrame{
+			{Frame: 'A', Tics: 1},
+			{Frame: 'B', Tics: 1, Prefix: "FI10"},
+			{Frame: 'C', Tics: 1, Prefix: "FI10"},
+			{Frame: 'D', Tics: 1, Prefix: "FI10"},
+			{Frame: 'E', Tics: 3},
+			{Frame: 'F', Tics: 2},
+			{Frame: 'G', Tics: 2},
+			{Frame: 'H', Tics: 2},
+			{Frame: 'I', Tics: 2},
+			{Frame: 'J', Tics: 2},
+		},
+		Melee: true,
 	},
 	wpPistol: {
-		Name: "Pistol", SpritePrefix: "PISG", FlashPrefix: "PISF", FireSound: "DSPISTOL",
+		Name: "Pistol", SpritePrefix: "PI0G", FlashPrefix: "PI0L", FireSound: "DSPISTOL",
 		AmmoType: 0, AmmoCost: 1,
-		// S_PISTOL1..4
-		FireFrames: []WeaponFrame{{'A', 4}, {'B', 6}, {'C', 4}, {'B', 5}},
-		// S_PISTOLFLASH
-		FlashFrames: []WeaponFrame{{'A', 7}},
+		// SmoothPistol Fire: PI0F A 3 (recoil, A_GunFlash+A_FireBullets);
+		// PI0G ABCD 1; PI0G EF 2; PI0G A 3 (A_ReFire point); PI0G A 5.
+		FireFrames: []WeaponFrame{
+			{Frame: 'A', Tics: 3, Prefix: "PI0F"},
+			{Frame: 'A', Tics: 1},
+			{Frame: 'B', Tics: 1},
+			{Frame: 'C', Tics: 1},
+			{Frame: 'D', Tics: 1},
+			{Frame: 'E', Tics: 2},
+			{Frame: 'F', Tics: 2},
+			{Frame: 'A', Tics: 3},
+			{Frame: 'A', Tics: 5},
+		},
+		// SmoothPistol Flash randomly picks one of 4 single-tic PI0L frames
+		// (A-D, all equivalent bright light bumps) — simplified to a fixed
+		// PI0L A held for the recoil frame's own duration.
+		FlashFrames: []WeaponFrame{{Frame: 'A', Tics: 4}},
 	},
 	wpShotgun: {
-		Name: "Shotgun", SpritePrefix: "SHTG", FlashPrefix: "SHTF", FireSound: "DSSHOTGN",
+		Name: "Shotgun", SpritePrefix: "SHOG", FlashPrefix: "SHOL", FireSound: "DSSHOTGN",
 		AmmoType: 1, AmmoCost: 1,
-		// S_SGUN1..9 — the pump-action cycle: A A B C D C B A A
+		// SmoothShotgun Fire: SHOG A 3 (pump-ready pose, no action yet);
+		// SHOG A 3 (A_GunFlash+A_FireBullets — the actual shot, 3 tics into
+		// the animation); SHOG BDFHIJKL 1; SHOG M 2; SHOG NO 3; SHOG
+		// NLKJIHGFE 1; SHOG DCB 2; SHOG A 7 (A_ReFire point).
 		FireFrames: []WeaponFrame{
-			{'A', 3}, {'A', 7}, {'B', 5}, {'C', 5}, {'D', 4}, {'C', 5}, {'B', 5}, {'A', 3}, {'A', 7},
+			{Frame: 'A', Tics: 3},
+			{Frame: 'A', Tics: 3},
+			{Frame: 'B', Tics: 1}, {Frame: 'D', Tics: 1}, {Frame: 'F', Tics: 1}, {Frame: 'H', Tics: 1},
+			{Frame: 'I', Tics: 1}, {Frame: 'J', Tics: 1}, {Frame: 'K', Tics: 1}, {Frame: 'L', Tics: 1},
+			{Frame: 'M', Tics: 2},
+			{Frame: 'N', Tics: 3}, {Frame: 'O', Tics: 3},
+			{Frame: 'N', Tics: 1}, {Frame: 'L', Tics: 1}, {Frame: 'K', Tics: 1}, {Frame: 'J', Tics: 1},
+			{Frame: 'I', Tics: 1}, {Frame: 'H', Tics: 1}, {Frame: 'G', Tics: 1}, {Frame: 'F', Tics: 1}, {Frame: 'E', Tics: 1},
+			{Frame: 'D', Tics: 2}, {Frame: 'C', Tics: 2}, {Frame: 'B', Tics: 2},
+			{Frame: 'A', Tics: 7},
 		},
-		// S_SGUNFLASH1..2
-		FlashFrames: []WeaponFrame{{'A', 4}, {'B', 3}},
+		// A_GunFlash isn't called until the 2nd SHOG-A-3 state (see above) —
+		// flashDelayFrame holds "no flash yet" for that first 3-tic pump
+		// pose so the muzzle flash doesn't show a beat early.
+		FlashFrames: []WeaponFrame{
+			flashDelayFrame(3),
+			{Frame: 'A', Tics: 4},
+			{Frame: 'B', Tics: 3},
+		},
 	},
 	wpChaingun: {
-		Name: "Chaingun", SpritePrefix: "CHGG", FlashPrefix: "CHGF", FireSound: "DSPISTOL",
+		Name: "Chaingun", SpritePrefix: "CHNG", FlashPrefix: "CHNF", FireSound: "DSPISTOL",
 		AmmoType: 0, AmmoCost: 1,
-		// Vanilla S_CHAIN1..2 hold 4 tics each (8 tics/shot, ~4.4/sec). Per
-		// user request this project's chaingun fires at twice that rate:
-		// 2 tics/frame, 4 tics/shot (~8.75/sec). The muzzle flash is pulled
-		// in from 5 to 3 tics so it doesn't smear across two whole shots.
-		FireFrames:  []WeaponFrame{{'A', 2}, {'B', 2}},
-		FlashFrames: []WeaponFrame{{'A', 3}},
+		// SmoothChaingun fires two rounds per Fire visit (its own
+		// A_CheckReload mid-sequence loop); one shot's worth is CHNG A 1
+		// (A_GunFlash+A_FireBullets) + CHNG BCD 1 — 4 tics total, which
+		// happens to land on exactly this project's own already-doubled
+		// firing rate (see the previous vanilla-timed table's own note:
+		// 2 tics/frame, 4 tics/shot, ~8.75/sec — unchanged by this port).
+		FireFrames: []WeaponFrame{
+			{Frame: 'A', Tics: 1},
+			{Frame: 'B', Tics: 1},
+			{Frame: 'C', Tics: 1},
+			{Frame: 'D', Tics: 1},
+		},
+		FlashFrames: []WeaponFrame{{Frame: 'A', Tics: 2}},
 	},
 	wpMissile: {
-		Name: "Rocket Launcher", SpritePrefix: "MISG", FlashPrefix: "MISF", FireSound: "DSRLAUNC",
+		Name: "Rocket Launcher", SpritePrefix: "RLAN", FlashPrefix: "RLAF", FireSound: "DSRLAUNC",
 		AmmoType: 3, AmmoCost: 1,
-		// S_MISSILE1..2 (S_MISSILE3 is another 0-tic instant passthrough);
-		// both real frames are the same letter, so they're merged into one
-		FireFrames: []WeaponFrame{{'B', 20}},
-		// S_MISSILEFLASH1..4
-		FlashFrames: []WeaponFrame{{'A', 3}, {'B', 4}, {'C', 4}, {'D', 4}},
+		// SmoothRocketLauncher Fire: RLAN A 4 (A_GunFlash); B 2; D 3
+		// (A_FireMissile); C 3; BE 2; FG 2 (A_ReFire point) — 20 tics total,
+		// same overall duration as the original single-frame 20-tic hold.
+		FireFrames: []WeaponFrame{
+			{Frame: 'A', Tics: 4},
+			{Frame: 'B', Tics: 2},
+			{Frame: 'D', Tics: 3},
+			{Frame: 'C', Tics: 3},
+			{Frame: 'B', Tics: 2},
+			{Frame: 'E', Tics: 2},
+			{Frame: 'F', Tics: 2},
+			{Frame: 'G', Tics: 2},
+		},
+		// SmoothRocketLauncher Flash: RLAF A 2; B 2; C 2; DE 3 — ported
+		// whole, no branching/simplification needed.
+		FlashFrames: []WeaponFrame{
+			{Frame: 'A', Tics: 2},
+			{Frame: 'B', Tics: 2},
+			{Frame: 'C', Tics: 2},
+			{Frame: 'D', Tics: 3},
+			{Frame: 'E', Tics: 3},
+		},
 		// MT_ROCKET's canon speed is 20*35=700 units/sec; per user
 		// feedback this project's own rocket runs 20% faster than that.
 		// deathsound sfx_barexp (DSBAREXP) — rockets and exploding barrels
@@ -214,7 +341,9 @@ var Weapons = [numWeapons]WeaponDef{
 		// separate BEXP animation — using BEXP here was this project's own
 		// mistake, not a vanilla quirk, and showed the barrel's fireball
 		// shape on every rocket impact. All verified present in
-		// testdata/DOOM1.WAD (MISLA1, MISLB0-D0, DSBAREXP).
+		// testdata/DOOM1.WAD (MISLA1, MISLB0-D0, DSBAREXP). Untouched by
+		// the HD viewmodel port above — this is the flying projectile's own
+		// sprite, not the held weapon's.
 		Projectile: &ProjectileDef{
 			Sprite: "MISLA1", Speed: 700 * 1.2,
 			ExplodePrefix: "MISL", ExplodeFrames: []byte{'B', 'C', 'D'}, ExplodeTics: 4,
@@ -223,24 +352,35 @@ var Weapons = [numWeapons]WeaponDef{
 		},
 	},
 	wpPlasma: {
-		Name: "Plasma Rifle", SpritePrefix: "PLSG", FlashPrefix: "PLSF", FireSound: "DSPLASMA",
+		Name: "Plasma Rifle", SpritePrefix: "PLGG", FlashPrefix: "PLSF", FireSound: "DSPLASMA",
 		AmmoType: 2, AmmoCost: 1,
-		// S_PLASMA1..2. Vanilla's S_PLASMA2 is 20 tics but its A_ReFire
-		// bounces straight back to S_PLASMA1 the instant fire is held, so the
-		// real held-fire cadence is ~3 tics/shot (~12/sec). This engine
-		// always plays the whole FireFrames sequence before re-firing, so
-		// frame B is trimmed to 1 tic to land near that rate (4 tics/shot,
-		// ~9/sec) instead of the ~1.5/sec a literal 3+20 would give.
-		FireFrames: []WeaponFrame{{'A', 3}, {'B', 1}},
-		// S_PLASMAFLASH1 (vanilla randomly picks S_PLASMAFLASH2 instead
-		// about half the time; same simplification as the chaingun above)
-		FlashFrames: []WeaponFrame{{'A', 4}},
+		// SmoothPlasmaRifle's Fire1/2/3 phases each play one PLGF frame (A/
+		// B/C respectively, all "Bright A_FireProjectile") then either
+		// re-enter for the next phase (held fire) or fall into the PLGC
+		// idle-wobble tail — that tail is dropped (rule 3 above), and since
+		// this engine always restarts FireFrames at the same point, only
+		// PLGF A is used rather than cycling A/B/C; the visual difference
+		// between those three is minor (all the same "bright fire" pose).
+		// 3 tics/shot matches this project's own already-tuned held-fire
+		// cadence (see the previous vanilla-timed table's note: trimmed
+		// from a literal 3+20 to land near vanilla's real ~3-tic A_ReFire
+		// loop rate) — unchanged by this port.
+		FireFrames: []WeaponFrame{{Frame: 'A', Tics: 3, Prefix: "PLGF"}},
+		// SmoothPlasmaRifle's own Flash is TNT1 (invisible, a pure
+		// A_Light1 brightness bump with no separate flash sprite) — this
+		// project keeps the original vanilla PLSF flash sprite instead of
+		// dropping the muzzle flash light entirely (lights.go's
+		// muzzleFlashLight gates the dynamic flash-light spawn on
+		// hasFlash), since the mod doesn't provide a replacement asset for
+		// it either way.
+		FlashFrames: []WeaponFrame{{Frame: 'A', Tics: 4}},
 		// MT_PLASMA: speed 25*35=875 units/sec. Sprite/explosion/sound
 		// names (PLSS the flying ball, PLSE its splat, DSPLASMA reused for
 		// no distinct impact sound in vanilla) are NOT verified against
 		// any WAD — the shareware IWAD this project was built and tested
 		// against has no plasma rifle assets at all (it's Episode 2/3-only
-		// content), so this has never actually been exercised.
+		// content), so this has never actually been exercised. Untouched
+		// by the HD viewmodel port above.
 		Projectile: &ProjectileDef{
 			Sprite: "PLSSA0", Speed: 875,
 			ExplodePrefix: "PLSE", ExplodeFrames: []byte{'A', 'B', 'C', 'D', 'E'}, ExplodeTics: 4,
@@ -249,15 +389,43 @@ var Weapons = [numWeapons]WeaponDef{
 		},
 	},
 	wpBFG: {
-		Name: "BFG9000", SpritePrefix: "BFGG", FlashPrefix: "BFGF", FireSound: "DSBFG",
+		Name: "BFG9000", SpritePrefix: "BBGF", FlashPrefix: "BBGF", FireSound: "DSBFG",
 		AmmoType: 2, AmmoCost: 40,
-		// S_BFG1..4
-		FireFrames: []WeaponFrame{{'A', 20}, {'B', 10}, {'B', 10}, {'B', 20}},
-		// S_BFGFLASH1..2
-		FlashFrames: []WeaponFrame{{'A', 11}, {'B', 6}},
+		// SmoothBFG9000 Fire: BBGN ABCDE 3 (windup pose, no action yet);
+		// BBGF AABBCCDDDDEEEEE 1 (the charge-up "crackle" loop, 15 tics);
+		// A_GunFlash; BBGF F 5 Bright (A_FireProjectile — the actual
+		// discharge); BBGF EEBBA 1 (A_ReFire point). The trailing
+		// BBGN-wind-down-to-ready tail is dropped (rule 3). Kept the full
+		// ~40-tic charge-then-fire drama on purpose — it's the BFG's most
+		// iconic beat and this engine can afford it (the projectile itself
+		// still launches instantly on trigger-pull, same as every other
+		// projectile weapon here; only the viewmodel animation takes its
+		// time).
+		FireFrames: []WeaponFrame{
+			{Frame: 'A', Tics: 3, Prefix: "BBGN"}, {Frame: 'B', Tics: 3, Prefix: "BBGN"}, {Frame: 'C', Tics: 3, Prefix: "BBGN"},
+			{Frame: 'D', Tics: 3, Prefix: "BBGN"}, {Frame: 'E', Tics: 3, Prefix: "BBGN"},
+			{Frame: 'A', Tics: 1}, {Frame: 'A', Tics: 1},
+			{Frame: 'B', Tics: 1}, {Frame: 'B', Tics: 1},
+			{Frame: 'C', Tics: 1}, {Frame: 'C', Tics: 1},
+			{Frame: 'D', Tics: 1}, {Frame: 'D', Tics: 1}, {Frame: 'D', Tics: 1}, {Frame: 'D', Tics: 1},
+			{Frame: 'E', Tics: 1}, {Frame: 'E', Tics: 1}, {Frame: 'E', Tics: 1}, {Frame: 'E', Tics: 1}, {Frame: 'E', Tics: 1},
+			{Frame: 'F', Tics: 5},
+			{Frame: 'E', Tics: 1}, {Frame: 'E', Tics: 1},
+			{Frame: 'B', Tics: 1}, {Frame: 'B', Tics: 1},
+			{Frame: 'A', Tics: 1},
+		},
+		// The muzzle flash doesn't start until A_GunFlash fires — 30 tics
+		// into the sequence (the windup + charge-up above) — then holds for
+		// the same 5 tics as the BBGF-F discharge frame.
+		FlashFrames: []WeaponFrame{
+			flashDelayFrame(30),
+			{Frame: 'F', Tics: 3},
+			{Frame: 'F', Tics: 2},
+		},
 		// MT_BFG: speed 25*35=875 units/sec. Same caveat as Plasma Rifle
 		// above — BFS1/BFE1 names are unverified, no BFG assets exist in
-		// the shareware IWAD this project was tested against.
+		// the shareware IWAD this project was tested against. Untouched by
+		// the HD viewmodel port above.
 		Projectile: &ProjectileDef{
 			Sprite: "BFS1A0", Speed: 875,
 			ExplodePrefix: "BFE1", ExplodeFrames: []byte{'A', 'B', 'C', 'D'}, ExplodeTics: 8,
@@ -267,37 +435,78 @@ var Weapons = [numWeapons]WeaponDef{
 		},
 	},
 	wpChainsaw: {
-		Name: "Chainsaw", SpritePrefix: "SAWG", FireSound: "DSSAWFUL",
+		Name: "Chainsaw", SpritePrefix: "SAWN", FireSound: "DSSAWFUL",
 		AmmoType: -1, AmmoCost: 0,
-		// S_SAW1..2 — the A/B grind, looped seamlessly while fire is held
-		// (see updateWeapon's auto-refire). S_SAW/S_SAWB — the C/D idle
-		// vibration. Vanilla also plays DSSAWIDL/DSSAWHIT; this uses the one
-		// FireSound slot for the attack noise.
-		FireFrames: []WeaponFrame{{'A', 4}, {'B', 4}},
-		IdleFrames: []WeaponFrame{{'C', 4}, {'D', 4}},
-		IdleSound:  "DSSAWIDL",
-		Melee:      true,
+		// SmoothChainsaw Fire (after dropping the 0-tic A_Saw/A_Refire
+		// action states and the SAWN-CBA wind-down tail, rule 3): SAWN ABC
+		// 1 (windup); SAWF A 1 (loop sound + A_Saw start); SAWF ABAB 1
+		// (the actual cutting jitter). 8 tics total — happens to match the
+		// idle loop's own 8-tic cycle below.
+		FireFrames: []WeaponFrame{
+			{Frame: 'A', Tics: 1},
+			{Frame: 'B', Tics: 1},
+			{Frame: 'C', Tics: 1},
+			{Frame: 'A', Tics: 1, Prefix: "SAWF"},
+			{Frame: 'A', Tics: 1, Prefix: "SAWF"},
+			{Frame: 'B', Tics: 1, Prefix: "SAWF"},
+			{Frame: 'A', Tics: 1, Prefix: "SAWF"},
+			{Frame: 'B', Tics: 1, Prefix: "SAWF"},
+		},
+		// SmoothChainsaw Ready: SAWB BCDC 2, looped — a different sprite
+		// family (SAWB) than Fire's SAWN/SAWF, unlike the vanilla single-
+		// sprite SAWG this replaces.
+		IdleFrames: []WeaponFrame{
+			{Frame: 'B', Tics: 2, Prefix: "SAWB"},
+			{Frame: 'C', Tics: 2, Prefix: "SAWB"},
+			{Frame: 'D', Tics: 2, Prefix: "SAWB"},
+			{Frame: 'C', Tics: 2, Prefix: "SAWB"},
+		},
+		IdleSound: "DSSAWIDL",
+		Melee:     true,
 	},
 	wpSuperShotgun: {
-		Name: "Super Shotgun", SpritePrefix: "SHT2", FlashPrefix: "SHT2", FireSound: "DSDSHTGN",
+		Name: "Super Shotgun", SpritePrefix: "SH2N", FlashPrefix: "SH2P", FireSound: "DSDSHTGN",
 		AmmoType: 1, AmmoCost: 2,
-		// S_DSGUN1..9 exactly — the break-action cycle: A A B C D E F A A
-		// (id's SPR_SHT2 frames 0,0,1,2,3,4,5,0,0), ~54 tics / 1.54s, the
-		// slowest firing weapon. Two shells a shot, 20-pellet spray, wide
-		// (see fireHitscan). SHT2G0/H0 exist in the WAD but id's SSG never
-		// shows them.
+		// SmoothSuperShotgun Fire: SH2N A 3 (A_GunFlash) + A 2
+		// (A_FireBullets) + A 6 (the double-barrel discharge); then the
+		// break-action reload, all SH2R — ABCDEFGH 1, I 1, JKL 1, MNOPQX 2,
+		// Y 2, Z 2; then the snap-shut, all SH2S — ABCD 1, EFGH 2, H 1;
+		// then SH2N A 5 (A_ReFire point). 57 tics, comparable to the
+		// original vanilla-timed table's own 54.
 		FireFrames: []WeaponFrame{
-			{'A', 3}, {'A', 7}, {'B', 7}, {'C', 7}, {'D', 7},
-			{'E', 7}, {'F', 7}, {'A', 5}, {'A', 4},
+			{Frame: 'A', Tics: 3},
+			{Frame: 'A', Tics: 2},
+			{Frame: 'A', Tics: 6},
+			{Frame: 'A', Tics: 1, Prefix: "SH2R"}, {Frame: 'B', Tics: 1, Prefix: "SH2R"},
+			{Frame: 'C', Tics: 1, Prefix: "SH2R"}, {Frame: 'D', Tics: 1, Prefix: "SH2R"},
+			{Frame: 'E', Tics: 1, Prefix: "SH2R"}, {Frame: 'F', Tics: 1, Prefix: "SH2R"},
+			{Frame: 'G', Tics: 1, Prefix: "SH2R"}, {Frame: 'H', Tics: 1, Prefix: "SH2R"},
+			{Frame: 'I', Tics: 1, Prefix: "SH2R"},
+			{Frame: 'J', Tics: 1, Prefix: "SH2R"}, {Frame: 'K', Tics: 1, Prefix: "SH2R"}, {Frame: 'L', Tics: 1, Prefix: "SH2R"},
+			{Frame: 'M', Tics: 2, Prefix: "SH2R"}, {Frame: 'N', Tics: 2, Prefix: "SH2R"}, {Frame: 'O', Tics: 2, Prefix: "SH2R"},
+			{Frame: 'P', Tics: 2, Prefix: "SH2R"}, {Frame: 'Q', Tics: 2, Prefix: "SH2R"}, {Frame: 'X', Tics: 2, Prefix: "SH2R"},
+			{Frame: 'Y', Tics: 2, Prefix: "SH2R"},
+			{Frame: 'Z', Tics: 2, Prefix: "SH2R"},
+			{Frame: 'A', Tics: 1, Prefix: "SH2S"}, {Frame: 'B', Tics: 1, Prefix: "SH2S"},
+			{Frame: 'C', Tics: 1, Prefix: "SH2S"}, {Frame: 'D', Tics: 1, Prefix: "SH2S"},
+			{Frame: 'E', Tics: 2, Prefix: "SH2S"}, {Frame: 'F', Tics: 2, Prefix: "SH2S"},
+			{Frame: 'G', Tics: 2, Prefix: "SH2S"}, {Frame: 'H', Tics: 2, Prefix: "SH2S"},
+			{Frame: 'H', Tics: 1, Prefix: "SH2S"},
+			{Frame: 'A', Tics: 5},
 		},
-		// S_DSFLASH1..2
-		FlashFrames: []WeaponFrame{{'I', 4}, {'J', 3}},
-		// A_OpenShotgun2 / A_LoadShotgun2 / A_CloseShotgun2 — the break
-		// open, shell load, and snap shut, at the C, D and F frames.
+		// SmoothSuperShotgun's own Flash randomly picks a branch through
+		// SH2P A-F; simplified to a fixed 2-frame flash, the same
+		// simplification the original vanilla-timed table already made
+		// (id's own SSG flash is likewise a random pick between two
+		// frames).
+		FlashFrames: []WeaponFrame{{Frame: 'A', Tics: 4}, {Frame: 'B', Tics: 3}},
+		// A_OpenShotgun2 / A_LoadShotgun2 / A_CloseShotgun2 sounds, retimed
+		// to this port's own break-open (SH2R start), shell-load (SH2R Y),
+		// and snap-shut (SH2S H) points.
 		FireSoundSeq: []timedSound{
-			{AtTic: 17, Sound: "DSDBOPN"},
-			{AtTic: 24, Sound: "DSDBLOAD"},
-			{AtTic: 38, Sound: "DSDBCLS"},
+			{AtTic: 19, Sound: "DSDBOPN"},
+			{AtTic: 35, Sound: "DSDBLOAD"},
+			{AtTic: 51, Sound: "DSDBCLS"},
 		},
 	},
 }
@@ -505,6 +714,52 @@ func (g *Game) SelectWeaponSlot(slot int) {
 	}
 }
 
+// weaponCycleOrder lists every weapon index in mouse-wheel cycle order:
+// weaponSlots flattened slot 1 through 7 (each slot's own toggle order),
+// so scrolling steps through weapons in the same layout the 1-7 keys
+// already teach the player, just without needing to know which slot a
+// weapon lives in.
+var weaponCycleOrder = func() []int {
+	var order []int
+	for slot := 1; slot < len(weaponSlots); slot++ {
+		order = append(order, weaponSlots[slot]...)
+	}
+	return order
+}()
+
+// CycleWeapon switches to the next (dir > 0) or previous (dir < 0) owned
+// weapon in weaponCycleOrder, wrapping around — the mouse-wheel weapon
+// switch (combatSystem.Update). A no-op if dir is 0 or the player owns
+// fewer than two weapons.
+func (g *Game) CycleWeapon(dir int) {
+	if dir == 0 {
+		return
+	}
+	owned := make([]int, 0, len(weaponCycleOrder))
+	for _, w := range weaponCycleOrder {
+		if g.Player.Weapons[w] {
+			owned = append(owned, w)
+		}
+	}
+	if len(owned) < 2 {
+		return
+	}
+	cur := g.Weapon.Current
+	if g.Weapon.pending >= 0 {
+		cur = g.Weapon.pending
+	}
+	idx := 0
+	for i, w := range owned {
+		if w == cur {
+			idx = i
+			break
+		}
+	}
+	n := len(owned)
+	next := owned[((idx+dir)%n+n)%n]
+	g.SwitchWeapon(next)
+}
+
 // FireWeapon fires the current weapon if it's ready and there's enough
 // ammo: plays its sound, starts its fire animation, deducts ammo, and
 // resolves the shot. The three projectile weapons (Rocket Launcher, Plasma
@@ -549,7 +804,14 @@ func (g *Game) beginFire() bool {
 	}
 	switch {
 	case proj != nil:
-		g.spawnProjectile(proj)
+		shots := g.spawnProjectile(proj)
+		// RocketFollow: firing the rocket launcher with the right mouse
+		// button held rides the camera along with the shot until it
+		// explodes — see rocketFollowCamera (projectiles.go) and the
+		// g.rocketCam swap in renderFrame.
+		if g.Weapon.Current == wpMissile && len(shots) > 0 && g.Window != nil && g.Window.MouseRightDown() {
+			g.rocketCam = shots[0]
+		}
 	case def.Melee:
 		g.fireMelee()
 	default:
@@ -813,29 +1075,42 @@ func (g *Game) idleSoundInterval(name string) float64 {
 	return d
 }
 
-// currentSprite reports which viewmodel sprite frame letter is showing
-// right now, and which flash frame (if any) is overlaid.
+// currentSprite reports which viewmodel sprite prefix+frame letter is
+// showing right now, and which flash prefix+frame (if any) is overlaid.
+// gunPrefix/flashPrefix are def.SpritePrefix/def.FlashPrefix unless the
+// active WeaponFrame sets its own Prefix (see that field's doc comment —
+// a few weapons' fire sequences switch sprite family mid-animation).
 //
 // Not firing: frame 'A' (id's ready/raise/lower states) unless the weapon
 // defines IdleFrames — the chainsaw, whose C/D idle loops forever to give
 // the running saw its vibration. Firing: FireFrames / FlashFrames indexed
 // by the time since the shot started.
-func (g *Game) currentSprite() (gunFrame byte, flashFrame byte, hasFlash bool) {
+func (g *Game) currentSprite() (gunPrefix string, gunFrame byte, flashPrefix string, flashFrame byte, hasFlash bool) {
 	def := Weapons[g.Weapon.Current]
+	gunPrefix, flashPrefix = def.SpritePrefix, def.FlashPrefix
 
 	if g.Weapon.phase != weaponFiring {
 		if f, ok := frameAtLooped(def.IdleFrames, g.Weapon.idleTics); ok {
-			return f.Frame, 0, false
+			if f.Prefix != "" {
+				gunPrefix = f.Prefix
+			}
+			return gunPrefix, f.Frame, flashPrefix, 0, false
 		}
-		return 'A', 0, false
+		return gunPrefix, 'A', flashPrefix, 0, false
 	}
 
 	gunFrame = 'A'
 	if f, ok := frameAt(def.FireFrames, g.Weapon.fireElapsedTics); ok {
 		gunFrame = f.Frame
+		if f.Prefix != "" {
+			gunPrefix = f.Prefix
+		}
 	}
-	if f, ok := frameAt(def.FlashFrames, g.Weapon.fireElapsedTics); ok {
-		return gunFrame, f.Frame, true
+	if f, ok := frameAt(def.FlashFrames, g.Weapon.fireElapsedTics); ok && f.Frame != 0 {
+		if f.Prefix != "" {
+			flashPrefix = f.Prefix
+		}
+		return gunPrefix, gunFrame, flashPrefix, f.Frame, true
 	}
-	return gunFrame, 0, false
+	return gunPrefix, gunFrame, flashPrefix, 0, false
 }

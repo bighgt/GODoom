@@ -9,18 +9,22 @@ import (
 	"twopointfive/bsp"
 	"twopointfive/config"
 	"twopointfive/raster"
+	"twopointfive/render/worldgeo"
 	"twopointfive/wad"
 )
 
 func TestMouseLookInvertY(t *testing.T) {
 	const sens = 0.0022
+	// mouseLook's maxPitch is just a caller-supplied clamp — worldgeo.MaxPitch
+	// here is an arbitrary real value, not something this test is pinning.
+	const maxPitch = worldgeo.MaxPitch
 	// Mouse pushed forward (mdy < 0): default looks up (pitch increases).
-	_, up := mouseLook(0, 0, 0, -100, sens, false)
+	_, up := mouseLook(0, 0, 0, -100, sens, maxPitch, false)
 	if up <= 0 {
 		t.Errorf("non-inverted: mouse forward gave pitch %.4f, expected > 0 (look up)", up)
 	}
 	// Inverted: same motion looks down.
-	_, down := mouseLook(0, 0, 0, -100, sens, true)
+	_, down := mouseLook(0, 0, 0, -100, sens, maxPitch, true)
 	if down >= 0 {
 		t.Errorf("inverted: mouse forward gave pitch %.4f, expected < 0 (look down)", down)
 	}
@@ -29,16 +33,16 @@ func TestMouseLookInvertY(t *testing.T) {
 	}
 
 	// Yaw is unaffected by invertY, and sensitivity scales it.
-	yawA, _ := mouseLook(0, 0, 50, 0, sens, false)
-	yawB, _ := mouseLook(0, 0, 50, 0, sens, true)
+	yawA, _ := mouseLook(0, 0, 50, 0, sens, maxPitch, false)
+	yawB, _ := mouseLook(0, 0, 50, 0, sens, maxPitch, true)
 	if yawA != yawB || yawA != -50*sens {
 		t.Errorf("yaw: A=%.5f B=%.5f want %.5f", yawA, yawB, -50*sens)
 	}
 
-	// Pitch stays clamped to the shear limit.
-	_, p := mouseLook(0, 0, 0, -100000, sens, false)
-	if p != raster.MaxPitch {
-		t.Errorf("pitch not clamped: %.4f, want %.4f", p, raster.MaxPitch)
+	// Pitch stays clamped to whichever limit is passed in.
+	_, p := mouseLook(0, 0, 0, -100000, sens, maxPitch, false)
+	if p != maxPitch {
+		t.Errorf("pitch not clamped: %.4f, want %.4f", p, maxPitch)
 	}
 }
 
@@ -61,6 +65,20 @@ func TestApplyMouseLookRespectsGameFlag(t *testing.T) {
 	g.applyMouseLook(0, -100)
 	if g.Camera.Pitch >= 0 {
 		t.Errorf("invertMouseY=true: forward mouse -> pitch %.4f, want < 0 (look down)", g.Camera.Pitch)
+	}
+}
+
+// TestApplyMouseLookClampsToWorldgeoMaxPitch: the hardware path's true
+// camera rotation (worldgeo.CameraBasis) only needs to stay short of the
+// ±90 deg singularity, so applyMouseLook clamps pitch to worldgeo.MaxPitch
+// (89 deg).
+func TestApplyMouseLookClampsToWorldgeoMaxPitch(t *testing.T) {
+	huge := -1e9 // drive pitch hard into its clamp regardless of sensitivity
+
+	g := &Game{MouseSensitivity: 0.0022}
+	g.applyMouseLook(0, huge)
+	if g.Camera.Pitch != worldgeo.MaxPitch {
+		t.Errorf("pitch = %.4f, want worldgeo.MaxPitch (%.4f)", g.Camera.Pitch, worldgeo.MaxPitch)
 	}
 }
 

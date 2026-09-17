@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"twopointfive/raster"
-	"twopointfive/render"
 )
 
 func TestMuzzleFlashLightOnlyWhileFiring(t *testing.T) {
@@ -137,7 +136,7 @@ func TestCollectLightsCapAndOrder(t *testing.T) {
 		Weapon: WeaponState{Current: wpPistol, phase: weaponReady, pending: -1},
 	}
 	// More shots than the shader can take, deliberately spawned far-first.
-	for i := render.MaxLights + 20; i >= 1; i-- {
+	for i := activeLightBudget + 20; i >= 1; i-- {
 		g.projectiles = append(g.projectiles, &Projectile{X: float64(i) * 10, def: rocketDef()})
 	}
 	got, dynamicN := g.collectLights()

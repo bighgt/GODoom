@@ -14,10 +14,6 @@ func TestEmbeddedSPIRV(t *testing.T) {
 	blobs := map[string][]byte{
 		"blit.vert":             blitVertSPV,
 		"blit.frag":             blitFragSPV,
-		"light.frag":            litLightFragSPV,
-		"bright.frag":           litBrightFragSPV,
-		"blur.frag":             litBlurFragSPV,
-		"composite.frag":        litCompositeFragSPV,
 		"world.vert":            worldVertSPV,
 		"world.frag":            worldFragSPV,
 		"worldblit.frag":        worldBlitFragSPV,

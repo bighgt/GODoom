@@ -1,7 +1,9 @@
 package editor
 
 import (
+	"fmt"
 	"image"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -113,6 +115,124 @@ func toImage(r *assets.RGBA) *image.RGBA {
 		return nil
 	}
 	return &image.RGBA{Pix: r.Pix, Stride: r.Width * 4, Rect: image.Rect(0, 0, r.Width, r.Height)}
+}
+
+// ---- importing new textures --------------------------------------------
+//
+// Imported files are copied into assets/textures/walls|flats/ under a
+// derived name and registered live — the exact same loose-file, lazy-load
+// convention the hi-res/Quake/Heretic packs already use (see assets/hires.go),
+// so an imported texture also shows up unmodified on the next run and in
+// an actual play session, not just this editor session.
+
+// ImportWallTexture copies srcPath in as a new (or replacement) wall
+// texture and adds it to the wall browser, returning the name it was
+// given.
+func (b *Bank) ImportWallTexture(srcPath string) (string, error) {
+	name := textureNameFromFile(srcPath)
+	dst, err := copyIntoAssetDir(assets.HiresWallsDir, name, srcPath)
+	if err != nil {
+		return name, err
+	}
+	if err := b.Tex.ImportWallTexture(name, dst); err != nil {
+		return name, err
+	}
+	delete(b.thumbs, name)
+	b.Walls = addSorted(b.Walls, name)
+	return name, nil
+}
+
+// ImportFlat is ImportWallTexture's flat counterpart.
+func (b *Bank) ImportFlat(srcPath string) (string, error) {
+	name := textureNameFromFile(srcPath)
+	dst, err := copyIntoAssetDir(assets.HiresFlatsDir, name, srcPath)
+	if err != nil {
+		return name, err
+	}
+	if err := b.Tex.ImportFlat(name, dst); err != nil {
+		return name, err
+	}
+	delete(b.flatThmb, name)
+	b.Flats = addSorted(b.Flats, name)
+	return name, nil
+}
+
+// ImportFolder imports every *.png found recursively under dir, as wall
+// textures or, if flat, flats. Returns how many imported cleanly; one bad
+// file is logged in firstErr but doesn't stop the rest of the folder.
+func (b *Bank) ImportFolder(dir string, flat bool) (n int, firstErr error) {
+	_ = filepath.WalkDir(dir, func(p string, e os.DirEntry, err error) error {
+		if err != nil || e.IsDir() || !strings.EqualFold(filepath.Ext(p), ".png") {
+			return nil
+		}
+		var ierr error
+		if flat {
+			_, ierr = b.ImportFlat(p)
+		} else {
+			_, ierr = b.ImportWallTexture(p)
+		}
+		if ierr != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%s: %w", p, ierr)
+			}
+			return nil
+		}
+		n++
+		return nil
+	})
+	return n, firstErr
+}
+
+// textureNameFromFile derives a lump name from an imported file's base
+// name: uppercased and cut to 8 characters, the on-disk PWAD limit
+// (wad.putName truncates the same way) — so what the browser shows always
+// matches what a saved level can actually store. A name that collides with
+// an existing texture replaces it, the same "last one seen wins" rule the
+// hi-res packs use for a duplicate name.
+func textureNameFromFile(path string) string {
+	base := filepath.Base(path)
+	base = strings.TrimSuffix(base, filepath.Ext(base))
+	name := strings.ToUpper(base)
+	if len(name) > 8 {
+		name = name[:8]
+	}
+	return name
+}
+
+// copyIntoAssetDir copies srcPath into dir (created if needed) as name+".png",
+// returning the destination path.
+func copyIntoAssetDir(dir, name, srcPath string) (string, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	dst := filepath.Join(dir, name+".png")
+	in, err := os.Open(srcPath)
+	if err != nil {
+		return "", err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return "", err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return "", err
+	}
+	return dst, nil
+}
+
+// addSorted inserts name into the sorted, deduped list if it isn't already
+// present.
+func addSorted(list []string, name string) []string {
+	i := sort.SearchStrings(list, name)
+	if i < len(list) && list[i] == name {
+		return list
+	}
+	list = append(list, "")
+	copy(list[i+1:], list[i:])
+	list[i] = name
+	return list
 }
 
 func dedupeSorted(in []string) []string {

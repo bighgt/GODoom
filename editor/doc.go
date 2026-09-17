@@ -249,6 +249,23 @@ func (d *Doc) floorAt(x, y float64) float64 {
 	return 0
 }
 
+// lightAt is floorAt's sibling for a sector's light level, 0..1 — used to
+// shade a thing's preview sprite in the 3D view about as bright as it'll
+// actually look in-game.
+func (d *Doc) lightAt(x, y float64) float64 {
+	const fallback = 176.0 / 255.0 // NewEmptyDoc's own default sector light
+	if d.tree == nil {
+		return fallback
+	}
+	if s := bsp.PointSector(d.tree, &d.render, float32(x), float32(y)); s != nil {
+		return float64(s.LightLevel) / 255
+	}
+	if len(d.Level.Sectors) > 0 {
+		return float64(d.Level.Sectors[0].LightLevel) / 255
+	}
+	return fallback
+}
+
 // ---- editing operations ------------------------------------------------
 
 // AddThing places a THING of doomednum num at (x, y), facing angle
@@ -283,6 +300,10 @@ func (d *Doc) SetLineTexture(idx int, name string) bool {
 		s.LowerTexture = name
 		s.UpperTexture = name
 	}
+	// view3d's hardware renderer bakes textures into a static-geometry cache
+	// keyed off the BSP tree's identity (see rebuildTree); without this, a
+	// texture-only edit never gets a new tree, so the change never shows.
+	d.markDirty()
 	return true
 }
 
@@ -297,6 +318,7 @@ func (d *Doc) SetSectorFlat(idx int, name string, ceil bool) bool {
 	} else {
 		d.Level.Sectors[idx].FloorTexture = name
 	}
+	d.markDirty() // see SetLineTexture's comment on why this is needed
 	return true
 }
 

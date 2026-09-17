@@ -450,15 +450,15 @@ func (g *Game) evTeleport(lineIdx int, mo *Mobj, monsterOnly bool) bool {
 			g.Camera.Angle = dest.Angle
 			g.VelX, g.VelY = 0, 0
 			if sec := bsp.PointSector(g.BSP, g.Level, float32(dest.X), float32(dest.Y)); sec != nil {
-				g.Camera.Z = float64(sec.FloorHeight) + EyeHeight
+				g.Camera.Z = sec.FloorZAt(dest.X, dest.Y) + EyeHeight
 			}
 			g.groundPlayer(g.Camera.Z - EyeHeight)
 		} else {
 			mo.X, mo.Y, mo.Angle = dest.X, dest.Y, dest.Angle
-			mo.Z = float64(ds.FloorHeight)
+			mo.Z = ds.FloorZAt(dest.X, dest.Y)
 			mo.MomX, mo.MomY, mo.MomZ = 0, 0, 0
 		}
-		g.P_SpawnMobj(dest.X, dest.Y, float64(ds.FloorHeight), MT_TFOG)
+		g.P_SpawnMobj(dest.X, dest.Y, ds.FloorZAt(dest.X, dest.Y), MT_TFOG)
 		g.playWorldSound("DSTELEPT")
 		mo.TeleportFreeze = teleportFreezeTics
 		return true

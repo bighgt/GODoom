@@ -77,6 +77,136 @@ func TestBuildProducesGeometry(t *testing.T) {
 	t.Logf("tris=%d textures=%d kinds=%v", len(g.StaticTris)/3, len(g.Textures), kinds)
 }
 
+// TestSlopedFloorMeshVertexZMatchesPlane: emitFlat must fan a tilted
+// sector's floor into a mesh whose vertices each sit at the plane's own
+// FloorZAt(x, y) — not the flat scalar height — and its normal must tilt
+// away from pure +Z once the sector actually has a slope. This is the
+// regression a sloped-floor mesh needs: an untilted sector already has
+// TestBuildProducesGeometry/TestWallAndFlatVertexInvariants covering it.
+func TestSlopedFloorMeshVertexZMatchesPlane(t *testing.T) {
+	lvl, _, tex := loadLevel(t)
+
+	var sec wad.Sector
+	found := false
+	for _, s := range lvl.Sectors {
+		if _, ok := tex.Flat(s.FloorTexture); ok {
+			sec = s
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("no sector in the test level has a resolvable floor texture")
+	}
+	sec.FloorTiltX, sec.FloorTiltY = 0.3, -0.2
+	sec.SlopePivotX, sec.SlopePivotY = 100, 100
+
+	b := &Builder{
+		tex: tex, texID: make(map[*assets.RGBA]uint16),
+		buckets: make(map[uint16]map[int32][]Vert), masked: make(map[uint16]map[int32][]Vert),
+	}
+	poly := []bsp.Point{{X: 0, Y: 0}, {X: 256, Y: 0}, {X: 256, Y: 256}, {X: 0, Y: 256}}
+	b.emitFlat(poly, &sec, false)
+
+	var got []Vert
+	for _, byCell := range b.buckets {
+		for _, verts := range byCell {
+			got = append(got, verts...)
+		}
+	}
+	if len(got) == 0 {
+		t.Fatal("emitFlat produced no vertices")
+	}
+	for _, v := range got {
+		want := float32(sec.FloorZAt(float64(v.X), float64(v.Y)))
+		if math.Abs(float64(v.Z-want)) > 1e-3 {
+			t.Errorf("vert (%.0f,%.0f): Z=%.4f, want FloorZAt=%.4f", v.X, v.Y, v.Z, want)
+		}
+	}
+	if got[0].Nx == 0 && got[0].Ny == 0 {
+		t.Error("sloped floor's normal is still (0,0,±1) — the tilt wasn't picked up")
+	}
+}
+
+// TestEmitExtraFloorsDrawsControlSectorTopAndBottom: a target sector with
+// a room-over-room band (Builder.extraFloors) must fan TWO extra flats
+// over its own footprint — the control sector's ceiling facing up (the
+// platform's walkable top) and its floor facing down (the underside) —
+// each at the control sector's own (possibly tilted) height, not the
+// target's.
+func TestEmitExtraFloorsDrawsControlSectorTopAndBottom(t *testing.T) {
+	lvl, _, tex := loadLevel(t)
+
+	// Any two distinct sectors with resolvable floor+ceiling textures do —
+	// emitExtraFloors evaluates the CONTROL sector's plane over the
+	// TARGET's footprint, not the control's own, so they needn't be
+	// adjacent or even nearby.
+	targetIdx, ctrlIdx := -1, -1
+	for i, s := range lvl.Sectors {
+		if _, ok := tex.Flat(s.FloorTexture); !ok {
+			continue
+		}
+		if _, ok := tex.Flat(s.CeilingTexture); !ok {
+			continue
+		}
+		switch {
+		case targetIdx < 0:
+			targetIdx = i
+		case ctrlIdx < 0:
+			ctrlIdx = i
+		}
+	}
+	if targetIdx < 0 || ctrlIdx < 0 {
+		t.Fatal("need two distinct sectors with resolvable floor+ceiling textures")
+	}
+
+	b := &Builder{
+		lvl: lvl, tex: tex, texID: make(map[*assets.RGBA]uint16),
+		buckets: make(map[uint16]map[int32][]Vert), masked: make(map[uint16]map[int32][]Vert),
+		extraFloors: map[int][]int{targetIdx: {ctrlIdx}},
+	}
+	poly := []bsp.Point{{X: 0, Y: 0}, {X: 256, Y: 0}, {X: 256, Y: 256}, {X: 0, Y: 256}}
+	b.emitExtraFloors(poly, targetIdx)
+
+	var got []Vert
+	for _, byCell := range b.buckets {
+		for _, verts := range byCell {
+			got = append(got, verts...)
+		}
+	}
+	if len(got) == 0 {
+		t.Fatal("emitExtraFloors produced no vertices")
+	}
+
+	ctrl := &lvl.Sectors[ctrlIdx]
+	var sawTop, sawBottom bool
+	for _, v := range got {
+		wantTop := float32(ctrl.CeilZAt(float64(v.X), float64(v.Y)))
+		wantBottom := float32(ctrl.FloorZAt(float64(v.X), float64(v.Y)))
+		switch {
+		case math.Abs(float64(v.Z-wantTop)) < 1e-3:
+			sawTop = true
+			if v.Nz <= 0 {
+				t.Errorf("platform top vert (%.0f,%.0f,%.2f) faces down (Nz=%v), want up", v.X, v.Y, v.Z, v.Nz)
+			}
+		case math.Abs(float64(v.Z-wantBottom)) < 1e-3:
+			sawBottom = true
+			if v.Nz >= 0 {
+				t.Errorf("platform bottom vert (%.0f,%.0f,%.2f) faces up (Nz=%v), want down", v.X, v.Y, v.Z, v.Nz)
+			}
+		default:
+			t.Errorf("vert (%.0f,%.0f,%.2f) matches neither the control sector's ceiling (%v) nor floor (%v)",
+				v.X, v.Y, v.Z, wantTop, wantBottom)
+		}
+	}
+	if !sawTop {
+		t.Error("no platform-top (control ceiling, facing up) vertices emitted")
+	}
+	if !sawBottom {
+		t.Error("no platform-bottom (control floor, facing down) vertices emitted")
+	}
+}
+
 func TestBuildIsDeterministicAndReuses(t *testing.T) {
 	lvl, tree, tex := loadLevel(t)
 	b := New(lvl, tree, tex)

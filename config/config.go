@@ -25,8 +25,8 @@ type Config struct {
 	// "600p", "720p", "900p", "1080p", "1440p", or "native" (the monitor's
 	// own framebuffer), case-insensitive; anything else falls back to the
 	// default. The rendered image is letterboxed to the screen, so a lower
-	// value is the single biggest performance lever the software renderer
-	// has. IGNORED in windowed mode — there the render target is the window
+	// value is one of the biggest performance levers the renderer has.
+	// IGNORED in windowed mode — there the render target is the window
 	// itself (WindowWidth x WindowHeight).
 	Resolution string `json:"resolution"`
 	// RenderScale multiplies the resolved render size on both axes (so 0.5
@@ -147,12 +147,11 @@ type Config struct {
 	// Voxels replaces map-object sprites (monsters, items, ammo, keys, ...)
 	// with voxel models from assets/voxel/Doom{1,2}_Voxel.pk3 when a model
 	// exists for the current frame. Default true; harmless if the pack is
-	// absent (falls back to sprites). A distant thing still draws as a
-	// sprite regardless (see raster.DrawVoxel's size cutoff).
+	// absent (falls back to sprites).
 	Voxels bool `json:"voxels"`
-	// Flashlight enables the F-key head-mounted flashlight (a forward beam
-	// in the enhanced/hardware render tiers, a flat brightness bump in
-	// vanilla). Default true; false disables the toggle entirely.
+	// Flashlight enables the F-key head-mounted flashlight — a forward beam
+	// with a hotspot-to-spill falloff (see engine/flashlight.go). Default
+	// true; false disables the toggle entirely.
 	Flashlight bool `json:"flashlight"`
 	// VoxelScale is map units per voxel for the models above. Cheello's
 	// Voxel Doom is authored at 1.0 (the default); raise/lower to fit a pack
@@ -167,91 +166,36 @@ type Config struct {
 	// with `go run ./tools/importquake` (reads assets/import/
 	// Quake1_Textures.pk3) — it never touches the existing hi-res PNGs.
 	Quake1Textures bool `json:"quake1Textures"`
-	// TextureQuality is the single global texture-filtering setting for every
-	// world surface — walls, flats, sprites and voxels:
-	//   "nearest"    classic hard pixels, no mips (the default; fastest; the
-	//                vanilla look, and byte-for-byte the pre-existing wall/flat
-	//                output)
-	//   "bilinear"   smooth within a texture
-	//   "trilinear"  bilinear + a box-filtered mip chain by on-screen scale
-	//                (kills distance shimmer)
-	//   "aniso2x" / "aniso4x" / "aniso8x" / "aniso16x"
-	//                trilinear plus up to N anisotropic taps, so a surface seen
-	//                at a grazing angle — a long wall, a floor stretching to
-	//                the horizon — stays sharp instead of blurring. N is the
-	//                max sample count.
-	// The filtered modes are pure CPU work in the software rasterizer's
-	// innermost loops: at 1080p "trilinear" is ~5x the per-frame cost of
-	// "nearest" and "aniso8x"/"aniso16x" ~8x, so it is opt-in. Case-
-	// insensitive; anything unrecognised -> the "nearest" default. Voxels
-	// have no texture, so for them anything but "nearest" just means
-	// "antialias the splats". Replaces the old per-surface spriteFilter /
-	// voxelFilter knobs.
-	TextureQuality string `json:"textureQuality"`
 	// MaxFPS caps the frame rate when VSync is off (a plain sleep at the end
 	// of each frame). 0 means uncapped. Ignored when VSync is on. Default 0.
 	MaxFPS int `json:"maxFPS"`
-	// LightingMode selects the lighting pipeline: "enhanced" (the default)
-	// has the CPU emit a G-buffer (albedo + normal + sector light + depth)
-	// and a multi-pass Vulkan pipeline do fully hardware dynamic lighting —
-	// map light emitters (animated-light sectors, torches, lamps), the
-	// muzzle flash and in-flight rockets/plasma/BFG, ground shadows under
-	// every thing, screen-space shadows for the nearest lights, HDR, bloom
-	// and a highlight soft-knee. "vanilla" shades every wall/flat on the CPU
-	// through the exact PrBoom scalelight/zlight port (raster/light.go) and
-	// the GPU only blits the finished frame — the fallback for a GPU that
-	// can't stand up the enhanced pipeline. Anything else -> "enhanced".
-	LightingMode string `json:"lightingMode"`
-	// Renderer selects the rasterization path: "software" (the default) runs
-	// the CPU rasterizer in raster/ and lightingMode picks vanilla vs
-	// enhanced from there; "hardware" submits GPU geometry built from the BSP
-	// walk (render/worldgeo) and the GPU does texturing / depth / the vanilla
-	// scalelight fade + per-surface dynamic point lights. Plain Vulkan 1.0
-	// (one draw call per texture, no bindless); falls back to "software" if
-	// that path can't start. World sprites are billboards; voxel models and
-	// ground shadows are software-only for now. Anything else -> "software".
-	Renderer string `json:"renderer"`
-	// LightScale multiplies every sector's light level before it is shaded,
-	// in both pipelines: 1.0 is the WAD's authored brightness, lower is
-	// darker (0.75, the default, is a deliberately moodier baseline than
-	// vanilla Doom), higher washes the map out. Clamped to [0.1, 2.0].
+	// LightScale multiplies every sector's light level before it is shaded:
+	// 1.0 is the WAD's authored brightness, lower is darker (0.75, the
+	// default, is a deliberately moodier baseline than vanilla Doom), higher
+	// washes the map out. Clamped to [0.1, 2.0].
 	LightScale float64 `json:"lightScale"`
 	// AmbientLight is a brightness-floor GAIN applied after LightScale and
-	// every dynamic light are summed, in the enhanced and hardware
-	// pipelines: a surface (wall, flat, or a monster/thing sprite) never
-	// reads darker than AmbientLight * that sector's OWN authored
-	// brightness, undiminished by camera distance — so a monster standing
-	// across a well-lit room stays legible and detailed instead of fading
-	// toward black by mid-room the way the distance-based fade alone would
-	// leave it, while a monster in a genuinely dark sector gets little to
-	// no lift and needs a real light source (torch, muzzle flash, the
-	// flashlight) to be seen. 0 (off) reproduces the old crush-to-near-
-	// black behaviour in every sector regardless of its brightness; higher
-	// values trade moodiness for visibility. Default 0.2, clamped to
-	// [0, 1]. Ignored by the vanilla pipeline (which has no dynamic lights
-	// and its own, non-configurable colormap floor).
+	// every dynamic light are summed: a surface (wall, flat, or a monster/
+	// thing sprite) never reads darker than AmbientLight * that sector's OWN
+	// authored brightness, undiminished by camera distance — so a monster
+	// standing across a well-lit room stays legible and detailed instead of
+	// fading toward black by mid-room the way the distance-based fade alone
+	// would leave it, while a monster in a genuinely dark sector gets little
+	// to no lift and needs a real light source (torch, muzzle flash, the
+	// flashlight) to be seen. 0 (off) reproduces the old crush-to-near-black
+	// behaviour in every sector regardless of its brightness; higher values
+	// trade moodiness for visibility. Default 0.2, clamped to [0, 1].
 	AmbientLight float64 `json:"ambientLight"`
-	// Exposure is a final multiply on the enhanced pipeline's HDR colour
-	// just before the tonemap — the knob to pull the whole image up or down
-	// after LightScale and the emitters have been summed. 1.0 default,
-	// clamped to [0.1, 4.0]. Ignored by the vanilla pipeline.
+	// Exposure is a final multiply on the HDR colour just before the
+	// tonemap — the knob to pull the whole image up or down after
+	// LightScale and the emitters have been summed. 1.0 default, clamped to
+	// [0.1, 4.0].
 	Exposure float64 `json:"exposure"`
-	// Shadows toggles the enhanced pipeline's screen-space light shadows:
-	// the nearest dynamic lights are occluded by geometry between them and a
-	// surface. Default true. (Vanilla mode has no dynamic lights, so this
-	// does nothing there.)
-	Shadows bool `json:"shadows"`
-	// GroundShadows toggles the cheap contact-shadow blob drawn on the floor
-	// under every thing and the player (both pipelines). It grounds sprites/
-	// voxels but reads as a plain dark ellipse up close, so it's OFF by
-	// default — set true to enable.
-	GroundShadows bool `json:"groundShadows"`
-	// CartoonShading gives the hardware (GPU-geometry) renderer a cel-
-	// shaded look: lighting is quantized into a handful of flat bands
-	// instead of a smooth gradient, and a screen-space pass darkens pixels
-	// where depth jumps sharply (silhouettes, corners, and geometry seen
-	// against the sky) into black outlines. Hardware-renderer only — the
-	// software vanilla/enhanced pipelines are unaffected. Default false.
+	// CartoonShading gives the renderer a cel-shaded look: lighting is
+	// quantized into a handful of flat bands instead of a smooth gradient,
+	// and a screen-space pass darkens pixels where depth jumps sharply
+	// (silhouettes, corners, and geometry seen against the sky) into black
+	// outlines. Default false.
 	CartoonShading bool `json:"cartoonShading"`
 	// SwitchWeapons swaps the two games' arsenals: a Doom WAD is then played
 	// with Heretic's weapons (Elven Wand, Ethereal Crossbow, Dragon Claw,
@@ -422,15 +366,10 @@ func Default() Config {
 		Flashlight:           true,
 		VoxelScale:           1.0,
 		Quake1Textures:       false,
-		TextureQuality:       TextureNearest,
 		MaxFPS:               0,
-		LightingMode:         LightingEnhanced,
-		Renderer:             RendererSoftware,
 		LightScale:           0.75,
 		AmbientLight:         0.2,
 		Exposure:             1.0,
-		Shadows:              true,
-		GroundShadows:        false,
 		CartoonShading:       false,
 		SwitchWeapons:        false,
 		FogColor:             "",
@@ -451,37 +390,6 @@ func DefaultJSON() ([]byte, error) {
 		return nil, err
 	}
 	return append(b, '\n'), nil
-}
-
-// Lighting mode keywords (Config.LightingMode).
-const (
-	LightingVanilla  = "vanilla"
-	LightingEnhanced = "enhanced"
-)
-
-// Renderer keywords (Config.Renderer).
-const (
-	RendererSoftware = "software"
-	RendererHardware = "hardware"
-)
-
-// Texture-quality keywords (Config.TextureQuality). The four "aniso" values
-// are trilinear plus that many anisotropic taps.
-const (
-	TextureNearest   = "nearest"
-	TextureBilinear  = "bilinear"
-	TextureTrilinear = "trilinear"
-	TextureAniso2x   = "aniso2x"
-	TextureAniso4x   = "aniso4x"
-	TextureAniso8x   = "aniso8x"
-	TextureAniso16x  = "aniso16x"
-)
-
-// textureQualityKeywords is every accepted TextureQuality value, for
-// repaired()'s validation.
-var textureQualityKeywords = map[string]bool{
-	TextureNearest: true, TextureBilinear: true, TextureTrilinear: true,
-	TextureAniso2x: true, TextureAniso4x: true, TextureAniso8x: true, TextureAniso16x: true,
 }
 
 // Crosshair keywords (Config.Crosshair).
@@ -532,7 +440,7 @@ func Load() Config {
 				len(missing), strings.Join(missing, " "))
 		}
 		if dep := deprecatedKeys(raw); len(dep) > 0 {
-			log.Printf("config: ignoring deprecated key(s) %s — use \"textureQuality\" (nearest/bilinear/trilinear/aniso2x..16x) instead",
+			log.Printf("config: ignoring retired key(s) %s — run `go run ./tools/genconfig -f` for a config.json with only the current options",
 				strings.Join(dep, " "))
 		}
 		// Back-compat: an old config that set "showStatusBar": false and has
@@ -547,14 +455,21 @@ func Load() Config {
 
 // deprecatedKeys reports which retired config keys appear in the file, so a
 // user editing an old config.json is told their setting is being ignored
-// rather than silently having no effect.
+// rather than silently having no effect. spriteFilter/voxelFilter were
+// superseded by textureQuality; renderer/lightingMode/textureQuality/
+// shadows/groundShadows were the software (CPU) rasterizer's own settings,
+// retired along with it — hardware (GPU-geometry) rendering is the only
+// renderer now, so there is nothing left for any of them to configure.
 func deprecatedKeys(raw []byte) []string {
 	var present map[string]json.RawMessage
 	if json.Unmarshal(raw, &present) != nil {
 		return nil
 	}
 	var dep []string
-	for _, k := range []string{"spriteFilter", "voxelFilter"} {
+	for _, k := range []string{
+		"spriteFilter", "voxelFilter",
+		"renderer", "lightingMode", "textureQuality", "shadows", "groundShadows",
+	} {
 		if _, ok := present[k]; ok {
 			dep = append(dep, k)
 		}
@@ -740,36 +655,6 @@ func (c Config) repaired() Config {
 		log.Printf("config: voxelScale %.2f out of [%.2f, %.2f], using %.2f",
 			c.VoxelScale, MinVoxelScale, MaxVoxelScale, d.VoxelScale)
 		c.VoxelScale = d.VoxelScale
-	}
-
-	switch tq := strings.ToLower(strings.TrimSpace(c.TextureQuality)); {
-	case tq == "":
-		c.TextureQuality = d.TextureQuality
-	case textureQualityKeywords[tq]:
-		c.TextureQuality = tq
-	default:
-		log.Printf("config: unknown textureQuality %q, using %q", c.TextureQuality, d.TextureQuality)
-		c.TextureQuality = d.TextureQuality
-	}
-
-	switch mode := strings.ToLower(strings.TrimSpace(c.LightingMode)); mode {
-	case LightingVanilla, LightingEnhanced:
-		c.LightingMode = mode
-	case "":
-		c.LightingMode = d.LightingMode
-	default:
-		log.Printf("config: unknown lightingMode %q, using %q", c.LightingMode, d.LightingMode)
-		c.LightingMode = d.LightingMode
-	}
-
-	switch mode := strings.ToLower(strings.TrimSpace(c.Renderer)); mode {
-	case RendererSoftware, RendererHardware:
-		c.Renderer = mode
-	case "":
-		c.Renderer = d.Renderer
-	default:
-		log.Printf("config: unknown renderer %q, using %q", c.Renderer, d.Renderer)
-		c.Renderer = d.Renderer
 	}
 
 	if c.LightScale == 0 {

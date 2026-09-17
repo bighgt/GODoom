@@ -1,12 +1,10 @@
 package engine
 
 import (
-	"log"
 	"math"
 	"slices"
 
 	"twopointfive/bsp"
-	"twopointfive/raster"
 	"twopointfive/render/worldgeo"
 	"twopointfive/wad"
 )
@@ -103,7 +101,7 @@ const ticDuration = 1.0 / ticsPerSecond
 // BSP, falling back to a wide-open range if point location fails.
 func (g *Game) sectorFloorCeil(x, y float64) (floor, ceil float64) {
 	if sec := bsp.PointSector(g.BSP, g.Level, float32(x), float32(y)); sec != nil {
-		return float64(sec.FloorHeight), float64(sec.CeilingHeight)
+		return sec.FloorZAt(x, y), sec.CeilZAt(x, y)
 	}
 	return -32768, 32768
 }
@@ -496,99 +494,8 @@ func (g *Game) runTic() {
 	g.mobjs = alive
 }
 
-// drawMobjs renders every live map object farthest first (so nearer things
-// overdraw) as either a voxel model or a flat billboard. Called each frame
-// after the world has written the depth buffer — see raster.DrawVoxel /
-// raster.DrawThing.
-func (g *Game) drawMobjs() {
-	if len(g.mobjs) == 0 {
-		return
-	}
-	order := append(g.mobjScratch[:0], g.mobjs...)
-	cx, cy := g.Camera.X, g.Camera.Y
-	d2 := func(m *Mobj) float64 { return (m.X-cx)*(m.X-cx) + (m.Y-cy)*(m.Y-cy) }
-	slices.SortFunc(order, func(a, b *Mobj) int {
-		// Farthest first (nearer things overdraw).
-		switch da, db := d2(a), d2(b); {
-		case da > db:
-			return -1
-		case da < db:
-			return 1
-		default:
-			return 0
-		}
-	})
-	g.mobjScratch = order
-
-	// Forward axis, for a cheap "clearly behind the camera" reject: those
-	// things would still cost a projection, an atan2 rotation pick and a BSP
-	// sector-light lookup in the draw pass before the rasterizer dropped them.
-	fdx, fdy := math.Cos(g.Camera.Angle), math.Sin(g.Camera.Angle)
-
-	frac := g.renderLerp()
-	things := g.thingScratch[:0]
-	haveModel := 0
-	for _, mo := range order {
-		if mo.State == S_NULL {
-			continue // inert marker (teleport dest) — nothing to draw
-		}
-		if (mo.X-cx)*fdx+(mo.Y-cy)*fdy < -160 {
-			continue // behind the view plane (160u margin covers the largest radius)
-		}
-		name := mobjSpriteName(mo)
-		ix, iy, iz, iang := mo.renderState(frac)
-		lit := g.spriteSectorLight(ix, iy)
-		if mo.Flags&MF_SHADOW != 0 {
-			lit /= 3 // Heretic ghosts / spectres — no fuzz, but draw them dim & shadowy
-		}
-		t := raster.SceneThing{
-			X: ix, Y: iy, Z: iz, Angle: iang,
-			Light: lit, FullBright: mo.Fullbright,
-			Prefix: name, Frame: mo.Frame,
-		}
-		if g.Voxels != nil {
-			if m, angOff, _, ok := g.Voxels.Model(name, mo.Frame); ok {
-				haveModel++
-				t.Model, t.ModelAngleOff = m, angOff
-			}
-		}
-		things = append(things, t)
-		if g.heretic && t.Model != nil {
-			if f, ok := g.hereticFlameFor(name, t.Model, ix, iy, iz, g.VoxelScale, g.renderClock); ok {
-				// SceneThing.ModelScale is a multiplier ON TOP of the
-				// renderer's voxelScale; f.Scale is absolute, so divide it
-				// back out.
-				ms := 1.0
-				if g.VoxelScale > 0 {
-					ms = float64(f.Scale) / g.VoxelScale
-				}
-				things = append(things, raster.SceneThing{
-					X: float64(f.X), Y: float64(f.Y), Z: float64(f.Z),
-					Angle:      float64(f.Yaw) * 180 / math.Pi,
-					Light:      int16(f.Light * 255),
-					FullBright: f.FullBright,
-					Model:      f.Model, ModelScale: ms,
-				})
-			}
-		}
-	}
-	g.thingScratch = things
-
-	// One parallel pass over the strip workers (the wall render is already
-	// strip-parallel; a screenful of big sprites/voxels was the next cost).
-	asVoxel, asSprite := g.Raster.DrawThings(g.Camera, things)
-
-	// One line, the first frame anything is on screen, so it's obvious from
-	// the log whether voxels are actually being drawn.
-	if g.Voxels != nil && !g.loggedVoxelStatus && asVoxel+asSprite > 0 {
-		g.loggedVoxelStatus = true
-		log.Printf("engine: map objects this frame — %d voxel, %d sprite (%d had a model, %d too small/declined)",
-			asVoxel, asSprite, haveModel, haveModel-asVoxel)
-	}
-}
-
 // voxelKVXFrontBias backs a KVX model's built-in "front" a quarter turn to
-// line up with a Doom thing's facing — raster/voxel.go's voxelYawBias.
+// line up with a Doom thing's facing.
 const voxelKVXFrontBias = -math.Pi / 2
 
 // worldGeomChanged reports whether any sector's floor or ceiling height has
@@ -700,13 +607,11 @@ func (g *Game) collectWorldObjects() ([]worldgeo.Sprite, []worldgeo.VoxelInstanc
 	return sprites, voxels
 }
 
-// collectGroundShadows lists this frame's contact-shadow casters for the
-// hardware path — grounded things (same filter as drawGroundShadows) as
-// {x, y, floorZ, radius}, nearest-first and capped at hwGroundShadowCap so a
+// collectGroundShadows lists this frame's contact-shadow casters as {x, y,
+// floorZ, radius}, nearest-first and capped at hwGroundShadowCap so a
 // slaughtermap can't overflow the World UBO array. world.frag stamps a soft
-// blob on the floor under each. Always on for the hardware path (cheap: a
-// small UBO array + a short per-floor-pixel loop); the groundShadows config
-// gates only the software rasterizer's own blob pass.
+// blob on the floor under each — always on (cheap: a small UBO array + a
+// short per-floor-pixel loop).
 func (g *Game) collectGroundShadows() [][4]float32 {
 	cx, cy := g.Camera.X, g.Camera.Y
 	out := g.hwShadows[:0]
@@ -747,40 +652,6 @@ func (g *Game) collectGroundShadows() [][4]float32 {
 // hwGroundShadowCap must equal SHADOW_MAX in world.frag and shadowCasterMax
 // in render/vulkan/world.go.
 const hwGroundShadowCap = 24
-
-// drawGroundShadows stamps a soft contact shadow on the floor under every
-// grounded thing and under the player, so nothing reads as hovering. Call
-// after the world pass (r.depth is filled) and before the sprite/voxel
-// pass, so each thing draws over its own shadow. A no-op when config
-// groundShadows is off (raster.SetGroundShadows was told the same) — it is
-// off by default.
-func (g *Game) drawGroundShadows() {
-	if !g.groundShadows {
-		return
-	}
-	for _, mo := range g.mobjs {
-		if mo.State == S_NULL || mo.Flags&(MF_MISSILE|MF_SPAWNCEILING|MF_NOGRAVITY) != 0 {
-			continue
-		}
-		if mo.Radius < 6 || mo.Z > mo.FloorZ+16 {
-			continue // too small to matter, or airborne / hung — no ground contact
-		}
-		radius := mo.Radius * 1.6
-		if radius < 14 {
-			radius = 14
-		} else if radius > 60 {
-			radius = 60
-		}
-		strength := 0.5
-		if mo.Flags&MF_CORPSE != 0 {
-			strength = 0.4
-		}
-		g.Raster.DrawGroundShadow(g.Camera, mo.X, mo.Y, mo.FloorZ, radius, strength)
-	}
-	// The player's own shadow — visible when looking down, and it grounds
-	// the view the same way.
-	g.Raster.DrawGroundShadow(g.Camera, g.Camera.X, g.Camera.Y, g.PlayerZ, 24, 0.5)
-}
 
 // spriteSectorLight is the light level of the sector a world point stands
 // in — what raster shades a billboard by, mirroring id's R_ProjectSprite

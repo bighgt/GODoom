@@ -1,12 +1,12 @@
-// Package vulkan is the Vulkan implementation of render.Renderer. It owns
-// the instance, device, swapchain, and a small "blit" pipeline: every
-// frame, it uploads the RGBA image package raster rendered on the CPU into
-// a GPU texture and draws a single fullscreen triangle sampling it with
-// nearest filtering. That's the entire GPU-rendering stage — see
-// game_design.txt section 7 for why this project puts the Doom-faithful
-// BSP/wall/flat rendering on the CPU (matching the original engine's own
-// architecture) and reserves Vulkan for what a modern GPU does best:
-// getting the finished frame on screen, upscaled, every vsync.
+// Package vulkan is the Vulkan implementation of render.Renderer. The game
+// (cmd/engine, cmd/isoengine) always uses the GPU-geometry path (NewWorld /
+// DrawWorld — see world.go): the CPU walks the BSP into a triangle list and
+// hands it here, and the GPU does the actual rasterizing, texturing,
+// depth-testing and shading. New/DrawFrame is a second, simpler backend —
+// upload a whole CPU-drawn RGBA8 frame into a GPU texture and blit it with
+// a single fullscreen triangle — used directly by the pre-game launcher and
+// the level editor to present their own (2D, imkit-drawn) GUIs, unrelated
+// to how the game itself renders a level.
 package vulkan
 
 import (
@@ -36,28 +36,19 @@ type Renderer struct {
 	debug bool
 	vsync bool // prefer FIFO (tear-free) over mailbox when choosing a present mode
 
-	// lit selects the pipeline built by New: false = the vanilla blit (the
-	// CPU already shaded the frame, we just upscale/present it); true = the
-	// enhanced deferred-lighting path in lit.go (G-buffer -> GPU lighting ->
-	// bloom -> tonemap). The two are mutually exclusive — DrawFrame errors
-	// in lit mode and DrawFrameLit errors otherwise — since the engine
-	// knows at startup which one config asked for.
-	lit    bool
-	litRes *litResources
-
 	// hw selects the hardware (GPU-geometry) path — the triangle list
 	// render/worldgeo builds from the BSP walk, rasterised on the GPU (see
 	// world.go). Built by NewWorld instead of New; mutually exclusive with
-	// lit / vanilla. DrawWorld errors unless this is set, and DrawFrame /
-	// DrawFrameLit error when it is.
+	// vanilla. DrawWorld errors unless this is set, and DrawFrame errors
+	// when it is.
 	hw bool
 	wr *worldResources
 	// iso selects the isometric-viewer path (see isosetup.go/isoworld.go) —
 	// also render/worldgeo geometry, but an orthographic top-down camera and
 	// a much simpler pipeline (no bloom/ambient/voxel passes). Built by
-	// NewIso instead of New/NewWorld; mutually exclusive with hw / lit /
-	// vanilla. DrawIso errors unless this is set, and DrawFrame / DrawFrameLit
-	// / DrawWorld error when it is.
+	// NewIso instead of New/NewWorld; mutually exclusive with hw / vanilla.
+	// DrawIso errors unless this is set, and DrawFrame / DrawWorld error
+	// when it is.
 	iso bool
 	ir  *isoResources
 	// maxAnisotropy is the device's advertised MaxSamplerAnisotropy when the
@@ -143,12 +134,16 @@ type Renderer struct {
 // New stands up the full Vulkan pipeline targeting win: instance, surface,
 // physical/logical device, swapchain, render pass, framebuffers, command
 // pool/buffers, sync objects, the frame-upload texture, and the blit
-// pipeline that presents it. srcW/srcH is the size of the RGBA frames
-// DrawFrame will be given (the CPU render resolution). vsync prefers the
-// tear-free FIFO present mode over mailbox. debug enables
-// VK_LAYER_KHRONOS_validation when it's present on the system.
-func New(win *window.Window, srcW, srcH int, vsync, debug, lit bool) (*Renderer, error) {
-	r := &Renderer{win: win, vsync: vsync, debug: debug, lit: lit}
+// pipeline that presents it — a CPU-drawn RGBA8 frame in, upscaled and
+// presented every DrawFrame call. This is the generic "present a 2D pixel
+// buffer" backend used directly (not through the render.Renderer interface)
+// by the pre-game launcher and the level editor's own GUI, both of which
+// draw their whole UI on the CPU via package imkit; the game itself instead
+// uses NewWorld's GPU-geometry path. vsync prefers the tear-free FIFO
+// present mode over mailbox. debug enables VK_LAYER_KHRONOS_validation when
+// it's present on the system.
+func New(win *window.Window, srcW, srcH int, vsync, debug bool) (*Renderer, error) {
+	r := &Renderer{win: win, vsync: vsync, debug: debug}
 
 	steps := []func() error{
 		r.createInstance,
@@ -162,19 +157,9 @@ func New(win *window.Window, srcW, srcH int, vsync, debug, lit bool) (*Renderer,
 		r.createCommandPool,
 		r.createCommandBuffers,
 		r.createSyncObjects,
-	}
-	if lit {
-		// The enhanced path: a G-buffer upload set, offscreen HDR + bloom
-		// targets, and the lighting/bright/blur/composite pipelines. The
-		// composite pass reuses r.renderPass / r.framebuffers (it also
-		// targets the swapchain), so those steps above still run.
-		steps = append(steps, func() error { return r.createLitResources(srcW, srcH) })
-	} else {
-		steps = append(steps,
-			func() error { return r.createTextureResources(srcW, srcH) },
-			r.createDescriptors,
-			r.createPipeline,
-		)
+		func() error { return r.createTextureResources(srcW, srcH) },
+		r.createDescriptors,
+		r.createPipeline,
 	}
 	for _, step := range steps {
 		if err := step(); err != nil {
@@ -202,7 +187,6 @@ func (r *Renderer) Destroy() {
 
 	r.destroyWorldResources()
 	r.destroyIsoResources()
-	r.destroyLitResources()
 	r.destroyPipeline()
 	r.destroyDescriptors()
 	r.destroyTextureResources()

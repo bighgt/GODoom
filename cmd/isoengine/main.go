@@ -215,16 +215,15 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 	game := engine.NewGame(win, renderer, ras, w, level, tree, cam, cfg)
 	game.AudioDevice = dev
 	game.AltWAD = altWAD // switchWeapons fire-sound fallback (nil otherwise)
-	game.HardwareMode = true
 	game.WorldBuilder = worldgeo.New(level, tree, textures)
 	game.WorldBuilder.SkipCeilings = true
 	game.WorldBuilder.Invalidate()
 	game.ReplaceMovementSystem(engine.IsoMovementSystem{})
 	game.ReplaceUseSystem(engine.IsoUseSystem{})
 	game.OnLevelChange = func(next string) {
-		// loadMap rebuilds WorldBuilder from scratch for the new level
-		// (HardwareMode's own path — see engine/level.go), which resets
-		// SkipCeilings to false; reapply it and rebuild once more.
+		// loadMap rebuilds WorldBuilder from scratch for the new level (see
+		// engine/level.go), which resets SkipCeilings to false; reapply it
+		// and rebuild once more.
 		game.WorldBuilder.SkipCeilings = true
 		game.WorldBuilder.Invalidate()
 		audio.PlayLevelMusic(w, music, game.MapMusicLump(next), next, "isoengine")

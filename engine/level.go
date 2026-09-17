@@ -111,9 +111,11 @@ func (g *Game) loadMap(next string) {
 	}
 
 	g.Level, g.BSP = lvl, tree
-	if g.HardwareMode {
-		// Rebuild the GPU-geometry builder for the new level's BSP; the Vulkan
-		// backend uploads the new level's textures lazily on the first frame.
+	g.applySlopes() // SLOPES sector planes for the new level — before anything (including the player spawn Z below) reads a height
+	// Rebuild the GPU-geometry builder for the new level's BSP; the Vulkan
+	// backend uploads the new level's textures lazily on the first frame.
+	// g.Raster is nil in some simulation-only tests, which never render.
+	if g.Raster != nil {
 		g.WorldBuilder = worldgeo.New(lvl, tree, g.Raster.Textures())
 	}
 	g.blockGrid = buildCollisionGrid(lvl)
@@ -149,7 +151,7 @@ func (g *Game) loadMap(next string) {
 	g.Camera.X, g.Camera.Y, g.Camera.Angle, g.Camera.Pitch = sx, sy, sang, 0
 	g.Camera.Z = EyeHeight
 	if sec := bsp.PointSector(tree, lvl, float32(sx), float32(sy)); sec != nil {
-		g.Camera.Z = float64(sec.FloorHeight) + EyeHeight
+		g.Camera.Z = sec.FloorZAt(sx, sy) + EyeHeight
 	}
 	g.VelX, g.VelY = 0, 0
 	g.groundPlayer(g.Camera.Z - EyeHeight)
@@ -163,9 +165,6 @@ func (g *Game) loadMap(next string) {
 	g.spawnSpecials()
 	g.spawnMapThings()
 	g.buildStaticLights()
-	if g.Raster != nil {
-		g.Raster.WarmTextureCache(lvl) // prebuild filtered-texture mip chains for the new level
-	}
 
 	if dn := g.levelDisplayName(); dn != next {
 		log.Printf("engine: entered %s — %q", next, dn)

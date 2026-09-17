@@ -26,7 +26,7 @@ func StartCamera(level *wad.Level, tree bsp.Node) raster.Camera {
 
 	z := EyeHeight
 	if sec := bsp.PointSector(tree, level, float32(x), float32(y)); sec != nil {
-		z = float64(sec.FloorHeight) + EyeHeight
+		z = sec.FloorZAt(x, y) + EyeHeight
 	}
 
 	return raster.Camera{X: x, Y: y, Z: z, Angle: angleDeg * math.Pi / 180, FOVDeg: 90}

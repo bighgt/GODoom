@@ -2,7 +2,6 @@ package editor
 
 import (
 	"fmt"
-	"image"
 	"log"
 	"os"
 	"path/filepath"
@@ -12,6 +11,7 @@ import (
 
 	"twopointfive/imkit"
 	"twopointfive/render/vulkan"
+	"twopointfive/render/worldgeo"
 	"twopointfive/wad"
 	"twopointfive/window"
 )
@@ -53,40 +53,24 @@ type App struct {
 	pending func()
 }
 
+// emptyWorldGeom is fed to DrawWorld while no WAD is loaded (a.doc == nil).
+// DrawWorld also presents the frame — it's the sole call that blits a.cv
+// (the whole 2D UI) to the screen (see the loop below) — so it must run
+// every frame even with nothing to render in 3D; an empty Geometry draws
+// zero triangles and skips texture/static-buffer sync.
+var emptyWorldGeom = &worldgeo.Geometry{}
+
 // Run opens the editor. wadArg is a WAD path (empty = auto-discover the
-// first WAD with maps under wad/ or assets/); startNew begins on a fresh
-// one-room level instead of that WAD's first map; fullscreen opens
-// borderless-fullscreen on the primary monitor instead of the default
-// windowed size (F11 toggles it either way once running).
+// first WAD with maps under wad/ or assets/). If none is found (or wadArg
+// names one that fails to load), the editor still opens with no map loaded
+// — use File > Open WAD... (Ctrl+O) to pick one via the native file dialog.
+// startNew begins on a fresh one-room level instead of the WAD's first map
+// (only for this initial load); fullscreen opens borderless-fullscreen on
+// the primary monitor instead of the default windowed size (F11 toggles it
+// either way once running).
 func Run(wadArg string, startNew, fullscreen bool) error {
-	wadPath, err := resolveWAD(wadArg)
-	if err != nil {
-		return err
-	}
-	w, err := wad.Load(wadPath)
-	if err != nil {
-		return fmt.Errorf("load %s: %w", wadPath, err)
-	}
-	maps := w.ListMaps()
-	if len(maps) == 0 {
-		return fmt.Errorf("%s has no maps", wadPath)
-	}
-	mapName := preferredMap(maps)
-
-	bank, err := LoadBank(w, wadPath)
-	if err != nil {
-		return fmt.Errorf("assets: %w", err)
-	}
-	var doc *Doc
-	if startNew {
-		doc = NewEmptyDoc(bank, "")
-	} else if doc, err = NewDoc(w, wadPath, mapName); err != nil {
-		return fmt.Errorf("load map %s: %w", mapName, err)
-	}
-
 	a := &App{
 		windowedW: defaultWinW, windowedH: defaultWinH,
-		bank: bank, doc: doc,
 		last: time.Now(),
 	}
 	if err := a.openWindow(fullscreen); err != nil {
@@ -99,13 +83,18 @@ func Run(wadArg string, startNew, fullscreen bool) error {
 
 	a.ui = imkit.New(a.cv)
 	a.split.Pos = a.cv.W / 2 // 2D pane / (3D + panel) split
-	a.v2.init(doc)
 	a.v2.onPick = func(x, y, z float64) { a.v3.FocusOn(x, y, z) }
-	a.v3.init(bank)
+	a.v3.init(nil)
 	a.panel.init()
 	imkit.LabelWidth = 92
-	a.status = fmt.Sprintf("%s  —  %s", filepath.Base(wadPath), mapName)
-	log.Printf("editor: %s  map %s  (%d walls, %d flats)", filepath.Base(wadPath), mapName, len(bank.Walls), len(bank.Flats))
+
+	if wadPath, err := resolveWAD(wadArg); err != nil {
+		a.status = "no WAD found — File > Open WAD…  (Ctrl+O)"
+		log.Printf("editor: %v", err)
+	} else if err := a.loadWAD(wadPath, startNew); err != nil {
+		a.status = "load " + wadPath + ": " + err.Error()
+		log.Printf("editor: %v", err)
+	}
 
 	for !a.win.ShouldClose() && !a.quit {
 		now := time.Now()
@@ -118,7 +107,19 @@ func Run(wadArg string, startNew, fullscreen bool) error {
 		a.frame(dt)
 		a.ui.End()
 
-		if err := a.blit.DrawFrame(a.cv.Img.Pix); err != nil {
+		// The 3D preview pane cut a transparent hole in a.cv over its own
+		// rect (view3d.draw); DrawWorld paints the GPU-rendered world
+		// underneath the WHOLE canvas, invisible everywhere else stayed
+		// opaque — see view3d's doc comment.
+		geom, camv := a.v3.geom, a.v3.wc
+		if a.doc == nil {
+			geom = emptyWorldGeom
+			camv = worldgeo.Camera{
+				X: a.v3.cam.X, Y: a.v3.cam.Y, Z: a.v3.cam.Z,
+				Angle: a.v3.cam.Angle, Pitch: a.v3.cam.Pitch, FOVDeg: a.v3.cam.FOVDeg,
+			}
+		}
+		if err := a.blit.DrawWorld(geom, camv, a.cv.W, a.cv.H, a.cv.Img.Pix, nil); err != nil {
 			return err
 		}
 		if a.pending != nil {
@@ -126,21 +127,73 @@ func Run(wadArg string, startNew, fullscreen bool) error {
 			a.pending = nil
 			f()
 		}
-		a.doc.RebuildIfDirty() // pick up geometry edits made this frame
+		if a.doc != nil {
+			a.doc.RebuildIfDirty() // pick up geometry edits made this frame
+		}
 	}
 	return nil
 }
 
-// openWindow (re)creates the window and its blit renderer at fullscreen or
-// windowed size, tearing down the previous ones first (both nil on the
-// very first call, from Run). The CPU canvas is resized in place — same
-// *Canvas, so a.ui and every widget's cross-frame state survive the
-// switch — and the split position rescales to the new width so the 2D/3D
-// balance the user set stays proportional across the toggle. The 3D pane's
-// raster.Renderer is dropped so it reallocates at its new pixel size on the
-// next frame (view3d.ensure already does this for any size change; forcing
-// it here also survives the (rare) case a resize lands on the same pane
-// dimensions coincidentally).
+// loadWAD opens wadPath fresh: loads it, rebuilds the merged texture bank
+// (every WAD under wad/Game WADs, wad/, assets/, plus this one), and opens
+// its preferred map — or, if startNew, a new one-room level using its
+// textures. Used both for Run's initial load and the "Open WAD..." menu
+// action, so a WAD can be loaded (or swapped) at any time, not just at
+// startup.
+func (a *App) loadWAD(wadPath string, startNew bool) error {
+	w, err := wad.Load(wadPath)
+	if err != nil {
+		return fmt.Errorf("load %s: %w", wadPath, err)
+	}
+	maps := w.ListMaps()
+	if len(maps) == 0 {
+		return fmt.Errorf("%s has no maps", wadPath)
+	}
+	bank, err := LoadBank(w, wadPath)
+	if err != nil {
+		return fmt.Errorf("assets: %w", err)
+	}
+	var doc *Doc
+	if startNew {
+		doc = NewEmptyDoc(bank, "")
+	} else {
+		mapName := preferredMap(maps)
+		if doc, err = NewDoc(w, wadPath, mapName); err != nil {
+			return fmt.Errorf("load map %s: %w", mapName, err)
+		}
+	}
+
+	a.bank = bank
+	a.v3.bank = bank
+	a.setDoc(doc)
+	a.status = fmt.Sprintf("%s  —  %s", filepath.Base(wadPath), doc.MapName)
+	log.Printf("editor: %s  map %s  (%d walls, %d flats)", filepath.Base(wadPath), doc.MapName, len(bank.Walls), len(bank.Flats))
+	return nil
+}
+
+// openWADDialog pops the native "open file" dialog (blocking) and loads
+// whatever WAD the user picks. Run from a.pending — after the frame has
+// already presented, matching how the pre-game launcher times the same
+// blocking dialog (see launcher/run.go).
+func (a *App) openWADDialog() {
+	path, err := window.PickWADFile()
+	if err != nil {
+		if err != window.ErrPickCancelled {
+			a.status = "open WAD: " + err.Error()
+		}
+		return
+	}
+	if err := a.loadWAD(path, false); err != nil {
+		a.status = "open " + path + ": " + err.Error()
+	}
+}
+
+// openWindow (re)creates the window and its GPU-geometry renderer at
+// fullscreen or windowed size, tearing down the previous ones first (both
+// nil on the very first call, from Run). The CPU canvas is resized in
+// place — same *Canvas, so a.ui and every widget's cross-frame state
+// survive the switch — and the split position rescales to the new width so
+// the 2D/3D balance the user set stays proportional across the toggle.
 func (a *App) openWindow(fullscreen bool) error {
 	if a.blit != nil {
 		a.blit.Destroy()
@@ -162,7 +215,7 @@ func (a *App) openWindow(fullscreen bool) error {
 	if fw == 0 || fh == 0 {
 		fw, fh = a.windowedW, a.windowedH
 	}
-	blit, err := vulkan.New(win, fw, fh, true, false, false)
+	blit, err := vulkan.NewWorld(win, fw, fh, true, false)
 	if err != nil {
 		win.Destroy()
 		return fmt.Errorf("open %s renderer: %w", fullscreenWord(fullscreen), err)
@@ -181,7 +234,6 @@ func (a *App) openWindow(fullscreen bool) error {
 
 	a.win, a.blit, a.fullscreen = win, blit, fullscreen
 	a.poll = imkit.NewPoller(win)
-	a.v3.r = nil
 	return nil
 }
 
@@ -212,63 +264,87 @@ func (a *App) frame(dt float64) {
 	statusRect := imkit.Rect{X: 0, Y: c.H - statusH, W: c.W, H: statusH}
 	work := imkit.Rect{X: body.X, Y: body.Y, W: body.W, H: body.H - statusH}
 
-	// Split: 2D view on the left, (3D view + docked panel) on the right.
-	left, right := a.ui.VSplit("main", work, &a.split, splitH, 320)
+	if a.doc == nil {
+		c.TextCenter(imkit.Rect{X: work.X, Y: work.Y + work.H/2 - 8, W: work.W, H: 16},
+			"No WAD loaded — File > Open WAD…  (Ctrl+O)", imkit.Theme.TextDim)
+	} else {
+		// Split: 2D view on the left, (3D view + docked panel) on the right.
+		left, right := a.ui.VSplit("main", work, &a.split, splitH, 320)
 
-	// The right block is the 3D view plus a fixed-width panel on its far
-	// right edge.
-	pnl := imkit.Rect{X: right.X + right.W - panelW, Y: right.Y, W: panelW, H: right.H}
-	v3r := imkit.Rect{X: right.X, Y: right.Y, W: right.W - panelW - 1, H: right.H}
-	a.cv.FillRect(imkit.Rect{X: v3r.X + v3r.W, Y: v3r.Y, W: 1, H: v3r.H}, imkit.Theme.Border)
+		// The right block is the 3D view plus a fixed-width panel on its far
+		// right edge.
+		pnl := imkit.Rect{X: right.X + right.W - panelW, Y: right.Y, W: panelW, H: right.H}
+		v3r := imkit.Rect{X: right.X, Y: right.Y, W: right.W - panelW - 1, H: right.H}
+		a.cv.FillRect(imkit.Rect{X: v3r.X + v3r.W, Y: v3r.Y, W: 1, H: v3r.H}, imkit.Theme.Border)
 
-	a.v2.draw(a.ui, left, a.doc, a.bank, &a.panel)
-	a.v3.draw(a.ui, v3r, a.doc, dt)
-	a.panel.draw(a.ui, pnl, a.doc, a.bank)
+		a.v2.draw(a.ui, left, a.doc, a.bank, &a.panel)
+		a.v3.draw(a.ui, v3r, a.doc, dt)
+		a.panel.draw(a.ui, pnl, a.doc, a.bank)
+
+		// The panel's Import buttons queue a blocking native dialog the same
+		// way App's own menu actions do — run it after this frame presents.
+		if p := a.panel.pending; p != nil {
+			a.panel.pending = nil
+			a.pending = func() {
+				if msg, ok := p(); ok {
+					a.status = msg
+				}
+			}
+		}
+	}
 
 	// status bar
 	c.FillRect(statusRect, imkit.Theme.Panel)
 	c.FillRect(imkit.Rect{X: 0, Y: statusRect.Y, W: c.W, H: 1}, imkit.Theme.Border)
 	msg := a.status
-	if a.doc.treeErr != nil {
-		msg += "   [3D: " + a.doc.treeErr.Error() + "]"
+	if a.doc != nil {
+		if a.doc.treeErr != nil {
+			msg += "   [3D: " + a.doc.treeErr.Error() + "]"
+		}
+		wx, wy := a.v2.worldUnderCursor(a.ui.In)
+		msg += fmt.Sprintf("   x %d  y %d   grid %d   mode %s", wx, wy, a.v2.grid, a.v2.mode.String())
 	}
-	wx, wy := a.v2.worldUnderCursor(a.ui.In)
-	msg += fmt.Sprintf("   x %d  y %d   grid %d   mode %s", wx, wy, a.v2.grid, a.v2.mode.String())
 	c.TextLeft(statusRect, msg, imkit.Theme.TextDim)
 }
 
 func (a *App) drawMenus() {
 	fileItems := []imkit.MenuItem{
-		{Label: "New level", Shortcut: "Ctrl+N"},
-		{Label: "Reload map", Shortcut: "Ctrl+R"},
+		{Label: "Open WAD…", Shortcut: "Ctrl+O"},
+		{Label: "New level", Shortcut: "Ctrl+N", Disabled: a.bank == nil},
+		{Label: "Reload map", Shortcut: "Ctrl+R", Disabled: a.doc == nil || a.doc.WAD == nil},
 		{Label: ""},
-		{Label: "Save map as PWAD", Shortcut: "Ctrl+S"},
-		{Label: "Play this map", Shortcut: "F5"},
+		{Label: "Save map as PWAD", Shortcut: "Ctrl+S", Disabled: a.doc == nil},
+		{Label: "Play this map", Shortcut: "F5", Disabled: a.doc == nil},
 		{Label: ""},
 		{Label: "Quit", Shortcut: "Ctrl+Q"},
 	}
 	switch a.ui.Menu("File", fileItems) {
 	case 0:
-		a.pending = a.newLevel
+		a.pending = a.openWADDialog
 	case 1:
+		a.pending = a.newLevel
+	case 2:
 		a.pending = func() { a.reloadMap() }
-	case 3:
-		a.pending = a.saveMap
 	case 4:
+		a.pending = a.saveMap
+	case 5:
 		a.pending = a.playMap
-	case 6:
+	case 7:
 		a.quit = true
 	}
-	if a.ui.In.Ctrl() && a.ui.In.Edge(imkit.KeyN) {
+	if a.ui.In.Ctrl() && a.ui.In.Edge(imkit.KeyO) {
+		a.pending = a.openWADDialog
+	}
+	if a.bank != nil && a.ui.In.Ctrl() && a.ui.In.Edge(imkit.KeyN) {
 		a.pending = a.newLevel
 	}
-	if a.ui.In.Ctrl() && a.ui.In.Edge(imkit.KeyR) {
+	if a.doc != nil && a.ui.In.Ctrl() && a.ui.In.Edge(imkit.KeyR) {
 		a.pending = func() { a.reloadMap() }
 	}
-	if a.ui.In.Ctrl() && a.ui.In.Edge(imkit.KeyS) {
+	if a.doc != nil && a.ui.In.Ctrl() && a.ui.In.Edge(imkit.KeyS) {
 		a.pending = a.saveMap
 	}
-	if a.ui.In.Edge(imkit.KeyF5) {
+	if a.doc != nil && a.ui.In.Edge(imkit.KeyF5) {
 		a.pending = a.playMap
 	}
 	if a.ui.In.Ctrl() && a.ui.In.Edge(imkit.KeyQ) {
@@ -276,7 +352,7 @@ func (a *App) drawMenus() {
 	}
 
 	var maps []string
-	if a.doc.WAD != nil {
+	if a.doc != nil && a.doc.WAD != nil {
 		maps = a.doc.WAD.ListMaps()
 	}
 	mapItems := make([]imkit.MenuItem, 0, len(maps)+1)
@@ -303,7 +379,7 @@ func (a *App) drawMenus() {
 		{Label: ""},
 		{Label: "Toggle Fullscreen", Shortcut: "F11", Checked: a.fullscreen},
 	}
-	if a.ui.In.Edge(imkit.KeyHome) {
+	if a.doc != nil && a.ui.In.Edge(imkit.KeyHome) {
 		a.v2.frameMap(a.doc)
 	}
 	if a.ui.In.Edge(imkit.KeyF11) {
@@ -311,7 +387,9 @@ func (a *App) drawMenus() {
 	}
 	switch a.ui.Menu("View", viewItems) {
 	case 0:
-		a.v2.frameMap(a.doc)
+		if a.doc != nil {
+			a.v2.frameMap(a.doc)
+		}
 	case 1:
 		a.v2.grid = min(a.v2.grid*2, 1024)
 	case 2:
@@ -415,9 +493,4 @@ func preferredMap(maps []string) string {
 	s := append([]string(nil), maps...)
 	sort.Strings(s)
 	return s[0]
-}
-
-// asImage wraps a raster framebuffer / RGBA slice as an *image.RGBA.
-func asImage(pix []byte, w, h int) *image.RGBA {
-	return &image.RGBA{Pix: pix, Stride: w * 4, Rect: image.Rect(0, 0, w, h)}
 }

@@ -121,8 +121,9 @@ float sectorAmbientFrac() {
 }
 
 // skyColorAt samples the sky texture by view direction for a given screen
-// pixel, mirroring raster/sky.go: horizontally skyPixPerTurn texture
-// columns per 360 deg yaw; vertically the vanilla skytexturemid mapping —
+// pixel (see game_design.txt section 10): horizontally skyPixPerTurn
+// texture columns per 360 deg yaw; vertically the vanilla skytexturemid
+// mapping —
 // row 100 (of the 128-tall reference) at the pitch-shifted horizon, stepped
 // at the vanilla 200-line rate scaled to the render height, wrapped (REPEAT
 // sampler). Water passes a rippled frag coord so the reflection shimmers.

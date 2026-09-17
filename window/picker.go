@@ -51,6 +51,16 @@ func PickWADFile() (string, error) {
 	return pickWAD()
 }
 
+// PickImageFile opens the platform's native "open file" dialog filtered to
+// PNG images — the level editor's "Import Texture..." command (a single
+// file; see PickFolder for a whole directory of them).
+func PickImageFile() (string, error) { return pickImageFile() }
+
+// PickFolder opens the platform's native "choose folder" dialog — the level
+// editor's "Import Textures (Folder)..." command, which then imports every
+// *.png found under it.
+func PickFolder() (string, error) { return pickFolder() }
+
 // WADFromCommandLine looks for an explicitly-supplied WAD path: TPF_WAD
 // first, then the first command-line argument naming an existing file that
 // ends in .wad (case-insensitive). Returns "" when neither is present. A

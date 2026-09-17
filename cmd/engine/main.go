@@ -1,8 +1,9 @@
 // Command engine is TwoPointFive's entry point: it asks for a WAD file,
 // parses it, builds the first level's BSP tree, opens a window, stands up
-// the Vulkan renderer and the CPU software rasterizer, positions a camera
-// at the level's player start, and runs the main loop. See game_design.txt
-// for the full engine design and roadmap.
+// the Vulkan hardware renderer (world geometry) and the CPU rasterizer
+// (the 2D weapon/HUD/crosshair overlay only), positions a camera at the
+// level's player start, and runs the main loop. See game_design.txt for
+// the full engine design and roadmap.
 package main
 
 import (
@@ -214,9 +215,9 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 	if cfg.AlwaysRun {
 		runMode = "always-run"
 	}
-	log.Printf("engine: config in effect — %s, renderer=%s, resolution=%s x%.2f, fov=%.0f, vsync=%v, hudScale=%.2f, weaponScale=%.2f, lighting=%s lightScale=%.2f exposure=%.2f shadows=%v groundShadows=%v, textureQuality=%s, "+
+	log.Printf("engine: config in effect — %s, resolution=%s x%.2f, fov=%.0f, vsync=%v, hudScale=%.2f, weaponScale=%.2f, lightScale=%.2f exposure=%.2f, "+
 		"invertMouseY=%v, mouseSensitivity=%.4f, turnSpeed=%.2f, %s, skill=%d, damageScale=%d, music=%v, musicVolume=%.2f, weaponVolume=%.2f, worldVolume=%.2f, debugInfo=%v, hud=%s, crosshair=%s/%s, voxels=%v x%.2f, quake1Textures=%v",
-		wm, cfg.Renderer, cfg.Resolution, cfg.RenderScale, cfg.FOVDegrees, cfg.VSync, cfg.HUDScale, cfg.WeaponScale, cfg.LightingMode, cfg.LightScale, cfg.Exposure, cfg.Shadows, cfg.GroundShadows, cfg.TextureQuality,
+		wm, cfg.Resolution, cfg.RenderScale, cfg.FOVDegrees, cfg.VSync, cfg.HUDScale, cfg.WeaponScale, cfg.LightScale, cfg.Exposure,
 		cfg.InvertMouseY, cfg.MouseSensitivity, cfg.TurnSpeed, runMode, cfg.Skill, cfg.DamageScale, cfg.Music, cfg.MusicVolume, cfg.WeaponVolume, cfg.WorldVolume, cfg.ShowDebugInfo, cfg.HUDStyle, cfg.Crosshair, cfg.CrosshairSize,
 		cfg.Voxels, cfg.VoxelScale, cfg.Quake1Textures)
 
@@ -253,77 +254,30 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 	if cfg.Windowed {
 		base = "window size"
 	}
-	mpix := float64(renderW*renderH) / 1e6
-	log.Printf("engine: window framebuffer %dx%d, CPU render target %dx%d (%.1f Mpix, %s x%.2f)",
-		fbW, fbH, renderW, renderH, mpix, base, cfg.RenderScale)
-	// The "large render target" / "filtered sampling is CPU-heavy" warnings
-	// below (and the matching WarmTextureCache work) only mean anything for
-	// the CPU rasterizer's own 3D-world pass — raster.Render/drawMobjs,
-	// which the hardware (GPU-geometry) path never calls at all (renderFrame
-	// just preps the small 2D overlay plane there; the world and its sprites
-	// are the GPU's job, textured through its own always-on anisotropic
-	// sampler, independent of this "textureQuality" setting entirely). Both
-	// are deferred until hw's FINAL value is known (after the hardware
-	// init/fallback below), not the configured intent — a hardware init
-	// failure still needs the warm cache once it falls back to software.
+	log.Printf("engine: window framebuffer %dx%d, render target %dx%d (%s x%.2f)",
+		fbW, fbH, renderW, renderH, base, cfg.RenderScale)
 
-	lit := cfg.LightingMode == config.LightingEnhanced
-	hw := cfg.Renderer == config.RendererHardware
-	if hw {
-		// The hardware (GPU-geometry) path is its own renderer — it walks the
-		// BSP into a triangle list and the GPU shades it. Enhanced lighting is
-		// a property of the software pipeline and doesn't apply.
-		lit = false
-	}
-
+	// ras is the 2D overlay compositor only (weapon / HUD / crosshair /
+	// status bar) — the world itself is the GPU-geometry (hardware) path's
+	// job below. SetLightScale/SetAmbientLight aren't overlay settings: the
+	// hardware path reads them back (render/vulkan/world.go) as shader
+	// uniforms, so the sector-light fade and ambient floor stay identical
+	// to what raster/light.go's tables define.
 	ras := raster.New(textures, renderW, renderH)
 	raster.SetLightScale(cfg.LightScale)
 	raster.SetAmbientLight(cfg.AmbientLight)
 	ras.SetHUDScale(cfg.HUDScale)
 	ras.SetWeaponScale(cfg.WeaponScale)
-	ras.SetTextureQuality(cfg.TextureQuality)
-	ras.SetGroundShadows(cfg.GroundShadows)
-	if lit {
-		ras.SetGBuffer(true)
-	}
 
 	// Vulkan validation layers cost double-digit percent and add per-call
 	// latency; keep them off unless explicitly asked for (TPF_VK_DEBUG=1).
 	vkDebug := os.Getenv("TPF_VK_DEBUG") != ""
 	done = stageTimer("create GPU renderer (device + pipelines + shaders)")
-	var renderer *vulkan.Renderer
-	if hw {
-		renderer, err = vulkan.NewWorld(win, renderW, renderH, cfg.VSync, vkDebug)
-		if err != nil {
-			// The GPU-geometry backend failed to stand up; don't make the game
-			// unlaunchable over it — fall back to the software rasterizer. Make
-			// this loud: it's the usual reason "hardware mode looks like vanilla
-			// software with no dynamic lights".
-			log.Printf("engine: ============================================================")
-			log.Printf("engine: renderer=hardware FAILED to initialise: %v", err)
-			log.Printf("engine: falling back to the SOFTWARE rasterizer (vanilla — no")
-			log.Printf("engine: dynamic lights). Fix the error above to get the GPU path.")
-			log.Printf("engine: ============================================================")
-			hw = false
-			renderer, err = vulkan.New(win, renderW, renderH, cfg.VSync, vkDebug, false)
-		} else {
-			log.Printf("engine: renderer=hardware active (GPU geometry + HDR/bloom/dynamic lights)")
-		}
-	} else {
-		renderer, err = vulkan.New(win, renderW, renderH, cfg.VSync, vkDebug, lit)
-		if err != nil && lit {
-			// The enhanced lighting pipeline failed to stand up (an unsupported
-			// format, an out-of-memory, a driver quirk). Don't make the game
-			// unlaunchable over it — fall back to the vanilla path and say so.
-			log.Printf("engine: enhanced lighting unavailable (%v) — falling back to lightingMode=vanilla", err)
-			lit = false
-			ras.SetGBuffer(false)
-			renderer, err = vulkan.New(win, renderW, renderH, cfg.VSync, vkDebug, false)
-		}
-	}
+	renderer, err := vulkan.NewWorld(win, renderW, renderH, cfg.VSync, vkDebug)
 	if err != nil {
-		return err
+		return fmt.Errorf("engine: hardware renderer failed to initialise: %w", err)
 	}
+	log.Printf("engine: renderer active (GPU geometry + HDR/bloom/dynamic lights)")
 	done()
 	win.PollEvents()
 	defer renderer.Destroy()
@@ -332,53 +286,29 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 		log.Println("engine: WARNING — Vulkan selected a CPU/software device; this is not real hardware rendering")
 	}
 
-	// Only the CPU rasterizer path (vanilla/enhanced, including a
-	// hardware-init fallback that just landed here as hw=false) ever runs
-	// raster.Render/drawMobjs against renderW*renderH pixels or filters a
-	// texture through it — the hardware path's world/sprites are entirely
-	// the GPU's job. Gating on the FINAL hw (post-fallback) rather than the
-	// configured intent means a failed hardware init still gets its warm
-	// cache instead of hitching mid-frame on the first room.
-	if !hw {
-		// The software rasterizer's cost is close to linear in render pixels
-		// (section 18 of game_design.txt). Flag a heavy target so a low
-		// frame rate is self-explanatory.
-		if mpix > 2.4 {
-			lever := "lower `resolution` or set `renderScale` below 1.0"
-			if cfg.Windowed {
-				lever = "use a smaller window or set `renderScale` below 1.0"
-			}
-			log.Printf("engine: that's a large render target for a CPU rasterizer — if the frame rate is low, %s", lever)
-		}
-		if cfg.TextureQuality != config.TextureNearest {
-			log.Printf("engine: textureQuality=%s — filtered wall/flat sampling is CPU-heavy on the software rasterizer; set it to \"nearest\" if the frame rate suffers", cfg.TextureQuality)
-			done = stageTimer("warm filtered-texture cache")
-			ras.WarmTextureCache(level) // build mip chains now, not mid-frame on first sight of a room
-			done()
-			win.PollEvents()
-		}
-	}
-
 	game := engine.NewGame(win, renderer, ras, w, level, tree, cam, cfg)
-	game.LitMode = lit   // may have been forced off by the fallback above
 	game.AltWAD = altWAD // switchWeapons fire-sound fallback (nil otherwise)
-	if hw {
-		game.HardwareMode = true
-		done = stageTimer("build static world geometry (BSP walk + texture decode)")
-		game.WorldBuilder = worldgeo.New(level, tree, textures)
-		done()
-		win.PollEvents()
-		game.ApplyMapInfo() // push the starting level's UMAPINFO sky to the fresh WorldBuilder
-		// HDR tonemap exposure (config) + a fixed bloom strength for the
-		// glow around dynamic lights / bright texels. The mip-pyramid bloom
-		// accumulates every scale, so it preserves more energy than a tight
-		// single blur — this is dialled back so normally-lit level geometry
-		// isn't washed, only genuine highlights glow.
-		renderer.SetHDR(float32(cfg.Exposure), 0.55)
-	}
+	done = stageTimer("build static world geometry (BSP walk + texture decode)")
+	game.WorldBuilder = worldgeo.New(level, tree, textures)
+	done()
+	win.PollEvents()
+	game.ApplyMapInfo() // push the starting level's UMAPINFO sky to the fresh WorldBuilder
+	// HDR tonemap exposure (config) + a fixed bloom strength for the glow
+	// around dynamic lights / bright texels. The mip-pyramid bloom
+	// accumulates every scale, so it preserves more energy than a tight
+	// single blur — this is dialled back so normally-lit level geometry
+	// isn't washed, only genuine highlights glow.
+	renderer.SetHDR(float32(cfg.Exposure), 0.55)
 
 	if cfg.Voxels {
-		pk3 := "Doom1_Voxel.pk3"
+		// DoomVoxelPack.pk3 (assets/voxel/) is an updated/alternate monster
+		// + item set assembled from a user-supplied .kvx drop — it covers
+		// every Doom1/Ultimate Doom monster (troo/poss/sarg/skul/head/boss/
+		// cybr/spid) plus items/decorations, but NOT Doom II's exclusive
+		// roster (mancubus/revenant/arch-vile/pain elemental/arachnotron/
+		// chaingunner), so it only replaces Doom1_Voxel.pk3 here — Doom II
+		// maps keep Doom2_Voxel.pk3, which already covers its full roster.
+		pk3 := "DoomVoxelPack.pk3"
 		switch {
 		case w.IsHeretic():
 			pk3 = "reikallhereticvoxels.pk3"
@@ -393,16 +323,13 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 			log.Printf("engine: voxel models unavailable (%v) — using sprites", err)
 		} else {
 			game.Voxels = vs
-			ras.SetVoxelScale(cfg.VoxelScale)
 			log.Printf("engine: voxel models active — %s, %d sprite frames", pk3, vs.Frames())
-			if hw {
-				// Mesh + upload every model up front so no first-sight GPU
-				// stall hits the render loop mid-game.
-				done = stageTimer("mesh + upload voxel models")
-				renderer.WarmVoxels(vs.Models())
-				done()
-				win.PollEvents()
-			}
+			// Mesh + upload every model up front so no first-sight GPU stall
+			// hits the render loop mid-game.
+			done = stageTimer("mesh + upload voxel models")
+			renderer.WarmVoxels(vs.Models())
+			done()
+			win.PollEvents()
 		}
 	}
 

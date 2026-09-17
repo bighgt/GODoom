@@ -57,9 +57,9 @@ func (g *Game) stepMove(dx, dy float64) bool {
 	// player dropping past a ledge can still move onto a platform that's
 	// within stepping distance of where they *are*, not where they started.
 	fromFloor := g.PlayerZ
-	if sec := bsp.PointSector(g.BSP, g.Level, float32(g.Camera.X), float32(g.Camera.Y)); sec != nil {
-		if f := float64(sec.FloorHeight); f > fromFloor {
-			fromFloor = f // a floor that has risen into us (a lift) wins
+	if secIdx := bsp.PointSectorIndex(g.BSP, g.Level, float32(g.Camera.X), float32(g.Camera.Y)); secIdx >= 0 {
+		if f, _, _ := g.planeAt(secIdx, g.Camera.X, g.Camera.Y, g.PlayerZ); f > fromFloor {
+			fromFloor = f // a floor (or a room-over-room band's top) that has risen into us wins
 		}
 	}
 	ox, oy := g.Camera.X, g.Camera.Y
@@ -134,14 +134,18 @@ func (g *Game) canMoveTo(x, y, fromFloor float64) bool {
 	}
 
 	destFloor := fromFloor
-	if sec := bsp.PointSector(g.BSP, g.Level, float32(x), float32(y)); sec != nil {
-		destFloor = float64(sec.FloorHeight)
+	if secIdx := bsp.PointSectorIndex(g.BSP, g.Level, float32(x), float32(y)); secIdx >= 0 {
+		// fromFloor doubles as "my current altitude," which is what picks
+		// the right room-over-room band at the destination (x, y) — e.g.
+		// stepping onto a platform's top vs. staying underneath it.
+		var destCeil float64
+		destFloor, destCeil, _ = g.planeAt(secIdx, x, y, fromFloor)
 		// The nearby-line scan above catches a low opening on a line being
 		// crossed, but not a destination sector that's simply too short to
 		// stand in on its own (reached across a wide, tall opening whose own
 		// clearance is fine). Check the destination sector directly, the
 		// way PrBoom seeds tmceilingz from newsubsec->sector.
-		if float64(sec.CeilingHeight)-destFloor < playerHeight {
+		if destCeil-destFloor < playerHeight {
 			return false
 		}
 	}
@@ -203,6 +207,15 @@ type wallOpening struct {
 // wallOpeningAt resolves ld's opening, or twoSided=false if it's one-sided
 // or its sector data doesn't resolve — either way, callers should treat it
 // as solid.
+//
+// For a sloped front/back sector this evaluates each one's plane at BOTH of
+// the line's endpoints and takes the tightest reading (highest floor,
+// lowest ceiling) rather than the query point's own position — a
+// conservative approximation (errs toward "blocked," never "narrower gap
+// than actually there") rather than plumbing the query (x, y) through every
+// caller. Every untilted sector (still the vanilla default) has all
+// endpoint readings agree, so this is byte-for-byte the old sector-wide
+// scalar behavior there.
 func (g *Game) wallOpeningAt(ld *wad.Linedef) wallOpening {
 	if ld.BackSidedef == wad.NoSidedef {
 		return wallOpening{}
@@ -217,10 +230,26 @@ func (g *Game) wallOpeningAt(ld *wad.Linedef) wallOpening {
 	}
 	front := g.Level.Sectors[frontSD.Sector]
 	back := g.Level.Sectors[backSD.Sector]
+	// Endpoint positions refine the reading for a sloped sector (see the
+	// doc comment above); if they don't resolve (e.g. a hand-built test
+	// level with no VERTEXES lump at all — the scalar heights are all that
+	// matters there anyway) fall back to the flat scalar reading, which
+	// FloorZAt/CeilZAt would give at ANY point for an untilted sector, so
+	// this is exactly the old behavior, not a degraded one.
+	x1, y1, x2, y2 := 0.0, 0.0, 0.0, 0.0
+	if int(ld.StartVertex) < len(g.Level.Vertexes) && int(ld.EndVertex) < len(g.Level.Vertexes) {
+		v1 := g.Level.Vertexes[ld.StartVertex]
+		v2 := g.Level.Vertexes[ld.EndVertex]
+		x1, y1, x2, y2 = float64(v1.X), float64(v1.Y), float64(v2.X), float64(v2.Y)
+	}
+	fFloor := math.Max(front.FloorZAt(x1, y1), front.FloorZAt(x2, y2))
+	bFloor := math.Max(back.FloorZAt(x1, y1), back.FloorZAt(x2, y2))
+	fCeil := math.Min(front.CeilZAt(x1, y1), front.CeilZAt(x2, y2))
+	bCeil := math.Min(back.CeilZAt(x1, y1), back.CeilZAt(x2, y2))
 	return wallOpening{
-		bottom:   math.Max(float64(front.FloorHeight), float64(back.FloorHeight)),
-		top:      math.Min(float64(front.CeilingHeight), float64(back.CeilingHeight)),
-		lowFloor: math.Min(float64(front.FloorHeight), float64(back.FloorHeight)),
+		bottom:   math.Max(fFloor, bFloor),
+		top:      math.Min(fCeil, bCeil),
+		lowFloor: math.Min(fFloor, bFloor),
 		twoSided: true,
 	}
 }

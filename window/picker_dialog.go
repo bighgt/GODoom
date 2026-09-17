@@ -28,3 +28,32 @@ func pickWAD() (string, error) {
 	}
 	return path, nil
 }
+
+// pickImageFile is PickImageFile's Windows/macOS backend.
+func pickImageFile() (string, error) {
+	path, err := dialog.File().
+		Title("Select a texture image").
+		Filter("PNG images", "png").
+		Load()
+	if err != nil {
+		if errors.Is(err, dialog.ErrCancelled) {
+			return "", ErrPickCancelled
+		}
+		return "", fmt.Errorf("window: image file dialog: %w", err)
+	}
+	return path, nil
+}
+
+// pickFolder is PickFolder's Windows/macOS backend.
+func pickFolder() (string, error) {
+	path, err := dialog.Directory().
+		Title("Select a folder of texture images").
+		Browse()
+	if err != nil {
+		if errors.Is(err, dialog.ErrCancelled) {
+			return "", ErrPickCancelled
+		}
+		return "", fmt.Errorf("window: folder dialog: %w", err)
+	}
+	return path, nil
+}

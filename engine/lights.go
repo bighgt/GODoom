@@ -6,20 +6,19 @@ import (
 	"twopointfive/render"
 )
 
-// Dynamic lights for the enhanced (GPU deferred) and hardware paths — see
-// game.LitMode / game.HardwareMode. Vanilla Doom has no dynamic lights at
-// all; these are the emitters the engine already simulates: the player's
-// weapon muzzle flash, every in-flight rocket / plasma / BFG shot (each
-// glowing in its own colour, flaring on impact), every MONSTER projectile
-// in flight (imp / caco / baron-knight fireballs), and the muzzle flash of
-// a hitscan monster (former human / shotgun guy / chaingunner) while it
-// fires. collectLights assembles them per frame.
+// Dynamic lights for the hardware path — real per-pixel emitters the
+// engine already simulates: the player's weapon muzzle flash, every
+// in-flight rocket / plasma / BFG shot (each glowing in its own colour,
+// flaring on impact), every MONSTER projectile in flight (imp / caco /
+// baron-knight fireballs), and the muzzle flash of a hitscan monster
+// (former human / shotgun guy / chaingunner) while it fires. collectLights
+// assembles them per frame.
 
 // muzzleFlashLight is where and how bright the weapon flash lights the
 // scene: a warm point just in front of the eye, roughly a room's width of
 // reach.
 func (g *Game) muzzleFlashLight() (render.Light, bool) {
-	if _, _, hasFlash := g.currentSprite(); !hasFlash {
+	if _, _, _, _, hasFlash := g.currentSprite(); !hasFlash {
 		return render.Light{}, false
 	}
 	dx, dy, _ := aimDirection(g.Camera)
@@ -235,60 +234,3 @@ func lightDist2(l render.Light, cx, cy, cz float32) float32 {
 	return dx*dx + dy*dy + dz*dz
 }
 
-// buildFrame packages the raster G-buffer and this frame's lights into the
-// render.Frame the enhanced backend consumes. Call after the raster
-// renderer has drawn the frame (Render + the sprite/overlay passes) and
-// only when g.LitMode is set.
-func (g *Game) buildFrame() *render.Frame {
-	d := g.Raster.Deferred()
-	lights, dynamicN := g.collectLights()
-	var shadow float32
-	shadowLights := 0
-	if g.shadows {
-		shadow = 1
-		shadowLights = dynamicN
-	}
-	// flashlightSpot returns the zero value (SpotIntensity 0, read by
-	// light.frag as "off") when the flashlight isn't on.
-	spot, _ := g.flashlightSpot()
-	g.frame = render.Frame{
-		W: d.W, H: d.H,
-		Albedo: d.Albedo, Normal: d.Normal, LightParam: d.LightParam, Overlay: d.Overlay,
-		Depth:          d.Depth,
-		CamX:           float32(g.Camera.X),
-		CamY:           float32(g.Camera.Y),
-		CamZ:           float32(g.Camera.Z),
-		SinA:           float32(d.SinA),
-		CosA:           float32(d.CosA),
-		Focal:          float32(d.Focal),
-		HorizonY:       float32(d.HorizonY),
-		OverlayY:       d.OverlayY,
-		OverlayH:       d.OverlayH,
-		ExtraLight:     0,
-		LightScale:     g.lightScale,
-		AmbientLight:   g.ambientLight,
-		Exposure:       g.exposure,
-		FogR:           g.fogR,
-		FogG:           g.fogG,
-		FogB:           g.fogB,
-		FogDensity:     g.fogDensity,
-		AnimTime:       float32(g.renderClock),
-		ShadowStrength: shadow,
-		ShadowLights:   shadowLights,
-		Lights:         lights,
-		SpotX:          spot.X,
-		SpotY:          spot.Y,
-		SpotZ:          spot.Z,
-		SpotDX:         spot.DX,
-		SpotDY:         spot.DY,
-		SpotDZ:         spot.DZ,
-		SpotR:          spot.R,
-		SpotG:          spot.G,
-		SpotB:          spot.B,
-		SpotIntensity:  spot.Intensity,
-		SpotRadius:     spot.Radius,
-		SpotCosOuter:   spot.CosOuter,
-		SpotCosInner:   spot.CosInner,
-	}
-	return &g.frame
-}

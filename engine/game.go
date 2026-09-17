@@ -14,6 +14,7 @@ import (
 	"twopointfive/engine/animdefs"
 	"twopointfive/engine/gldefs"
 	"twopointfive/engine/mapinfo"
+	"twopointfive/engine/slopes"
 	"twopointfive/raster"
 	"twopointfive/render"
 	"twopointfive/render/worldgeo"
@@ -140,11 +141,12 @@ func clamp(v, lo, hi float64) float64 {
 	return v
 }
 
-// Game is the engine's core object: it owns the window, the GPU renderer
-// (held as the render.Renderer interface — see game_design.txt), the CPU
-// software rasterizer that actually draws the level (package raster), the
-// loaded WAD/level/BSP tree, the camera, every live map object (Mobj), and
-// the ordered list of per-frame Systems. Run drives the main loop.
+// Game is the engine's core object: it owns the window, the Vulkan hardware
+// renderer (held as the render.Renderer interface — see game_design.txt),
+// the CPU rasterizer that draws the 2D overlay (weapon/HUD/crosshair/status
+// bar — package raster), the loaded WAD/level/BSP tree, the camera, every
+// live map object (Mobj), and the ordered list of per-frame Systems. Run
+// drives the main loop.
 type Game struct {
 	Window   *window.Window
 	Renderer render.Renderer
@@ -279,23 +281,11 @@ type Game struct {
 	// MaxFPS caps the frame rate in Run when > 0 (a sleep at end of frame);
 	// meant for when vsync is off. 0 = uncapped.
 	MaxFPS int
-	// LitMode routes each frame through the GPU deferred-lighting path
-	// (render.Renderer.DrawFrameLit) instead of the plain blit: the raster
-	// renderer emits a G-buffer (Raster.SetGBuffer) and Run passes it plus
-	// the frame's dynamic lights (collectLights) to the backend. Set from
-	// config.json's lightingMode == "enhanced"; both the Renderer and the
-	// Raster must have been created for it (see cmd/engine/main.go).
-	LitMode bool
-	// HardwareMode routes each frame through the GPU-geometry path
-	// (render.Renderer.DrawWorld): WorldBuilder walks the BSP into a triangle
-	// list the GPU shades, and the CPU rasterizer is used only for the 2D
-	// overlay (weapon / HUD / crosshair). Set from config.json's
-	// renderer == "hardware"; mutually exclusive with LitMode. The world
-	// sprites / monsters aren't GPU geometry yet, so they don't show in this
-	// mode (a follow-up stage).
-	HardwareMode bool
-	// WorldBuilder is the per-level BSP-to-triangle-list builder for
-	// HardwareMode (nil otherwise). Rebuilt on level change (see loadMap).
+	// WorldBuilder is the per-level BSP-to-triangle-list builder that feeds
+	// render.Renderer.DrawWorld every frame — the GPU shades the triangle
+	// list it walks the BSP into, and the CPU rasterizer (Raster) is used
+	// only for the 2D overlay (weapon / HUD / crosshair). Rebuilt on level
+	// change (see loadMap).
 	WorldBuilder *worldgeo.Builder
 	// IsoCameraAzimuth/IsoAimX/IsoAimY are read by IsoMovementSystem (see
 	// movement_iso.go) — an isometric front end (cmd/isoengine) updates
@@ -313,9 +303,9 @@ type Game struct {
 	// Unused by the first-person front end.
 	IsoAimLocked bool
 	// geomHeights snapshots every sector's floor+ceiling height; renderFrame
-	// (HardwareMode) rebuilds the cached static geometry only when one of
-	// them actually moved — a live door in its open-wait, a strobe light,
-	// etc. must not trigger a rebuild.
+	// rebuilds the cached static geometry only when one of them actually
+	// moved — a live door in its open-wait, a strobe light, etc. must not
+	// trigger a rebuild.
 	geomHeights []int16
 	dbgHWFrames int // rate-limits the hardware-path dynamic-light diagnostic
 	// dbgSimMS/dbgBuildMS/dbgDrawMS are smoothed (same EMA as fps below)
@@ -329,25 +319,11 @@ type Game struct {
 	// well-documented RADV-vs-Windows-AMD-driver gap), not at anything this
 	// engine's own CPU-side code is doing differently between OSes.
 	dbgSimMS, dbgBuildMS, dbgDrawMS float64
-	// lightScale / ambientLight / exposure are config lightScale /
-	// ambientLight / exposure, forwarded into every render.Frame (buildFrame)
-	// for the enhanced pipeline. lightScale and ambientLight are also handed
-	// to the hardware path via raster.SetLightScale / raster.SetAmbientLight
-	// in cmd/engine, so these copies are only read on the enhanced path.
-	lightScale   float32
-	ambientLight float32
-	exposure     float32
 	// Distance fog (config fogColor / fogDensity), 0..1 colour + density.
-	// Fed to every render path: buildFrame -> render.Frame (enhanced),
-	// worldgeo.Camera (hardware), raster.SetFog (vanilla, via cmd/engine).
+	// Fed to worldgeo.Camera (hardware) and raster.SetFog (the 2D overlay's
+	// own post-pass, via cmd/engine).
 	fogR, fogG, fogB float32
 	fogDensity       float32
-	// shadows (config shadows) gates the enhanced pipeline's screen-space
-	// light shadows (buildFrame sets the shader's shadow-strength tuning
-	// slot). groundShadows (config groundShadows, default off) gates the
-	// per-thing contact-blob pass (drawGroundShadows).
-	shadows       bool
-	groundShadows bool
 	// cartoonShading (config cartoonShading, default off) asks the hardware
 	// renderer for a cel-shaded look — see worldgeo.Camera.CartoonShading's
 	// doc comment for what that actually does; renderFrame's hardware
@@ -359,6 +335,15 @@ type Game struct {
 	jumpWasDown   bool          // for edge-detecting the jump key (Space)
 	weaponKeyDown [8]bool       // for edge-detecting weapon slot keys 1-7
 	projectiles   []*Projectile // in-flight shots; see projectiles.go
+	// rocketCam, while non-nil, is the in-flight rocket RocketFollow is
+	// riding the camera along with — set in beginFire when the rocket
+	// launcher fires with the right mouse button held, cleared in
+	// updateProjectiles once its explosion animation finishes. g.Camera
+	// itself is never touched by this: renderFrame swaps in a camera pose
+	// derived from rocketCam for the render only, so player movement,
+	// collision, and every other system keep working off the player's own
+	// real position the whole time. See engine/projectiles.go.
+	rocketCam *Projectile
 
 	// Classic Doom cheat codes, baked in for testing (see cheats.go). godMode
 	// (iddqd) and noclip (idclip) are the two persistent toggles; cheatBuf is
@@ -390,7 +375,6 @@ type Game struct {
 	staticLights []staticLight
 	lightScratch []render.Light
 	lightCands   []scoredLight
-	frame        render.Frame // reused per-frame render.Frame for buildFrame
 
 	// mods is the mounted assets/mods/ virtual filesystem (.pk3 archives +
 	// loose files). Always non-nil after NewGame, usually empty. GLDEFS is
@@ -410,6 +394,20 @@ type Game struct {
 	// current level's UMAPINFO par time in seconds (0 = none).
 	mapInfo map[string]*mapinfo.Entry
 	parTime int
+
+	// slopeDefs/extraFloorDefs are the parsed SLOPES lump's two kinds of
+	// entry (per-map sector-plane overrides, and room-over-room "3D floor"
+	// bands) from the WAD and/or a mod, or nil. Loaded once in NewGame;
+	// applied by applySlopes on every level load (NewGame, loadMap) — see
+	// slopes_load.go. A vanilla IWAD has neither, so nothing changes.
+	slopeDefs      map[string][]slopes.Def
+	extraFloorDefs map[string][]slopes.ExtraFloorDef
+	// extraFloors is applySlopes' resolved form of extraFloorDefs for the
+	// CURRENT map only, keyed by target sector index — what planeAt
+	// (roomoverroom.go) actually reads every tic. Rebuilt (not merely
+	// appended to) on every applySlopes call, so a stale entry from a
+	// previous level never lingers.
+	extraFloors map[int][]ExtraFloor
 
 	// DEHACKED / BEX (dehacked_load.go, dehacked_misc.go): dehLevelNames
 	// overrides a map's display name ([STRINGS] HUSTR_*), dehPars its par
@@ -453,13 +451,11 @@ type Game struct {
 	// corpses (and, from Phase 2, missiles and the player). Stepped at the
 	// fixed 35Hz tic (see runTic); rendered every frame. ticAccum carries
 	// leftover real time between frames; levelTime counts elapsed tics.
-	mobjs        []*Mobj
-	mobjScratch  []*Mobj                  // reused per-frame draw-order buffer
-	thingScratch []raster.SceneThing      // reused per-frame resolved draw list
-	hwSprites    []worldgeo.Sprite        // reused per-frame billboard list (HardwareMode)
-	hwVoxels     []worldgeo.VoxelInstance // reused per-frame voxel-instance list (HardwareMode)
-	hwShadows    [][4]float32             // reused per-frame ground-shadow caster list (HardwareMode)
-	playerMobj   *Mobj                    // the player's own map object — AI target; kept in sync with Camera
+	mobjs      []*Mobj
+	hwSprites  []worldgeo.Sprite        // reused per-frame billboard list
+	hwVoxels   []worldgeo.VoxelInstance // reused per-frame voxel-instance list
+	hwShadows  [][4]float32             // reused per-frame ground-shadow caster list
+	playerMobj *Mobj                    // the player's own map object — AI target; kept in sync with Camera
 	ticAccum     float64
 	levelTime    int
 	killCount    int // monsters killed this level
@@ -565,12 +561,6 @@ func NewGame(win *window.Window, renderer render.Renderer, ras *raster.Renderer,
 		CrosshairSize:        cfg.CrosshairSize,
 		Skill:                skill,
 		MaxFPS:               cfg.MaxFPS,
-		LitMode:              cfg.LightingMode == config.LightingEnhanced,
-		lightScale:           float32(cfg.LightScale),
-		ambientLight:         float32(cfg.AmbientLight),
-		exposure:             float32(cfg.Exposure),
-		shadows:              cfg.Shadows,
-		groundShadows:        cfg.GroundShadows,
 		cartoonShading:       cfg.CartoonShading,
 		damageScale:          cfg.DamageScale,
 		weaponVolume:         cfg.WeaponVolume,
@@ -580,9 +570,6 @@ func NewGame(win *window.Window, renderer render.Renderer, ras *raster.Renderer,
 	}
 	if fr, fg, fb, fdens, on := cfg.Fog(); on {
 		g.fogR, g.fogG, g.fogB, g.fogDensity = fr, fg, fb, float32(fdens)
-		if ras != nil {
-			ras.SetFog(fr, fg, fb, fdens) // vanilla-path post-pass
-		}
 	}
 	// The per-frame simulation runs as an ordered list of Systems (see
 	// systems.go) rather than a hardcoded call sequence in Run — order is
@@ -605,7 +592,6 @@ func NewGame(win *window.Window, renderer render.Renderer, ras *raster.Renderer,
 	if g.heretic {
 		log.Printf("engine: Heretic IWAD detected — monsters, artifacts, HUD, doors, sky, voxels active")
 		if g.Raster != nil {
-			g.Raster.SetPreferWADSky(true) // Heretic's own skies, not the Mars panorama
 			if tx := g.Raster.Textures(); tx != nil {
 				// Prefer the Heretic HD texture pack (assets/textures/heretic/,
 				// tools/importhereticpbr) for every wall/flat it covers — inert
@@ -649,6 +635,8 @@ func NewGame(win *window.Window, renderer render.Renderer, ras *raster.Renderer,
 	g.loadDehacked(w, g.mods, "")      // DEH/BEX table edits (WAD and/or mod lumps)
 	g.mapInfo = loadMapInfo(w, g.mods) // UMAPINFO per-map metadata (WAD and/or mod)
 	g.applyMapInfo()                   // sky / par-time for the starting level
+	g.slopeDefs, g.extraFloorDefs = loadSlopes(w, g.mods) // SLOPES per-map sector planes + 3D floors (WAD and/or mod)
+	g.applySlopes()                     // tilt this level's sectors, if any are defined
 	if dn := g.levelDisplayName(); dn != "" && dn != g.Level.Name {
 		log.Printf("engine: %s — %q", g.Level.Name, dn)
 	}
@@ -658,13 +646,25 @@ func NewGame(win *window.Window, renderer render.Renderer, ras *raster.Renderer,
 	// The player's own map object: monsters target it, and it's a solid
 	// body they bump into. Not in g.mobjs (never ticked or drawn); kept in
 	// sync with the Camera at the top of every tic (see runTic).
+	// cam.Z was resolved by StartCamera before this Game (and its SLOPES
+	// data) existed, so it reflects the sector's flat scalar height even if
+	// applySlopes just tilted it — re-resolve against the sector's actual
+	// (possibly tilted) floor now that we can. A mismatch self-corrects
+	// within a frame either way (resolvePlayerZ snaps to the real floor the
+	// first time it runs), but there's no reason to spawn wrong even for
+	// one frame when fixing it here is this cheap.
+	floorZ := cam.Z - EyeHeight
+	if sec := bsp.PointSector(g.BSP, g.Level, float32(cam.X), float32(cam.Y)); sec != nil {
+		floorZ = sec.FloorZAt(cam.X, cam.Y)
+	}
 	g.playerMobj = &Mobj{
 		Type: MT_PLAYER, Info: &mobjInfo[MT_PLAYER],
 		Health: g.Player.Health, Flags: mobjInfo[MT_PLAYER].Flags,
 		Radius: mobjInfo[MT_PLAYER].Radius, Height: mobjInfo[MT_PLAYER].Height,
-		X: cam.X, Y: cam.Y, Z: cam.Z - EyeHeight, Angle: cam.Angle,
+		X: cam.X, Y: cam.Y, Z: floorZ, Angle: cam.Angle,
 	}
-	g.groundPlayer(cam.Z - EyeHeight)
+	g.Camera.Z = floorZ + EyeHeight
+	g.groundPlayer(floorZ)
 	return g
 }
 
@@ -776,45 +776,31 @@ func emaMS(prev float64, d time.Duration) float64 {
 	return prev*smoothing + ms*(1-smoothing)
 }
 
-// renderFrame rasterizes the world on the CPU, overlays the in-flight
-// projectiles, map objects, viewmodel and HUD, then hands the result to the
-// GPU backend: the enhanced path uploads a G-buffer plus a separate crisp
-// overlay, the vanilla path a single pre-composited image.
+// renderFrame walks the BSP into a GPU triangle list, overlays the in-flight
+// projectiles, map objects, viewmodel and HUD onto the 2D overlay plane, and
+// hands both to the Vulkan hardware backend for one frame.
 func (g *Game) renderFrame() error {
-	g.Raster.SetAnimTime(g.renderClock) // water ripple (software path; harmless otherwise)
-	if g.HardwareMode {
-		// GPU-geometry path: no CPU world render — just prep the 2D overlay
-		// plane's per-frame lifecycle. The world + billboards go to the GPU
-		// below.
-		g.Raster.BeginOverlayFrame()
-	} else {
-		g.Raster.Render(g.Level, g.BSP, g.Camera)
-		// Soft contact shadow on the floor under every grounded thing + the
-		// player, before anything is drawn on top of it.
-		g.drawGroundShadows()
-		// Only the true-projectile weapons (Rocket Launcher, Plasma Rifle,
-		// BFG9000) ever populate g.projectiles; the hitscan weapons never do,
-		// so this loop is simply a no-op for them.
-		for _, p := range g.projectiles {
-			if name, ok := p.CurrentSprite(); ok {
-				g.Raster.DrawWorldSprite(g.Camera, p.X, p.Y, p.Z, p.SizeMultiplier(), name)
-			}
-		}
-		g.drawMobjs()
-		// Distance fog over the finished world + sprites (vanilla path; the
-		// enhanced pipeline fogs in light.frag, hardware in world.frag).
-		if !g.LitMode {
-			g.Raster.ApplyFog()
-		}
+	// RocketFollow: render from the followed rocket's chase-cam pose
+	// instead of the player's own — g.Camera itself is swapped for the
+	// duration of this call only (every geometry/sprite/light/HUD read
+	// below goes through it unchanged) and restored before returning, so
+	// player movement and every other system next frame are none the
+	// wiser. See the g.rocketCam field's own doc comment.
+	if g.rocketCam != nil {
+		realCam := g.Camera
+		g.Camera = rocketFollowCamera(g.rocketCam, realCam.FOVDeg)
+		defer func() { g.Camera = realCam }()
 	}
-	if !g.playerDead {
-		def := Weapons[g.Weapon.Current]
-		gunFrame, flashFrame, hasFlash := g.currentSprite()
+	// No CPU world render — just prep the 2D overlay plane's per-frame
+	// lifecycle. The world + billboards go to the GPU below.
+	g.Raster.BeginOverlayFrame()
+	if !g.playerDead && g.rocketCam == nil {
+		gunPrefix, gunFrame, flashPrefix, flashFrame, hasFlash := g.currentSprite()
 		// The held weapon dims with the sector the player is standing in,
 		// the way vanilla shades a psprite (the muzzle flash stays full
 		// bright).
 		bobX, bobY, bobScale := g.weaponBob()
-		g.Raster.DrawWeapon(def.SpritePrefix, gunFrame, def.FlashPrefix, flashFrame, hasFlash, g.Weapon.Offset,
+		g.Raster.DrawWeapon(gunPrefix, gunFrame, flashPrefix, flashFrame, hasFlash, g.Weapon.Offset,
 			bobX, bobY, bobScale, g.spriteSectorLight(g.Camera.X, g.Camera.Y))
 		if g.Crosshair != "" && g.Crosshair != "off" {
 			g.Raster.DrawCrosshair(g.Crosshair, g.CrosshairSize)
@@ -828,131 +814,113 @@ func (g *Game) renderFrame() error {
 			fmt.Sprintf("ANGLE %.0f PITCH %.0f", g.Camera.Angle*180/math.Pi, g.Camera.Pitch*180/math.Pi),
 		})
 	}
-	if g.HardwareMode {
-		// GPU-geometry path: walk the BSP into a triangle list, add a
-		// camera-facing billboard per live thing / projectile, and let the GPU
-		// rasterise + shade it. The 2D overlay draws above (weapon / HUD /
-		// crosshair) landed in the crisp overlay plane, which the GPU blends
-		// over the world.
-		buildStart := time.Now()
-		fov := g.Camera.FOVDeg
-		if fov <= 0 {
-			fov = 90
-		}
-		geomChanged := g.worldGeomChanged() // reads authoritative (pre-interp) heights
-		animChanged := g.animFrameChanged() // an animated flat/texture stepped a frame
-		restoreSecH := g.applySectorInterp()
-		// heightsChanged must run every frame (its snapshot update is a side
-		// effect other frames' comparisons depend on) even though it's only
-		// consulted when sectorInterpActive — see its own doc comment on why
-		// that check exists at all: a mid-glide mover reinterpolates every
-		// render frame, but most of those frames round to the exact same
-		// int16 height as the one before, and rebuilding for one of those
-		// would be a full-level Invalidate + a blocking GPU re-upload for no
-		// visual difference.
-		heightsChanged := g.renderedSectorHeightsChanged()
-		if geomChanged || animChanged || (g.sectorInterpActive && heightsChanged) {
-			// A mover changed a sector height between tics, an animated
-			// flat/wall texture advanced, or one is mid-glide this frame AND
-			// actually moved since the last frame we rebuilt for — rebuild
-			// the static geometry (its texture bindings are baked in, and the
-			// height version needs to track interpolation, not 35Hz).
-			g.WorldBuilder.Invalidate()
-		}
-		geom := g.WorldBuilder.Build(float32(g.Camera.X), float32(g.Camera.Y))
-		restoreSecH() // authoritative heights back before anything else reads them
-		sprites, voxels := g.collectWorldObjects()
-		if g.Voxels != nil && !g.loggedVoxelStatus && len(sprites)+len(voxels) > 0 {
-			g.loggedVoxelStatus = true
-			log.Printf("engine: [hw] map objects this frame — %d voxel instance(s), %d sprite(s) to the GPU voxel/billboard pass",
-				len(voxels), len(sprites))
-		}
-		g.WorldBuilder.AddSprites(g.Camera.Angle, sprites)
-		g.WorldBuilder.AddVoxels(voxels)
-		wc := worldgeo.Camera{
-			X: g.Camera.X, Y: g.Camera.Y, Z: g.Camera.Z,
-			Angle: g.Camera.Angle, Pitch: g.Camera.Pitch, FOVDeg: fov,
-			Time: g.renderClock, // world.frag water ripple
-			FogR: g.fogR, FogG: g.fogG, FogB: g.fogB, FogDensity: g.fogDensity,
-			CartoonShading: g.cartoonShading,
-		}
-		// Dynamic point lights (muzzle flash, projectile glow, map lights) —
-		// world.frag adds a smooth 1-(d/R)^2 falloff on top of the vanilla
-		// sector/distance fade.
-		lights, dynamicN := g.collectLights()
-		// The present pass traces screen-space shadow rays for the leading
-		// lights: every dynamic emitter (muzzle flash, in-flight shots,
-		// monster attacks), then up to two of the nearest map emitters
-		// (torches), capped at the shader's 8-light loop. Same order as the
-		// light array the world UBO packs, so the blit just reads
-		// lightPos[0..N).
-		shadowN := dynamicN
-		if extra := len(lights) - dynamicN; extra > 0 {
-			shadowN += min(extra, 2)
-		}
-		if shadowN > 8 {
-			shadowN = 8
-		}
-		wc.ShadowCasterN = shadowN
-		// Full-frame tint when the player is standing in a damaging liquid.
-		wc.TintR, wc.TintG, wc.TintB, wc.TintA = g.hwLiquidTint()
-		// Soft contact-shadow blobs on the floor under grounded things.
-		wc.GroundShadows = g.collectGroundShadows()
-		// Head-mounted flashlight (F) — a forward cone, separate from the
-		// point lights above.
-		if spot, ok := g.flashlightSpot(); ok {
-			wc.SpotX, wc.SpotY, wc.SpotZ = spot.X, spot.Y, spot.Z
-			wc.SpotDX, wc.SpotDY, wc.SpotDZ = spot.DX, spot.DY, spot.DZ
-			wc.SpotR, wc.SpotG, wc.SpotB = spot.R, spot.G, spot.B
-			wc.SpotIntensity, wc.SpotRadius = spot.Intensity, spot.Radius
-			wc.SpotCosOuter, wc.SpotCosInner = spot.CosOuter, spot.CosInner
-		}
-		// Static-geometry visibility culling (see the "vivid-gliding-river"
-		// plan doc): tests every StaticDraws entry's grid cell against this
-		// frame's camera and records the result on geom.StaticDrawVisible —
-		// render/vulkan/world.go's colour pass reads that to skip drawing
-		// what's out of view. Must run every frame (not just the debug-log
-		// window below): it's the actual cull now, not only a diagnostic.
-		visD, totD, visV, totV := g.WorldBuilder.UpdateVisibility(wc)
-		g.dbgBuildMS = emaMS(g.dbgBuildMS, time.Since(buildStart))
-		drawStart := time.Now()
-		err := g.Renderer.DrawWorld(geom, wc, g.Raster.Width, g.Raster.Height, g.Raster.Overlay(), lights)
-		g.dbgDrawMS = emaMS(g.dbgDrawMS, time.Since(drawStart))
-		if g.dbgHWFrames < 5400 {
-			g.dbgHWFrames++
-			if g.dbgHWFrames <= 3 || g.dbgHWFrames%1800 == 0 {
-				log.Printf("engine: [hw] frame %d — collectLights -> %d light(s) to DrawWorld", g.dbgHWFrames, len(lights))
-				log.Printf("engine: [hw] frame %d — visibility grid: %d/%d draws, %d/%d verts drawn (culled %.0f%%)",
-					g.dbgHWFrames, visD, totD, visV, totV, 100*(1-float64(visD)/float64(max(totD, 1))))
-				// Per-stage smoothed frame time: sim = every System +
-				// stepSimulation (CPU gameplay), build = BSP walk/geometry
-				// prep/visibility culling above (CPU, this engine's own
-				// code), draw = DrawWorld's command recording + submit +
-				// whatever fence wait it hits (Vulkan driver/GPU territory —
-				// see dbgDrawMS's own doc comment on why this is the number
-				// to compare across OSes/drivers).
-				log.Printf("engine: [hw] frame %d — timing: sim=%.2fms build=%.2fms draw=%.2fms (fps %.0f)",
-					g.dbgHWFrames, g.dbgSimMS, g.dbgBuildMS, g.dbgDrawMS, g.fps)
-			}
-		}
-		if err != nil {
-			return fmt.Errorf("engine: draw world: %w", err)
-		}
-		return nil
+	// Walk the BSP into a triangle list, add a camera-facing billboard per
+	// live thing / projectile, and let the GPU rasterise + shade it. The 2D
+	// overlay draws above (weapon / HUD / crosshair) landed in the crisp
+	// overlay plane, which the GPU blends over the world.
+	buildStart := time.Now()
+	fov := g.Camera.FOVDeg
+	if fov <= 0 {
+		fov = 90
 	}
-	if g.LitMode {
-		// Enhanced: the overlay is uploaded separately and composited on the
-		// GPU after tonemapping, so it stays crisp and unlit.
-		if err := g.Renderer.DrawFrameLit(g.buildFrame()); err != nil {
-			return fmt.Errorf("engine: draw frame: %w", err)
-		}
-		return nil
+	geomChanged := g.worldGeomChanged() // reads authoritative (pre-interp) heights
+	animChanged := g.animFrameChanged() // an animated flat/texture stepped a frame
+	restoreSecH := g.applySectorInterp()
+	// heightsChanged must run every frame (its snapshot update is a side
+	// effect other frames' comparisons depend on) even though it's only
+	// consulted when sectorInterpActive — see its own doc comment on why
+	// that check exists at all: a mid-glide mover reinterpolates every
+	// render frame, but most of those frames round to the exact same
+	// int16 height as the one before, and rebuilding for one of those
+	// would be a full-level Invalidate + a blocking GPU re-upload for no
+	// visual difference.
+	heightsChanged := g.renderedSectorHeightsChanged()
+	if geomChanged || animChanged || (g.sectorInterpActive && heightsChanged) {
+		// A mover changed a sector height between tics, an animated
+		// flat/wall texture advanced, or one is mid-glide this frame AND
+		// actually moved since the last frame we rebuilt for — rebuild
+		// the static geometry (its texture bindings are baked in, and the
+		// height version needs to track interpolation, not 35Hz).
+		g.WorldBuilder.Invalidate()
 	}
-	// Vanilla: scale the 320x200 HUD/weapon overlay onto the full-res frame,
-	// then blit the finished image.
-	g.Raster.CompositeOverlay()
-	if err := g.Renderer.DrawFrame(g.Raster.Pix); err != nil {
-		return fmt.Errorf("engine: draw frame: %w", err)
+	geom := g.WorldBuilder.Build(float32(g.Camera.X), float32(g.Camera.Y))
+	restoreSecH() // authoritative heights back before anything else reads them
+	sprites, voxels := g.collectWorldObjects()
+	if g.Voxels != nil && !g.loggedVoxelStatus && len(sprites)+len(voxels) > 0 {
+		g.loggedVoxelStatus = true
+		log.Printf("engine: [hw] map objects this frame — %d voxel instance(s), %d sprite(s) to the GPU voxel/billboard pass",
+			len(voxels), len(sprites))
+	}
+	g.WorldBuilder.AddSprites(g.Camera.Angle, sprites)
+	g.WorldBuilder.AddVoxels(voxels)
+	wc := worldgeo.Camera{
+		X: g.Camera.X, Y: g.Camera.Y, Z: g.Camera.Z,
+		Angle: g.Camera.Angle, Pitch: g.Camera.Pitch, FOVDeg: fov,
+		Time: g.renderClock, // world.frag water ripple
+		FogR: g.fogR, FogG: g.fogG, FogB: g.fogB, FogDensity: g.fogDensity,
+		CartoonShading: g.cartoonShading,
+	}
+	// Dynamic point lights (muzzle flash, projectile glow, map lights) —
+	// world.frag adds a smooth 1-(d/R)^2 falloff on top of the vanilla
+	// sector/distance fade.
+	lights, dynamicN := g.collectLights()
+	// The present pass traces screen-space shadow rays for the leading
+	// lights: every dynamic emitter (muzzle flash, in-flight shots,
+	// monster attacks), then up to two of the nearest map emitters
+	// (torches), capped at the shader's 8-light loop. Same order as the
+	// light array the world UBO packs, so the blit just reads
+	// lightPos[0..N).
+	shadowN := dynamicN
+	if extra := len(lights) - dynamicN; extra > 0 {
+		shadowN += min(extra, 2)
+	}
+	if shadowN > 8 {
+		shadowN = 8
+	}
+	wc.ShadowCasterN = shadowN
+	// Full-frame tint when the player is standing in a damaging liquid.
+	wc.TintR, wc.TintG, wc.TintB, wc.TintA = g.hwLiquidTint()
+	// Soft contact-shadow blobs on the floor under grounded things.
+	wc.GroundShadows = g.collectGroundShadows()
+	// Head-mounted flashlight (F) — a forward cone, separate from the
+	// point lights above.
+	if spot, ok := g.flashlightSpot(); ok {
+		wc.SpotX, wc.SpotY, wc.SpotZ = spot.X, spot.Y, spot.Z
+		wc.SpotDX, wc.SpotDY, wc.SpotDZ = spot.DX, spot.DY, spot.DZ
+		wc.SpotR, wc.SpotG, wc.SpotB = spot.R, spot.G, spot.B
+		wc.SpotIntensity, wc.SpotRadius = spot.Intensity, spot.Radius
+		wc.SpotCosOuter, wc.SpotCosInner = spot.CosOuter, spot.CosInner
+	}
+	// Static-geometry visibility culling (see the "vivid-gliding-river"
+	// plan doc): tests every StaticDraws entry's grid cell against this
+	// frame's camera and records the result on geom.StaticDrawVisible —
+	// render/vulkan/world.go's colour pass reads that to skip drawing
+	// what's out of view. Must run every frame (not just the debug-log
+	// window below): it's the actual cull now, not only a diagnostic.
+	visD, totD, visV, totV := g.WorldBuilder.UpdateVisibility(wc)
+	g.dbgBuildMS = emaMS(g.dbgBuildMS, time.Since(buildStart))
+	drawStart := time.Now()
+	err := g.Renderer.DrawWorld(geom, wc, g.Raster.Width, g.Raster.Height, g.Raster.Overlay(), lights)
+	g.dbgDrawMS = emaMS(g.dbgDrawMS, time.Since(drawStart))
+	if g.dbgHWFrames < 5400 {
+		g.dbgHWFrames++
+		if g.dbgHWFrames <= 3 || g.dbgHWFrames%1800 == 0 {
+			log.Printf("engine: [hw] frame %d — collectLights -> %d light(s) to DrawWorld", g.dbgHWFrames, len(lights))
+			log.Printf("engine: [hw] frame %d — visibility grid: %d/%d draws, %d/%d verts drawn (culled %.0f%%)",
+				g.dbgHWFrames, visD, totD, visV, totV, 100*(1-float64(visD)/float64(max(totD, 1))))
+			// Per-stage smoothed frame time: sim = every System +
+			// stepSimulation (CPU gameplay), build = BSP walk/geometry
+			// prep/visibility culling above (CPU, this engine's own
+			// code), draw = DrawWorld's command recording + submit +
+			// whatever fence wait it hits (Vulkan driver/GPU territory —
+			// see dbgDrawMS's own doc comment on why this is the number
+			// to compare across OSes/drivers).
+			log.Printf("engine: [hw] frame %d — timing: sim=%.2fms build=%.2fms draw=%.2fms (fps %.0f)",
+				g.dbgHWFrames, g.dbgSimMS, g.dbgBuildMS, g.dbgDrawMS, g.fps)
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("engine: draw world: %w", err)
 	}
 	return nil
 }
@@ -972,31 +940,34 @@ func (g *Game) capFrameRate(frameStart time.Time) {
 
 // mouseLook applies one mouse delta (window pixels: +mdx right, +mdy down —
 // see window.Window.MouseDelta) to a yaw/pitch pair and returns the new
-// values, pitch clamped to +-raster.MaxPitch. sens is radians of rotation
-// per pixel (Game.MouseSensitivity).
+// values, pitch clamped to +-maxPitch. sens is radians of rotation per pixel
+// (Game.MouseSensitivity). maxPitch is worldgeo.MaxPitch (89°) — see
+// applyMouseLook.
 //
 // Mouse-right turns the view right, a *decreasing* Camera.Angle (Angle
 // increases counter-clockwise, matching the Left/Right arrow keys). By
 // default mouse-up (GLFW y decreases upward) looks up, an *increasing*
 // Camera.Pitch; invertY flips that so pushing the mouse forward looks down,
 // the "flight-stick" convention some players prefer.
-func mouseLook(angle, pitch, mdx, mdy, sens float64, invertY bool) (float64, float64) {
+func mouseLook(angle, pitch, mdx, mdy, sens, maxPitch float64, invertY bool) (float64, float64) {
 	angle -= mdx * sens
 	pitchDelta := mdy * sens
 	if invertY {
 		pitchDelta = -pitchDelta
 	}
-	pitch = clamp(pitch-pitchDelta, -raster.MaxPitch, raster.MaxPitch)
+	pitch = clamp(pitch-pitchDelta, -maxPitch, maxPitch)
 	return angle, pitch
 }
 
 // applyMouseLook feeds one mouse delta through mouseLook into the camera,
 // using this Game's MouseSensitivity and InvertMouseY. Split out of
 // handleMovement so the config-to-camera path is directly testable without
-// a live window.
+// a live window. The pitch clamp is worldgeo.MaxPitch (89°) — the true
+// camera rotation (see worldgeo.CameraBasis) only needs to stay short of the
+// singularity at true vertical.
 func (g *Game) applyMouseLook(mdx, mdy float64) {
 	g.Camera.Angle, g.Camera.Pitch = mouseLook(
-		g.Camera.Angle, g.Camera.Pitch, mdx, mdy, g.MouseSensitivity, g.InvertMouseY)
+		g.Camera.Angle, g.Camera.Pitch, mdx, mdy, g.MouseSensitivity, worldgeo.MaxPitch, g.InvertMouseY)
 }
 
 // handleMovement is Phase 2's placeholder input scheme: WASD relative to
@@ -1115,12 +1086,14 @@ func (g *Game) handleMovement(dt float32) {
 // sector lookup, the hard-landing "oof" + view dip, and the eye-under-
 // ceiling clamp handleMovement used to do unconditionally.
 func (g *Game) resolvePlayerZ(dt float64) {
-	sec := bsp.PointSector(g.BSP, g.Level, float32(g.Camera.X), float32(g.Camera.Y))
-	if sec == nil {
+	secIdx := bsp.PointSectorIndex(g.BSP, g.Level, float32(g.Camera.X), float32(g.Camera.Y))
+	if secIdx < 0 {
 		g.Camera.Z = g.PlayerZ + EyeHeight // outside geometry — just hold
 		return
 	}
-	floor, ceil := float64(sec.FloorHeight), float64(sec.CeilingHeight)
+	// g.PlayerZ (this tic's starting height, before fallStep below moves it)
+	// picks which room-over-room band applies — see planeAt.
+	floor, ceil, _ := g.planeAt(secIdx, g.Camera.X, g.Camera.Y, g.PlayerZ)
 
 	// Heretic Wings of Wrath: free vertical movement, no gravity or fall
 	// damage. Space rises, no key sinks slowly; clamp between the floor and

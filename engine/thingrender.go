@@ -41,7 +41,7 @@ func ThingRenderInfo(lvl *wad.Level, tree bsp.Node, t wad.Thing) (prefix string,
 
 	floor, ceil := -32768.0, 32768.0
 	if sec := bsp.PointSector(tree, lvl, float32(t.X), float32(t.Y)); sec != nil {
-		floor, ceil = float64(sec.FloorHeight), float64(sec.CeilingHeight)
+		floor, ceil = sec.FloorZAt(float64(t.X), float64(t.Y)), sec.CeilZAt(float64(t.X), float64(t.Y))
 	}
 	z = floor
 	if info.Flags&MF_SPAWNCEILING != 0 {

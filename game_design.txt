@@ -7,27 +7,24 @@ here lives in git history, not this file.
 1. OVERVIEW
 -----------
 TwoPointFive is a Go engine that plays real Doom / Doom II WAD files as a
-fake-3D ("2.5D") first-person shooter, in the architectural spirit of id
-Software's 1993 engine. A CPU software rasterizer walks the level's own
-precomputed BSP tree front-to-back and draws textured walls, floors and
-ceilings one screen column at a time — the same algorithm the original
-used, only fanned across CPU cores by vertical screen strip and run at a
-configurable internal resolution.
+first-person shooter, in the architectural spirit of id Software's 1993
+engine. The level's own precomputed BSP tree is walked on the CPU
+front-to-back into a flat, per-texture-grouped triangle list
+(render/worldgeo), and a Vulkan hardware renderer (render/vulkan) does the
+actual rasterizing, texturing, depth-testing and shading on the GPU — the
+"software rasterizer" this project started from has been fully replaced by
+this GPU-geometry path; there is no CPU fallback.
 
-Lighting is the GPU's job by default. In "enhanced" mode (config
-lightingMode, the shipped default) the CPU emits a G-buffer — unlit albedo,
-packed surface normal, per-pixel sector light, camera-space depth — and a
-multi-pass Vulkan pipeline does the shading: a smooth version of vanilla's
-sector/distance fade as the base, plus dynamic coloured point lights (map
-torches and lamps, animated-light sectors, the weapon muzzle flash,
-in-flight rockets/plasma/BFG, explosions), screen-space shadows for the
-few gameplay-critical lights, an optional floor contact-shadow blob under
-things, HDR, bloom and a highlight soft-knee. "vanilla" mode — the CPU
-bakes the exact PrBoom sector/distance shade into the frame and the GPU
-only blits it, letterboxed and linearly upscaled — is the fallback for a
-GPU that can't stand the enhanced pipeline up. Either way, a global
-lightScale (config) dims or brightens the whole map; the default is
-deliberately moodier than id's.
+Lighting is entirely the GPU's job: world.frag computes a continuous
+version of vanilla's sector/distance fade as the base, then adds dynamic
+coloured point lights (map torches and lamps, animated-light sectors, the
+weapon muzzle flash, in-flight rockets/plasma/BFG, explosions), the head-
+mounted flashlight's spot cone, screen-space shadows and ambient occlusion
+for the nearby geometry, a floor contact-shadow blob under things, water/
+lava/nukage shading with real screen-space reflections, HDR, bloom, FXAA,
+sharpening and an optional cel-shaded "cartoon" look. A global lightScale
+(config) dims or brightens the whole map; the default is deliberately
+moodier than id's.
 
 The engine ships no game data. A pre-game launcher (section 22) picks the
 WAD and level and edits every setting: the freely redistributable shareware
@@ -35,8 +32,9 @@ DOOM1.WAD, a retail IWAD, or a PWAD (merged with a base IWAD automatically
 — section 2). A companion executable, cmd/isoengine, renders the same
 simulation as a top-down isometric game (section 23). A second companion,
 cmd/editor, is a dual 2D/3D level editor built on this same stack — it
-renders a map's live geometry through the same software rasterizer the
-game uses, and saves a PWAD the engine loads straight back (section 25).
+renders a map's live geometry through the same hardware (GPU-geometry)
+renderer the game uses, and saves a PWAD the engine loads straight back
+(section 25).
 
 Module `twopointfive`, Go 1.26. Windows and Linux (X11, RADV/Mesa) are both
 exercised; macOS is untested. Only the MUS/MIDI music path is Windows-
@@ -179,15 +177,18 @@ rather than embedding is deliberate — section 18.
     assets/mods/     drop-in .pk3s / loose files mounted at startup via
                      assets/vfs; GLDEFS and UMAPINFO are read from here
                      (§14). Gitignored but for *.example + README.txt
-    raster/          CPU software rasterizer — the actual 3D renderer,
-                     multithreaded across vertical screen strips
-    render/          backend-agnostic Renderer interface + Frame/Light types
+    raster/          the 2D overlay compositor — weapon viewmodel, status
+                     bar, crosshair, debug HUD text — plus the sector/
+                     distance shading tables the hardware shader also reads
+    render/          backend-agnostic Renderer interface + the Light type
     render/worldgeo/ BSP walk -> static triangle list for the GPU-geometry
                      renderer(s); ViewProj + the isometric IsoCamera/
                      IsoViewProj/IsoUnprojectToGround math (camera_iso.go)
-    render/vulkan/   Vulkan: GPU upload + fullscreen blit, the optional
-                     deferred-lighting chain, the hardware world path, and
-                     the isometric world path (isosetup.go / isoworld.go)
+    render/vulkan/   Vulkan: instance/device/swapchain setup, a plain
+                     CPU-buffer blit path (used by the launcher and editor's
+                     own 2D GUIs, not by the game), the hardware
+                     (GPU-geometry) world path, and the isometric world path
+                     (isosetup.go / isoworld.go)
     window/          GLFW window/input + the WAD picker + the launcher's
                      menu-key / raw-typed-char plumbing
     audio/           one PrBoom-style software mixer (oto) for effects +
@@ -243,11 +244,14 @@ playSession(path, mapName, cfg, wad, dev, music):
       -> bsp.Build(level)                 reconstruct the BSP tree
       -> assets.New(wad)                  palette + texture/flat/sprite resolver
       -> window.New(w,h,title,fullscreen) open the GLFW/Vulkan window
-      -> raster.New(textures, rw, rh)     CPU rasterizer + disk skybox, at the
+      -> raster.New(textures, rw, rh)     the 2D overlay compositor, at the
                                           resolved render resolution
-      -> vulkan.New / NewWorld(...)       GPU instance/device/swapchain/pipeline
-                                          (NewWorld for renderer "hardware")
+      -> vulkan.NewWorld(...)             GPU instance/device/swapchain/
+                                          pipeline for the hardware
+                                          (GPU-geometry) path — the only
+                                          renderer; a failed init is fatal
       -> engine.NewGame(...)              wire it into a Game
+      -> game.WorldBuilder = worldgeo.New(level, tree, textures)
       -> assets.LoadVoxelPackDir(...)     Doom1/Doom2 voxel models, optional
       -> game.Run()                       main loop until the window closes;
                                           each startup stage is timed
@@ -274,28 +278,26 @@ updateFPS / renderFrame / capFrameRate):
      service a pending level exit.
   4. fold the frame rate into an EMA for the debug HUD; advance
      g.renderClock by dt (the free-running seconds value the water ripple
-     animates against — SetAnimTime for the software path, worldgeo.Camera
-     .Time for the hardware one).
-  5. rasterize and present: raster.Renderer.Render draws the 3D view at the
-     render resolution, fanned across one worker per vertical strip; then
-     the optional ground shadows, in-flight projectiles, and the map
-     objects — voxel models or sprites, section 20, via DrawThings — draw
-     on top, DrawThings fanned across the same strips; then the weapon
-     viewmodel, status bar and optional debug HUD go into the 2D overlay.
-     Vanilla: the
-     overlay is composited into the frame and
-     render.Renderer.DrawFrame uploads the one image. Enhanced: the CPU
-     emitted a G-buffer instead (shade + overlay composite skipped) and
-     DrawFrameLit takes it plus the frame's dynamic lights for the GPU to
-     light, bloom and tonemap.
+     animates against — worldgeo.Camera.Time).
+  5. build and present: the weapon viewmodel, status bar and optional
+     debug HUD draw into raster's 2D overlay plane (raster.Renderer never
+     touches the 3D world or Vulkan at all any more). Meanwhile
+     WorldBuilder walks the BSP into a triangle list (rebuilt only when a
+     door/lift moves a sector height or an animated texture steps a
+     frame), the frame's map objects/projectiles are collected as sprite
+     billboards or voxel instances, this frame's dynamic lights are
+     gathered (collectLights), and render.Renderer.DrawWorld hands all of
+     it — the triangle list, the camera, the overlay plane, the lights —
+     to the GPU, which rasterizes, textures, shades and presents it in one
+     pass.
   6. optionally sleep out the rest of the frame budget (only when config
      maxFPS > 0).
 
-The CPU rasterizer and the GPU renderer are deliberately separate
-concerns: raster.Renderer never touches Vulkan, and render/vulkan never
-sees a BSP tree or a Sector — only a finished RGBA8 rectangle, or in
-enhanced mode a G-buffer plus a plain []render.Light, still no engine
-types.
+raster.Renderer and render/vulkan are deliberately separate concerns:
+raster never touches Vulkan or the 3D world, and render/vulkan never sees
+a BSP tree or a Sector directly — only the worldgeo triangle list, a
+camera, a plain []render.Light, and raster's finished overlay plane to
+blend on top.
 
 
 5. PACKAGE wad — THE WAD FILE FORMAT
@@ -402,9 +404,12 @@ PointSector both build on.
 assets.Textures (built once per WAD by assets.New) resolves named wall
 textures, flats and sprites into assets.RGBA bitmaps — already
 palette-resolved, 4 B/pixel — decoding lazily and caching by name. The
-caches are mutex-guarded: the raster renderer resolves a seg's textures
-from several strip workers at once, so first-touch decode-and-cache is
-serialised (cheap — once per name, a hit is a map read).
+caches are guarded by an RWMutex: render/worldgeo's Builder resolves every
+seg's textures while building the static geometry, and the hardware
+renderer's texture sync reads them back, so a cache hit (the overwhelming
+common case, after the first frame) takes only a read lock and many
+callers can resolve concurrently; a genuine miss takes the write lock to
+decode and insert.
 
   WallTexture(name)  composite TEXTURE1/TEXTURE2 texture; falls back to a
                      magenta/black checkerboard for an unresolvable name
@@ -431,296 +436,57 @@ builds the sprite-frame index (id's R_InitSpriteDefs) the renderer uses to
 pick an 8-way rotation.
 
 
-8. PACKAGE raster — THE CPU SOFTWARE RASTERIZER
-----------------------------------------------
-raster.Renderer owns an RGBA8 framebuffer (raster.Pix) at a caller-chosen
-size — raster.New(textures, width, height) — and draws one
-Level/BSP/Camera into it per Render call. cmd/engine sizes it from
-config.json (section 17); raster.InternalWidth / InternalHeight (320x200,
-vanilla's own) are the fallback and the 16:10 reference the horizontal FOV
-is calibrated against. The upscale to the window is the GPU's linear
-filter, not this package — which keeps the soft low-res look.
+8. PACKAGE raster — THE 2D OVERLAY
+-----------------------------------
+raster.Renderer draws the 2D overlay plane every frame — the weapon
+viewmodel, status bar, crosshair and debug HUD text — into a straight-alpha
+RGBA8 buffer (raster.Overlay()) that render.Renderer.DrawWorld blends on
+top of the GPU-rendered world (section 9). It does no 3D-world drawing of
+its own and never touches Vulkan.
 
-Render aspects wider or narrower than the 16:10 reference are Hor+: the
-vertical FOV is held and the horizontal view widens (referenceAspect /
-vFOV math in Render), so 16:9 or 21:9 shows more to the sides, never a
-stretched frame.
+raster.New(textures, width, height) sizes the overlay plane to the render
+resolution (raster.InternalWidth / InternalHeight, 320x200, are the
+fallback when a non-positive size is given) and resolves the weapon/HUD
+sprites and fonts through the given assets.Textures. raster.Camera (X, Y,
+Z in map units, Angle radians CCW from +X, Pitch radians up+/down-,
+FOVDeg) is the engine's one canonical camera type, used throughout —
+worldgeo.Camera is built from it each frame for the hardware renderer
+(section 9), which clamps Pitch to worldgeo.MaxPitch (89 degrees) — a true
+3D camera rotation, not a shear, so it can look almost straight up or
+down.
 
-raster.Camera: X, Y, Z (map units, the WAD's own space), Angle (radians, 0
-= +X / east, CCW), Pitch (radians up+/down-, clamped to raster.MaxPitch =
-32 degrees by the engine's mouselook), FOVDeg (cmd/engine sets it from
-config; struct default 90).
-
-Screen-strip parallelism. New splits [0, Width) into GOMAXPROCS strips
-(clamped so none is narrower than minStripWidth = 32), each a stripCtx
-holding its inclusive column range plus its own ceilClip/floorClip
-occlusion slices. Every frame runs two parallel passes (one goroutine per
-strip, the first on the caller's):
-  Pass 1  clears Pix / depth / overlay in contiguous byte partitions
-          (memmove-friendly, independent of the column split) and resets
-          each strip's clips; a barrier follows. Normal and LightParam are
-          NOT cleared — every G-buffer draw path writes them alongside
-          depth for every pixel it covers, and the lighting shader reads
-          them only where depth != +Inf, so a pixel nothing drew this
-          frame keeps stale bytes that are never sampled. Skipping those
-          two full-plane memsets is real memory-bandwidth saved every
-          frame at high render resolutions.
-  Pass 2  every worker walks the whole BSP front-to-back (a read-only
-          recursion, cheap to repeat) but draws only its own columns, into
-          its private clips and a disjoint set of Pix / depth columns. No
-          framebuffer locking; the only shared mutation is the texture
-          cache (section 7's mutex).
-Strip boundaries don't change a pixel: each column's projected depth and
-texture-X are a direct function of the absolute column (a lerp on x), not
-an accumulator seeded at the loop start, so a strip starting mid-wall gets
-bit-identical values. Verified byte-for-byte against a single-strip render
-(raster/parallel_test.go, also under -race).
-
-Render's algorithm each frame (step 1 once; 2-3 per strip, in parallel):
-  1. Recompute focal length from FOVDeg (pinhole projection) and pitchShear
-     = tan(Pitch)*focal. Pitch is a vertical shear of the whole projection,
-     not true 3D rotation — walls and flats are still projected in the
-     horizontal plane, the classic software-port mouselook approximation.
-     sin/cos of Angle and the per-column sky sample table (buildSkyTable,
-     section 10) are computed here and read-only for the rest of the frame.
-  2. Reset this strip's occlusion state: ceilClip[x] = 0, floorClip[x] =
-     Height — the running "what's already drawn from the top/bottom" bounds
-     every wall/flat span narrows, mirroring Doom's ceilingclip/floorclip.
-  3. bsp.Traverse front-to-back; for each Leaf, render every Seg
-     (renderSeg), its column loop clamped to this strip:
-       - backface cull in WORLD space: the sign of (v1-cam) x (v2-cam)
-         (Doom winds a seg so this is negative only from its front side).
-         Doing it before projection — not as a screen-space sx1 >= sx2
-         test — matters for a seg with one endpoint behind the camera:
-         near-plane clipping can invert sx1/sx2 and wrongly drop a visible
-         wall, and the area past it then reads as black void.
-       - project both endpoints into camera space then screen space
-         (screenX = Width/2 + horiz/depth*focal) after near-plane clipping;
-         a still-degenerate sx1 >= sx2 is skipped.
-       - for each covered, not-yet-occluded column, perspective-interpolate
-         depth and texture-space X, then:
-           one-sided line: ceiling flat down to the wall, the middle
-             texture floor-to-ceiling, floor flat below; close the column.
-           two-sided line: ceiling flat to the (possibly stepped) upper
-             piece if the back ceiling is lower, floor flat to the lower
-             piece if the back floor is higher, and narrow
-             ceilClip/floorClip to what's covered — the gap between the
-             back sector's floor and ceiling is left open, since a
-             subsector visited later in the same walk still draws into it.
-     When G-buffer mode is on, renderSeg also computes the seg's
-     front-facing world normal (the right-hand perpendicular of the v1->v2
-     direction — Doom winds solid space to the right) and carries it in the
-     per-seg segDraw for the wall spans to stamp.
-
-Wall texturing (drawWallSpan) anchors each piece to a world-Z (anchorZ)
-that depends on which piece and the Linedef's ML_DONTPEGTOP /
-ML_DONTPEGBOTTOM flags — ported from id's rw_*texturemid:
-  pieceMiddle (one-sided): unpegged anchors the texture bottom to the
-    floor; default anchors the top to the ceiling.
-  pieceUpper: unpegged (DONTPEGTOP) anchors the top to the front ceiling (a
-    fixed point, so the texture reveals from the bottom as a door's back
-    ceiling rises); default anchors the bottom to the back ceiling
-    (recomputed each frame, so it stays flush with a moving door).
-  pieceLower: default anchors the top to the back floor; unpegged
-    (DONTPEGBOTTOM) anchors to the front ceiling instead — a well-known
-    original quirk, faithfully reproduced.
-Column depth is constant, so world-Z is linear in screen row and texture V
-is a constant per-row add (depth/focal) — this is what stretches a wall up
-close and compresses it far away. drawWallSpan / drawFlatSpan sample the
-texture's Pix slice directly (no per-texel [4]byte copy), mask power-of-two
-dimensions instead of a modulo, and apply lighting as an integer
-multiply-shift.
-
-Flat texturing (drawFlatSpan) is a per-row floor-casting pass — inverting
-the camera projection to recover the world point each pixel's ray hits the
-floor/ceiling plane at — rather than Doom's horizontal visplane spans; it
-fits this renderer's column-major structure more simply.
-
-Brightmaps (drawWallSpan / drawFlatSpan + applyBright). If the loaded packs
-define a brightmap mask for a wall texture or flat (assets.Textures.Brightmap
-— a greyscale PNG under assets/mods/brightmaps/ or assets/textures/brightmaps/,
-resized at load to the base texture's exact pixel dims), each covered texel
-is post-processed: in G-buffer mode the mask value is stamped into
-LightParam.g and light.frag lights the texel to max(sectorFade, mask) plus
-a small (0.2) bloom kicker — bounded, so a stray masked highlight can't blow
-out; the vanilla path (no HDR) scales the shaded pixel up by
-1 + mask*brightBoost (brightBoost 1.0 — a gentle lift, hue preserved).
-`go run ./tools/genbright [WAD ...]` derives a mask set from an IWAD, strict
-by design: a texel must be BRIGHT and VIVIDLY COLOURED (bright grey is a
-metal highlight, not a light), must sit in a solid cluster (>=5 of 8
-neighbours), and a texture whose surviving coverage is still large is
-dropped as a false positive. Output to assets/textures/brightmaps/
-(gitignored); a drop-in pack in assets/mods/brightmaps/ overrides per name.
-The hardware path does the same — world.frag samples the mask through a
-second per-draw sampler (uBright) and uses the same max(fade, mask) model.
-
-Liquid floors (drawFlatSpan + shadeLiquid). classifyFloorLiquid tags a
-floor flat by family prefix — FWATER -> water, LAVA*/FIRELAVA -> lava,
-NUKAGE*/SLIME* -> nukage — onto the per-seg segDraw, and each such pixel is
-post-processed after it is written:
-  water  — the FWATER texel is "the bottom, seen THROUGH the water", kept as
-    the dominant term (translucent, not painted-on). Its sample coords are
-    REFRACTED in the flat span loop by ~1.5*waterWave slope so the bottom
-    shimmers as the water moves. blendWater then: (1) a depth cue from view
-    ANGLE and view DISTANCE — d = 0.14 + 0.55*grazing + 0.34*clamp(dist/620)
-    — so a wide lake reads deeper toward its far side, a puddle underfoot
-    stays shallow; (2) exponential absorption of the bottom by depth — red
-    fastest (exp(-2.3d)), blue slowest (exp(-0.5d)) — fading it to dark
-    blue-green, with a waterWave-crest caustic; (3) a rippled, desaturated
-    hint of the mirrored sky mixed in by a SHARP fresnel (0.02 +
-    0.18*grazing^5), the reflection sample displaced by the wave slope
-    (skyReflectTexel, reusing r.skyTx); (4) a SUN GLINT — one Gaussian spot
-    near the horizon whose column drifts slowly with time and camera yaw,
-    shattered into glitter by crest^5 — a coherent highlight, not a sheen.
-    waterWave is a multi-octave sum-of-sines height field over the pixel's
-    WORLD xy at r.animTime (SetAnimTime, fed g.renderClock). In G-buffer
-    mode the pixel is stamped with the matWater material key (~0.16) so
-    light.frag damps the dynamic-light wash — otherwise firing a weapon
-    near water blew it out. animTime defaults 0 (static) — tests leave it
-    there so serial and parallel renders stay bit-identical; the refraction
-    offset is a pure function of the absolute column, so it does too.
-  lava   — a strong warm additive lift so lava reads hot even unlit, with a
-    slow per-patch pulse (0.92 + 0.13*sin(world xy + time*2.3)) so the glow
-    breathes; in G-buffer mode it also stamps the emissive material key
-    (Normal.a = 255) so the enhanced lighting pass passes it through
-    unshaded (and it blooms).
-  nukage — a milder green additive tint, not emissive.
-The hardware path shades the SAME three the same way in world.frag
-(KIND_LIQUID_* — worldgeo.liquidKindOfFlat tags the floor verts). Separate
-from this, engine/liquidlights.go seeds real dynamic lights over lava/nukage
-sectors so the glow also spills onto surrounding geometry in both backends.
-
-Lighting (raster/light.go) is a direct port of PrBoom's r_main.c
-R_InitLightTables plus the render-time lookups in r_segs.c / r_plane.c.
-Vanilla never multiplies a colour by a brightness — it picks one of
-NUMCOLORMAPS (32) progressively darker COLORMAP rows per wall column and
-per flat pixel:
-
-  lightnum = (sectorLight >> LIGHTSEGSHIFT[4]) + extralight        [0..15]
-  startmap = ((LIGHTLEVELS-1-lightnum)*2) * NUMCOLORMAPS/LIGHTLEVELS
-           = (15 - lightnum) * 4
-  walls: scalelight[lightnum][j], j = clamp(rw_scale>>LIGHTSCALESHIFT,0,47)
-         row = clamp(startmap - j/DISTMAP[2], 0, 31)
-  flats: zlight[lightnum][j], j = clamp(depth/16, 0, 127)
-         row = clamp(startmap - ((160<<12)/(j+1) >> 12)/DISTMAP, 0, 31)
-
-Both tables fade 1/distance from the sector's base row toward row 0
-(identity) point-blank. With no palette to remap, each row collapses to a
-plain multiply, (NUMCOLORMAPS - row)/NUMCOLORMAPS — the near-linear
-approximation GZDoom's software "Doom" light mode uses (row 31 -> 8/256,
-never pure black). Baked at init into [16][48] and [16][128] uint16 arrays
-of 0..256 multipliers, so the hot path is one lookup and a c*m>>8 per
-texel with no float math: drawWallSpan holds one multiplier for a whole
-column (constant depth, via shadeMul), drawFlatSpan re-indexes zlight per
-row (distIdx). The wall scale index uses a fixed 320-wide / 90-degree
-reference (~2560/depth) rather than this renderer's real width/FOV:
-vanilla's scalelight[] carries a SCREENWIDTH/viewwidth term that cancels
-the resolution dependence, so wall brightness stays put across render-scale
-and FOV changes. Walls also get vanilla's "fake contrast": renderSeg
-nudges a perfectly E-W face -16 and an N-S one +16, which after the >>4 is
-r_segs.c's lightnum-- / lightnum++. The sky is always full-bright.
-
-Before any of it, lightnumOf multiplies the raw sector light by the
-package-level lightScale (raster.SetLightScale, from config lightScale),
-clamped back to 0..255. It defaults below 1, so the vanilla map is a touch
-darker than id's; 1.0 is the WAD's authored brightness. The enhanced path
-applies the same factor in the shader (section 9), so the two modes track
-each other.
-
-World sprites shade like walls: blitBillboard darkens the whole billboard
-by one multiplier from spriteShade(sectorLight, depth) — the sprite
-sector's scalelight row at its distance, the same table a wall uses, so a
-thing tracks the brightness of the geometry around it (id's
-R_ProjectSprite, no fake contrast). The engine supplies each sprite's
-sector light (Game.spriteSectorLight, a bsp.PointSector on the mobj's
-x/y). An FF_FULLBRIGHT frame and an emissive sprite (glowing projectile /
-explosion via DrawWorldSprite) skip the shade. The weapon viewmodel dims
-with the player's sector via pspriteShade — spritelights[MAXLIGHTSCALE-1],
-the bright "point-blank" end of that sector's scalelight, so it has no
-distance falloff of its own; the muzzle-flash overlay stays full bright.
-
-Enhanced mode. Everything above is the "vanilla" lighting path. In
-"enhanced" mode Renderer.SetGBuffer(true) makes the wall/flat/sprite/voxel
-draws emit a G-buffer instead: Pix holds unlit albedo, Normal packs the
-surface normal (rgb *0.5+0.5) plus a material key (a: 0 world / ~0.16 water
-/ ~0.5 sprite / >= 0.75 emissive), LightParam.r holds the pixel's sector
-light level and LightParam.g the brightmap self-illumination mask (0
-everywhere but a masked texel), depth is written for sprite pixels too — and CompositeOverlay is
-skipped so the raw overlay can be handed over separately. Renderer.Deferred()
-bundles those planes with the camera parameters a GPU pass needs to invert
-the projection. Vanilla output is byte-for-byte unchanged (every G-buffer
-branch is guarded by the SetGBuffer flag).
-
-Sky (raster/sky.go): buildSkyTable, run once per frame before the strip
-fork, resolves the sky bitmap and fills skyTx[x] — the texture column for
-each screen column, from that column's view angle plus camera yaw. The
-per-column angle (an atan2) is cached and recomputed only when the focal
-length changes. drawSkySpan (dispatched from drawCeilingSpan whenever a
-sector's ceiling texture is exactly "F_SKY1", Doom's one hardcoded special
-flat) is a straight texel copy with an incremental per-row V. A
-stepped-down two-sided line below a sky ceiling with no upper texture is
-filled with sky rather than void, matching vanilla.
-
-Sprites (raster/sprite.go): camera-facing billboards, distance-scaled like
-wall textures. blitBillboard is the shared draw: per pixel it depth-tests
-against r.depth (a Width*Height camera-space depth buffer written by
-drawWallSpan / drawFlatSpan) so a thing is correctly hidden behind level
-geometry, and shaded by sector light + distance. blitBillboard takes a
-column band and only writes inside it. DrawWorldSprite draws one named
-lump, always emissive (the glowing projectile / explosion path); DrawThing
-takes the thing's sector light and fullbright flag and picks the 0..7
-rotation (id's R_ProjectSprite). engine.Game.drawMobjs builds the whole
-frame's []raster.SceneThing (farthest first, culling things behind the
-view plane) and hands it to DrawThings, which resolves voxel-vs-sprite and
-decodes each sprite frame once on the calling goroutine (assets.SpriteFrame
-isn't goroutine-safe), then splats them fanned across the strip workers.
-Sampling
-follows the global config textureQuality (section 16, texfilter.go):
-"nearest" hard pixels; "bilinear" smooths within the sprite; "trilinear"
-and the "anisoNx" modes mip-blend a per-sprite box-filtered chain
-(spritemips.go) by on-screen scale so a distant thing stops shimmering. A
-camera-facing billboard has an isotropic footprint, so the anisotropic
-taps collapse to plain trilinear for sprites. The filtered paths work in
-PREMULTIPLIED alpha (Doom sprites are 1-bit cut-outs; premultiplying keeps
-filtering from fringing the silhouette toward transparent black). In the G-buffer path only
-solidly covered pixels (coverage >= 128) stamp normal / sector light /
-depth; the sub-128 fringe keeps the wall behind it so the GPU lighting
-pass doesn't halo the outline.
-
-Voxel models (raster/voxel.go, section 20) replace that billboard for any
-map object whose current sprite frame the loaded voxel pack has a model
-for. DrawVoxel projects the model through the same camera and splats each
-surface voxel as a small depth-tested square into r.Pix — real 3D geometry
-that turns with the thing's facing and occludes / is occluded through the
-shared r.depth buffer. Shading is the same spriteShade term (or the real
-sector light in the G-buffer path), plus a subtle top-lit term from each
-voxel's KVX face bits. A model shorter than minVoxelHeightPx (24) on screen
-is declined and the flat sprite drawn instead.
-
-Ground shadows (raster/shadow.go, DrawGroundShadow): an optional soft
-contact shadow on the floor under a grounded thing / the player, to
-counter the billboard/splat having no cast shadow of its own. OFF by
-default (config groundShadows) — it reads as a plain dark ellipse up
-close. Called once per caster after Render (r.depth filled) and before the
-sprite/voxel pass, so a thing draws over its own shadow. It projects the
-caster's floor point, walks the pixels in the shadow's screen bbox,
-unprojects each the way drawFlatSpan does, and — only where r.depth shows
-that pixel really is that floor — darkens it by strength*(1-(dist/r)^2),
-capped at shadowMaxDarken. Vanilla mode darkens the finished pixel; the
-G-buffer path dims albedo a little and the sector-light plane more, so the
-GPU lighting pass still lands a shadow there. Single-threaded.
+BeginOverlayFrame (called once per frame before the overlay draws) clears
+only the rows last frame's draws touched (markOverlay tracks the dirty
+span) and rolls the dirty rect forward. Every overlay element is authored
+in a 320x200 "HUD space" and mapped to render pixels by hudRect — a
+uniform scale plus a horizontally-centred, bottom-anchored offset — through
+one of two independent transforms:
+  - status bar / HUD: hudScale = hudFit * hudUserScale, where hudFit is the
+    320x200 -> framebuffer fit (fills the height) and hudUserScale is
+    config.json's hudScale (SetHUDScale). Recomputed when either changes.
+    Which HUD draws is config hudStyle (engine hudStyle enum, F1 cycles it
+    at runtime): "doom" = the full DrawStatusBar; "quake2" = the minimal
+    DrawQuakeHUD; "none" = neither. Legacy showStatusBar:false with no
+    hudStyle key maps to "none" (config.Load).
+  - weapon viewmodel: hudFit * weaponUserScale (weaponScale / weaponOffX /
+    weaponOffY, the weaponSpace=true path through blit; SetWeaponScale from
+    config weaponScale). Independent of the status bar's hudUserScale, so
+    the two are sized by separate knobs — weaponScale defaults to 1 (fills
+    the screen height, the original look).
+  - debug text: hudScale for the glyph size but pinned to the top-left,
+    ignoring the offset (raster/hud.go).
 
 Weapon viewmodel (raster/weapon.go, DrawWeapon): bottom-anchored,
 horizontally centered by the sprite's own pixel size (not its embedded
 hotspot offset, which encodes a pseudo-3D projection this project doesn't
 reproduce); the muzzle-flash overlay is positioned by the two sprites'
 offset DELTA, which still gives correct relative alignment. The gun sprite
-is dimmed by the player's sector (pspriteShade); the flash is full bright.
-DrawWeapon is skipped entirely while the player is dead (section 14).
-Sizing is in the HUD's 320x200 space at the weapon transform (below), so an
-HD-weapon-pack frame (section 11, TexelsPerUnit 2) has the same logical
-footprint as the 1x original and drops in with no layout change — it just
-carries more pixels for the GPU upscale.
+is dimmed by the player's sector via light.go's pspriteShade (below); the
+flash is full bright. DrawWeapon is skipped entirely while the player is
+dead (section 14). Sizing is in the HUD's 320x200 space at the weapon
+transform above, so an HD-weapon-pack frame (section 11, TexelsPerUnit 2)
+has the same logical footprint as the 1x original and drops in with no
+layout change — it just carries more pixels for the GPU upscale.
 
 Weapon bob (engine/weapons.go — g.weaponBob() returns all three per frame,
 passed into DrawWeapon). One shared free-running angle WeaponState.bobPhase
@@ -741,30 +507,22 @@ actual speed, and all read as one arc rather than independent wobbles:
      sprite that doesn't fill its own bottom rows, plus the Y lift, can't
      crack a gap open underneath.
 
-The 2D overlay: weapon viewmodel, status bar and debug HUD all draw into a
-separate full-render-resolution RGBA buffer (r.overlay). Each draw calls
-markOverlay with its row span, so Render can clear only last frame's
-touched rows at the start of the next one and the enhanced path can upload
-only the changed rows (section 9). Vanilla alpha-composites the whole
-buffer onto r.Pix by CompositeOverlay (strip-parallel, same byte-partition
-split as the frame clear) once per frame, after the 3D view. Every element
-is authored in vanilla's 320x200 "HUD space", mapped to render pixels by
-one of two transforms — a uniform scale plus a horizontally-centred,
-bottom-anchored offset (hudRect):
-  - status bar / HUD: hudScale = hudFit * hudUserScale, where hudFit is the
-    320x200 -> framebuffer fit (fills the height) and hudUserScale is
-    config.json's hudScale (SetHUDScale). Recomputed when either changes.
-    Which HUD draws is config hudStyle (engine hudStyle enum, F1 cycles it
-    at runtime): "doom" = the full DrawStatusBar; "quake2" = the minimal
-    DrawQuakeHUD; "none" = neither. Legacy showStatusBar:false with no
-    hudStyle key maps to "none" (config.Load).
-  - weapon viewmodel: hudFit * weaponUserScale (weaponScale / weaponOffX /
-    weaponOffY, the weaponSpace=true path through blit; SetWeaponScale from
-    config weaponScale). Independent of the status bar's hudUserScale, so
-    the two are sized by separate knobs — weaponScale defaults to 1 (fills
-    the screen height, the original look).
-  - debug text: hudScale for the glyph size but pinned to the top-left,
-    ignoring the offset (raster/hud.go).
+Sector/distance shading (raster/light.go) is a direct port of PrBoom's
+r_main.c R_InitLightTables plus the render-time lookups in r_segs.c /
+r_plane.c, baked at init into [16][48] and [16][128] uint16 arrays of
+0..256 brightness multipliers — collapsing each of vanilla's 32 COLORMAP
+rows to a plain multiply, (NUMCOLORMAPS - row)/NUMCOLORMAPS, since there is
+no palette to remap. This is not a leftover from the removed CPU
+rasterizer: pspriteShade (the bright, "point-blank" end of a sector's
+table — spritelights[MAXLIGHTSCALE-1], so the held weapon has no distance
+falloff of its own) shades the weapon overlay above, and BuildLightLUT /
+LightScaleValue / AmbientLightValue / LightScaleRef feed the hardware
+shader's own uniforms (world.frag's fade(), section 9) so the two shade
+identically — a light.go doc comment and light_test.go pin the two against
+each other. SetLightScale / SetAmbientLight apply config lightScale /
+ambientLight (section 17); ExtraLight is id's "extralight" lever, bumped by
+the Heretic Torch/Tome artifacts (section 24) and read back by the hardware
+shader too.
 
 Status bar (raster/statusbar.go, DrawStatusBar): takes a raster.HUDStats (a
 flat draw-only snapshot the engine rebuilds from PlayerStats every frame —
@@ -795,14 +553,13 @@ engine.Game.ShowHUD (on by default; config showDebugInfo).
 
 9. RENDER / RENDER-VULKAN — GPU PRESENTATION
 -------------------------------------------
-render.Renderer is a four-method interface — DrawFrame, DrawFrameLit,
-DrawWorld, Destroy. The engine core depends only on this, never on Vulkan
-directly. Destroy blocks on device-idle before releasing anything, so
-callers can invoke it directly on shutdown.
+render.Renderer is a two-method interface — DrawWorld, Destroy. The engine
+core depends only on this, never on Vulkan directly. Destroy blocks on
+device-idle before releasing anything, so callers can invoke it directly
+on shutdown.
 
-DrawWorld is the "hardware" (GPU-geometry) path — config renderer
-"hardware" (default "software"), stood up by vulkan.NewWorld instead of
-vulkan.New. render/worldgeo builds the whole level's walls + flats once (wall
+DrawWorld is the hardware (GPU-geometry) path — the only path the game
+uses, stood up by vulkan.NewWorld. render/worldgeo builds the whole level's walls + flats once (wall
 quads + BSP-reconstructed subsector-polygon flats, UVs/pegging/fake-contrast
 matched to raster) into a static triangle list the backend keeps in a
 device-local buffer, rebuilt only when a door/lift moves a sector height
@@ -849,51 +606,45 @@ NominalCell).
 world.vert/world.frag: one draw call per texture (a bound set-0 per Draw,
 plain Vulkan 1.0 — no bindless), wall/flat/sprite images uploaded once as
 device-local mip chains (GPU blit chain) sampled with an anisotropic REPEAT
-sampler, a continuous take on the vanilla scalelight/zlight fade computed
+sampler, a continuous take on vanilla's scalelight/zlight fade computed
 directly in the shader (fade() — sector light -> lightnum -> startmap minus
-a smooth 1/distance term; the old quantised two-LUT version was removed as
-dead code once this replaced it). Set-0 binding 1 is the run's
+a smooth 1/distance term). Set-0 binding 1 is the run's
 brightmap mask (worldgeo.Draw.Bright, resolved once per texture like Tex; a
 1x1 black dummy when it has none); world.frag lights a masked texel to
 max(sectorFade, luma(uBright)) + a small bloom kicker so a lit panel /
-light / EXIT sign stays lit regardless of sector light — the hardware match
-for the software path's LightParam.g model. Two separate ambient terms keep
-a shadowed pixel legible. First, a brightness FLOOR (config ambientLight,
-W.light.w — default 0.2, section 17): litAmt is raised to at least
-ambientLight * sectorAmbientFrac(), i.e. scaled by how bright THIS sector is
-authored, undiminished by camera distance — so a monster across a lit room
-stays detailed instead of fading to near-black by mid-room, while one in a
-genuinely dark sector gets almost no lift and needs a real light. 0
-reproduces the old crush-to-black in every sector. light.frag (enhanced
-software) applies the same via S.spotCosInner.y; the vanilla path has its
-own non-configurable colormap floor. Second, on top of that, a faint
-hemisphere AMBIENT tint (scaled by 1-lit) keeps a fully-shadowed pixel from
-crushing to pure black: world.frag's hemisphereAmbient() mixes a sky-tinted
-colour (up-facing = floors) with a darker hue-kept version (down-facing =
-ceilings) by vNormal.z, all times a strength scalar. The tint (W.amb.rgb)
+light / EXIT sign stays lit regardless of sector light. Two separate
+ambient terms keep a shadowed pixel legible. First, a brightness FLOOR
+(config ambientLight, W.light.w — default 0.2, section 17): litAmt is
+raised to at least ambientLight * sectorAmbientFrac(), i.e. scaled by how
+bright THIS sector is authored, undiminished by camera distance — so a
+monster across a lit room stays detailed instead of fading to near-black
+by mid-room, while one in a genuinely dark sector gets almost no lift and
+needs a real light. 0 reproduces vanilla's crush-to-black in every sector.
+Second, on top of that, a faint hemisphere AMBIENT tint (scaled by 1-lit)
+keeps a fully-shadowed pixel from crushing to pure black: world.frag's
+hemisphereAmbient() mixes a sky-tinted colour (up-facing = floors) with a
+darker hue-kept version (down-facing = ceilings) by vNormal.z, all times a
+strength scalar. The tint (W.amb.rgb)
 is THIS level's
 sky bitmap averaged, hue-boosted and scaled ~0.09, computed once and cached
 by pointer in worldResources (hemisphereAmbient in world.go) — so a shadowed
 corner in a hell map goes murky-warm and one under an open sky goes cool
 blue with no per-map tuning. W.amb.w <= 0 falls back to the old flat
 vec3(.020,.028,.045). A fully enclosed level (no sky) gets a fixed cool
-neutral. voxel.frag applies the same model; the vanilla software path keeps
-its flat cool floor. Live things
+neutral. voxel.frag applies the same model. Live things
 and in-flight projectiles are camera-facing billboards
 (worldgeo.Builder.AddSprites, KindSprite / KindSpriteFull for the emissive
 projectile path) appended as extra Draws, sized/seated from the sprite
-frame's pixel dims and offsets exactly like raster.blitBillboard, sorted by
+frame's own pixel dims and offsets (section 8's ThingSprite), sorted by
 the GPU depth test. This frame's dynamic point lights (muzzle flash, rocket / plasma / BFG
-glow, animated map emitters — g.collectLights, same set the enhanced
-software path uses) ride in the World UBO as nLights + lightPos[64] /
+glow, animated map emitters — g.collectLights, section 14) ride in the World UBO as nLights + lightPos[64] /
 lightColor[64] vec4 arrays, after a 6-vec4 header (cam, screen, light,
 nLights, fog, amb — worldUBOHead = 24 floats), and a trailing
 shadowCaster[24] vec4 array (xyz = a grounded thing's floor position, w =
 blob radius; w <= 0 ends the list). world.frag's groundShadow() stamps a
 soft round dark blob on each up-facing floor pixel under a caster, faded by
 distance and by how far the pixel's floor sits from the caster's own (no
-bleed onto a step) — the hardware answer to raster.drawGroundShadows, always
-on (the groundShadows config still gates only the software blob pass).
+bleed onto a step) — always on, no config gate.
 engine.collectGroundShadows fills the list nearest-first from the same
 grounded-thing filter, capped at hwGroundShadowCap = 24.
 The fog vec4 (rgb + density, from config fogColor/fogDensity via
@@ -917,9 +668,7 @@ from worldgeo.Camera's Spot* fields, which engine.Game.flashlightSpot
 recomputes per frame off the live camera with a handheld sway and a battery
 flicker. world.frag adds it as a real Lambert + smooth cone falloff on top
 of the sector fade, using the same per-pixel bumpedNormal() the point
-lights do. light.frag (enhanced software) reads the same fields off
-render.Frame. The vanilla path has no spot — flashlightSystem there just
-raises raster.ExtraLight.
+lights do.
 
 Cartoon shading (config cartoonShading, hardware only) rides in a repurposed
 UBO pad float (CartoonBands, alongside the Spot block): when > 0, world.frag
@@ -933,7 +682,7 @@ world.go, deliberately not player knobs.
 
 A floor whose flat is a liquid gets its own vert kind (worldgeo.liquidKind
 OfFlat: KindLiquidWater / KindLiquidLava / KindLiquidNukage) and world.frag
-shades it to match the software path's shadeLiquid — water: the FWATER
+shades it — water: the FWATER
 texel (sector light only, fade()) is the translucent "bottom", its sample
 REFRACTED by the wave slope so it shimmers, then exponentially absorbed
 with a depth cue (view angle + view distance: depth = 0.14 + 0.55*graz +
@@ -963,14 +712,10 @@ push constant carries the camera basis for this (p0 exposure,bloomStrength,
 waterClock,near; p1 sinA,cosA,focal,far; p2 camX,camY,camZ,horizonY; p3 w,h,
 ssrStrength,godrayStrength; worldgeo.NearPlane/FarPlane exported for the
 linearise). SSR runs pre-tonemap and does NOT feed bloom (bloom is the
-pre-SSR scene). Enhanced-software still has its own light.frag ssr() off the
-R32F linear-depth buffer.
+pre-SSR scene).
 Lava: warm additive glow past 1.0 (blooms) with the slow sin pulse, and the
 dynamic-light term cut to 0.35 (lava is already self-lit). Nukage: a milder
-green additive tint. The waterWave / fresnel / tint / pulse constants are
-duplicated verbatim in raster so the two renderers match; the software
-enhanced path gets the same firing behaviour via the matWater G-buffer key
-+ light.frag's 0.15x damp. Every worldgeo.Vert carries a unit surface
+green additive tint. Every worldgeo.Vert carries a unit surface
 normal (walls face into their sector, floors up, ceilings down, billboards
 at the camera), so world.frag's dynamicDiffuse(N, specMask) is a real
 Lambert + Blinn-Phong term: per light, colour*intensity * (1-(d/R)^2)^2 *
@@ -988,8 +733,7 @@ and masked mid-textures keep their real normal and a faint fixed specMask;
 liquids pass a flat normal and specMask 0 (they have their own glint
 models). The world pass renders to an
 RGBA16F HDR scene image (values pile past 1.0), and worldbloom.go turns its
-bright part into a wide, soft glow with a true MIP PYRAMID (its own
-hardware-only shaders — the lit path's shared bright/blur are untouched):
+bright part into a wide, soft glow with a true MIP PYRAMID:
 worldbright.frag Karis-weighted 4-tap downsample + threshold scene -> mip 0
 (half res; the 1/(1+luma) weight stops a lone hot texel sparkling), then
 worldbloomdown.frag (13-tap Call of Duty ACM) downsamples the chain
@@ -1084,10 +828,10 @@ blit can sample it for water SSR) at render resolution, then worldblit.frag
 upscales it letterboxed to the swapchain and blends the un-composited 2D
 overlay (raster.Renderer.Overlay — weapon / HUD / crosshair, still
 CPU-drawn; raster.BeginOverlayFrame runs only the overlay-plane lifecycle,
-no CPU world render) on top. The sky matches raster/sky.go on
-both axes (skyPixPerTurn columns per yaw; the vanilla skytexturemid
-vertical anchored to the pitch-shifted horizon — pitchShear rides in the
-World UBO). Voxel models (cfg.Voxels): worldgeo.BuildVoxelMesh turns a KVX
+section 8) on top. The sky is computed entirely in world.frag
+(skyColorAt, section 10): skyPixPerTurn columns per yaw; the vanilla
+skytexturemid vertical anchored to the pitch-shifted horizon — pitchShear
+rides in the World UBO. Voxel models (cfg.Voxels): worldgeo.BuildVoxelMesh turns a KVX
 model into a static vertex-coloured cube-face mesh (cached per model as a
 device-local VBO), drawn by a dedicated voxel.vert/frag pipeline inside the
 world pass, depth-sorted, per-instance transform+shading in a push
@@ -1100,36 +844,46 @@ load with voxels that cut the mesh step ~5.7s -> 1.9s. cmd/isoengine's iso
 path instead meshes lazily on first sight (section 23).
 bsp.SubsectorPolygons (the flat outlines) clips a map box by every ancestor
 partition + seg front line, then hulls with the exact seg endpoints —
-236/237 E1M1 subsectors get a flat. If NewWorld fails to stand up,
-cmd/engine logs and falls back to software.
+236/237 E1M1 subsectors get a flat. A failed NewWorld (no Vulkan driver, or
+the device can't stand the pipeline up) is fatal — there is no CPU
+fallback (cmd/engine reports the error and exits).
 
-render/vulkan.Renderer is the one implementation of the first two paths,
-built for exactly one of them at startup (vulkan.New's `lit` argument, from
-config lightingMode — "enhanced" by
-default): DrawFrame for "vanilla", DrawFrameLit for "enhanced" — calling
-the wrong one returns an error. If the enhanced pipeline fails to stand
-up, cmd/engine retries vulkan.New with lit=false and runs vanilla.
+render/vulkan.Renderer is one type that can be built for one of three
+mutually exclusive roles, checked at the top of every Draw* method (calling
+the wrong one for how it was built returns an error):
+  - vulkan.NewWorld / DrawWorld — the hardware (GPU-geometry) path above.
+    The game's only renderer.
+  - vulkan.NewIso / DrawIso — the isometric top-down path (section 23).
+  - vulkan.New / DrawFrame — upload a whole CPU-drawn RGBA8 frame into a
+    GPU texture and blit it with one fullscreen triangle, nothing else.
+    Used directly (not through the render.Renderer interface) by the
+    pre-game launcher and the level editor to present their own 2D GUIs
+    (both drawn on the CPU via package imkit — sections 22, 25),
+    unrelated to how the game itself renders a level. The vanilla-shaded
+    CPU-rendered-world present path this once also served no longer
+    exists.
 
-Setup (vulkan.New): create instance (+ the KHRONOS validation layer only
-if present AND debug was requested — cmd/engine requests it only under
-TPF_VK_DEBUG; + VK_KHR_portability_enumeration and the matching create
-flag only where the loader advertises them, so MoltenVK on macOS exposes
-its device — inert on native Windows/Linux drivers, see section 21) ->
-GLFW window surface -> pick the best physical device (prefers a discrete
-GPU; logs DeviceName / DeviceTypeName / DeviceIsSoftware so a CPU/software
-Vulkan fallback is visibly flagged) -> logical device (+ VK_KHR_
-portability_subset when the device advertises it, spec-required) +
-graphics/present queues -> swapchain -> image views ->
-render pass -> framebuffers -> command pool/buffers -> sync objects -> the
-frame-upload texture (R8G8B8A8_UNORM, linear sampler) + one mapped staging
-buffer per frame-in-flight slot -> descriptor set -> the blit pipeline.
-This whole pipeline only ever sees the finished, already-composited frame
-at the configured render resolution.
+Setup (vulkan.New / NewWorld / NewIso all share this): create instance (+
+the KHRONOS validation layer only if present AND debug was requested —
+cmd/engine requests it only under TPF_VK_DEBUG; + VK_KHR_
+portability_enumeration and the matching create flag only where the loader
+advertises them, so MoltenVK on macOS exposes its device — inert on native
+Windows/Linux drivers, see section 21) -> GLFW window surface -> pick the
+best physical device (prefers a discrete GPU; logs DeviceName /
+DeviceTypeName / DeviceIsSoftware so a CPU/software Vulkan fallback is
+visibly flagged) -> logical device (+ VK_KHR_portability_subset when the
+device advertises it, spec-required) + graphics/present queues ->
+swapchain -> image views -> render pass -> framebuffers -> command
+pool/buffers -> sync objects. NewWorld/NewIso then build their own
+additional pipelines/resources on top (world.go / isosetup.go); plain New
+instead builds the frame-upload texture (R8G8B8A8_UNORM, linear sampler) +
+one mapped staging buffer per frame-in-flight slot -> descriptor set -> the
+blit pipeline.
 
-Per frame (DrawFrame): a minimized window (0x0 framebuffer) skips the
-frame; a swapchain flagged out of date is rebuilt first
-(recreateSwapchain). Then: wait this slot's in-flight fence, memcpy the
-CPU frame into this slot's mapped staging buffer, acquire a swapchain
+Per frame (DrawFrame, the plain CPU-buffer path): a minimized window (0x0
+framebuffer) skips the frame; a swapchain flagged out of date is rebuilt
+first (recreateSwapchain). Then: wait this slot's in-flight fence, memcpy
+the CPU frame into this slot's mapped staging buffer, acquire a swapchain
 image, wait the fence of whichever earlier in-flight frame last used that
 image (imagesInFlight) before reusing its command buffer, record a command
 buffer that transitions the frame texture, copies this slot's staging
@@ -1141,23 +895,25 @@ frame's exact aspect, black-boxing rather than stretching), bind the
 descriptor set, draw 3 vertices — submit and present. A
 VK_ERROR_OUT_OF_DATE_KHR / VK_SUBOPTIMAL_KHR from acquire or present sets
 a "recreate next frame" flag instead of returning an error, so a window
-resize doesn't terminate the loop.
+resize doesn't terminate the loop. DrawWorld/DrawIso follow the same
+acquire/submit/present bookkeeping, recording their own richer command
+buffers instead of the trivial blit.
 
 maxFramesInFlight is 2, so the CPU can build and upload frame N+1 while the
-GPU is still finishing N. What makes that safe: one host-visible staging
-buffer per slot (a memcpy for the next frame can't land on a buffer the
-GPU is still reading — DrawFrame waited that slot's fence); the single
-frame texture guarded by a record-time barrier whose source scope is the
-previous blit's fragment-shader sampling; and imagesInFlight[i] tracking
-which slot's fence last covered swapchain image i, waited on before that
-image's command buffer is re-recorded. renderFinished semaphores are sized
-per swapchain image (not per in-flight slot), since a binary semaphore
-can't be re-signaled until the presentation engine is entirely done with
-it. recreateSwapchain (on resize/monitor change) waits for device idle,
-then rebuilds the swapchain and everything sized to it — reusing the
-render pass and pipeline. The frame-upload texture is fixed at the
-configured render resolution and untouched by a resize; the blit rescales
-it.
+GPU is still finishing N. What makes that safe (plain DrawFrame): one
+host-visible staging buffer per slot (a memcpy for the next frame can't
+land on a buffer the GPU is still reading — DrawFrame waited that slot's
+fence); the single frame texture guarded by a record-time barrier whose
+source scope is the previous blit's fragment-shader sampling; and
+imagesInFlight[i] tracking which slot's fence last covered swapchain image
+i, waited on before that image's command buffer is re-recorded.
+renderFinished semaphores are sized per swapchain image (not per in-flight
+slot), since a binary semaphore can't be re-signaled until the
+presentation engine is entirely done with it. recreateSwapchain (on
+resize/monitor change) waits for device idle, then rebuilds the swapchain
+and everything sized to it — reusing the render pass and pipeline. The
+frame-upload texture is fixed at the configured render resolution and
+untouched by a resize; the blit rescales it.
 
 Shaders (render/vulkan/shaders/*.vert, *.frag) are precompiled to SPIR-V
 and embedded via go:embed; nothing compiles at runtime. Recompile after an
@@ -1170,131 +926,50 @@ edit and commit the regenerated .spv:
     a few KB larger, functionally identical. Pass base names to compile
     just those: `compile.sh world.frag`.
 
-Enhanced lighting path (render/vulkan/lit.go). When New is built with
-lit=true it skips the blit texture/pipeline and builds a deferred-lighting
-chain, still reusing the swapchain, render pass, framebuffers, command
-buffers and sync objects — resize handling is unchanged. Per frame
-(DrawFrameLit, same acquire/submit/present bookkeeping):
-
-  uploads   five planes packed into one staging buffer per slot — albedo,
-            normal(+material), sectorLight, overlay (RGBA8) and depth
-            (R32F) — into a full set of device images PER in-flight slot
-            (double-buffered, so frame N+1's staging->image copy doesn't
-            wait on frame N's lighting pass still sampling them). The four
-            big planes are memcpy'd into the mapped staging buffer on
-            parallel goroutines; the overlay is uploaded dirty-rows-only
-            (render.Frame.OverlayY/H — the HUD footprint this frame unioned
-            with what each slot still needs), the whole plane only on a
-            slot's first use. Plus a per-slot Scene UBO: camera basis,
-            extralight, a tuning vec4 (lightScale + exposure + shadow
-            strength + shadow-caster count) and the frame's lights, each as
-            xyz world pos + 1/radius^2 + rgb + intensity. The engine caps
-            the light list at activeLightBudget (40), ramped-nearest-first and
-            frustum-culled (nothing wholly behind the view plane), well
-            under the 64-slot shader array — the muzzle flash and in-flight
-            shots first, then the map's static emitters (section 14).
-  pass A    light.frag -> hdrColor (RGBA16F, render res). Reconstructs
-            world position from depth (the exact inverse of raster's
-            forward projection), applies a smooth un-quantised version of
-            the section-8 sector/distance fade (sector light first
-            multiplied by the tuning lightScale) as the base, then adds
-            each point light: an inverse-square-distance cull and
-            (1 - d^2/r^2)^2 attenuation (no sqrt — the direction for N.L
-            uses an rsqrt), N.L wrap-lambert for sprite-material pixels.
-            Only the first
-            shadow-caster-count lights (the leading dynamic ones — at most
-            SHADOW_MAXCASTERS = 4, and zero in a frame with nothing firing)
-            get the SHADOW_STEPS (8) screen-space depth march that scales a
-            light out where nearer geometry blocks it; the static map
-            emitters never do — marching every torch every pixel was a
-            large frame-rate cost for a subtle effect. The ambient
-            (sector-fade) term of a WALL/FLAT pixel is then attenuated by a
-            small screen-space AO (ssao): an 8-sample depth-scaled disc,
-            each sample's world point reconstructed from uDepth and counted
-            as an occluder if it rises above this surface's plane within a
-            short range — so a wall/floor junction, a doorway edge or the
-            underside of a step darkens. Direct lights, the brightmap term,
-            sprites (mat ~0.5) and water (~0.16) are untouched. A tiny cool
-            ambient floor (vec3(.020,.028,.045)*(1-lit)) keeps a fully
-            shadowed pixel off pure black. A water-material pixel (matWater)
-            has its summed dynamic-light term cut to 0.15 so a muzzle flash
-            over water reads as a glint not a flood, and it gets REFLECTIONS
-            of the real scene on top of the sky reflection raster.blendWater
-            baked in: (a) ssr() marches the R32F linear-depth buffer along
-            the reflected view ray (reflect about +Z, rippled by waterWave
-            at S.view.w = the AnimTime clock) — ~12 growing steps — and
-            where it passes just behind a surface, mixes in that pixel's
-            albedo (fresnel-weighted); (b) every dynamic light streaks
-            across the surface as a tight pow(align,48) coloured highlight.
-            A masked texel is lit to max(sectorFade, LightParam.g) + a small
-            bloom kicker so it stays lit regardless of sector light. Then
-            distance fog (Scene UBO fog vec4 = rgb + density, from config
-            fogColor/fogDensity via render.Frame): every lit AND emissive
-            world pixel is blended toward the fog colour by
-            1 - exp(-density*depth). Emissive pixels (sky, muzzle flash,
-            explosions) otherwise pass straight through; background
-            (depth +Inf) passes through unlit and unfogged (it is the sky).
-  pass B    bright.frag then a separable 9-tap Gaussian (blur.frag, H then
-            V) over a half-res RGBA16F pair — the bloom.
-  pass C    composite.frag -> the swapchain image, letterboxViewport'd like
-            the vanilla blit: (hdr + bloom*strength) * exposure (exposure
-            per frame from config; bloomStrength/threshold are fixed
-            constants in lit.go), a highlight soft-knee that is identity
-            below 0.8 (so "enhanced with nothing glowing" matches the
-            vanilla frame) and rolls off brighter values, then the
-            un-composited 2D overlay blended on top so the HUD/weapon stay
-            crisp and untonemapped.
-
-The G-buffer comes from raster (SetGBuffer / Deferred, section 8); the
-light list from engine (buildFrame / collectLights, section 14). The
-offscreen HDR/bloom targets are render-resolution and never rebuilt on
-resize. All four passes share one fullscreen-triangle vertex shader
-(blit.vert).
-
 
 10. THE SKYBOX
 --------------
 The sky is not positioned in the 3D world — there is no "sky sector" out
-past a level's walls. Whenever drawCeilingSpan hits a sector whose ceiling
-texture is exactly "F_SKY1" (Doom's hardcoded special flat), it paints
-directly from the camera instead of building a textured flat span
-(raster/sky.go, drawSkySpan).
+past a level's walls. world.frag's skyColorAt (section 9) computes it
+per-pixel from the camera's view direction whenever a wall/flat vertex is
+tagged with the sky material key, instead of sampling a texture through
+the normal UV path.
 
-Texture source, in priority order (buildSkyTable):
-  1. The external Mars panorama — a 4096x2048 daytime sky generated by
-     tools/gensky, loaded from disk at startup (not embedded — section 18).
-     When present it overrides every level's sky regardless of WAD. Colour
-     follows NASA's description of Mars: rusty orange-brown (iron-oxide dust
-     scattering red/orange), paling toward the horizon, with a pale-blue
-     forward-scatter halo near the sun. See tools/gensky.
-  2. Otherwise the WAD's own sky texture for the current map, PICKED THE
-     WAY PrBoom DOES (skyTextureForMap, p_setup.c's P_SetupLevel): SKY1..4
-     by episode for Doom / Ultimate Doom, and SKY1 (MAP01-11) / SKY2
-     (12-20) / SKY3 (21+) for Doom II & Final Doom. These are TEXTURE1
-     entry names (the Doom II ones wrap the RSKYn patches), so they resolve
-     through WallTexture for either game; a missing one falls back to SKY1.
-     Cached per map name.
+Texture source: the WAD's own sky texture for the current map, PICKED THE
+WAY PrBoom DOES (skyTextureForMap, p_setup.c's P_SetupLevel): SKY1..4 by
+episode for Doom / Ultimate Doom, and SKY1 (MAP01-11) / SKY2 (12-20) / SKY3
+(21+) for Doom II & Final Doom. These are TEXTURE1 entry names (the Doom II
+ones wrap the RSKYn patches), so they resolve through WallTexture for
+either game; a missing one falls back to SKY1. render/worldgeo.Builder
+resolves it once at level load (New) and again on a UMAPINFO `skytexture`
+override or a map change (SetSkyName, engine.Game.ApplyMapInfo).
 
-Mapping (drawSkySpan):
-  - Horizontal (u): the per-column view angle (the same tangent projection
-    every other column uses) plus a whole-texture offset for Camera.Angle.
-    A narrow WAD sky scrolls at id's ANGLETOSKYSHIFT rate — skyPixelsPerTurn
-    = 1024 texture columns per 360-degree turn, so a 256-wide sky wraps 4x
-    (the vanilla feel). A wide panorama instead maps its whole width to one
-    turn, so it does not visibly repeat and looking behind you shows its
-    far side.
-  - Vertical (v): anchored to skyTextureMidRow (id's skytexturemid,
-    R_InitSkyMap's "100*FRACUNIT", not the texture's geometric centre) at
-    the pitch-adjusted horizon row. The per-row texel rate is scaled by
-    skyReferenceScreenHeight (200) / render height, so the sky fills the
-    same share of the view at any resolution instead of tiling as it rises
-    — PrBoom's sky is likewise resolution-independent (dc_iscale scales
-    with the view). Looking up/down shifts which slice is visible.
-  - Walking never moves the sky (not a function of Camera.X/Y).
+Mapping (skyColorAt, mirroring the removed CPU rasterizer's own):
+  - Horizontal (u): the per-pixel view angle (from the pixel's screen
+    column, the same as every other column's projection) plus a
+    whole-texture offset for the camera's yaw. A narrow WAD sky scrolls at
+    id's ANGLETOSKYSHIFT rate — skyPixPerTurn = 1024 texture columns per
+    360-degree turn, so a 256-wide sky wraps 4x (the vanilla feel).
+  - Vertical (v): anchored to the vanilla skytexturemid convention (id's
+    "100*FRACUNIT", not the texture's geometric centre) at the
+    pitch-adjusted horizon row. The per-row texel rate is scaled by 200 /
+    render height (raster's own reference height), so the sky fills the
+    same share of the view at any resolution instead of tiling as it rises.
+    Looking up/down shifts which slice is visible.
+  - Walking never moves the sky (not a function of camera X/Y).
 
-Both axes use one mapping shared by every column and row, not fit locally
-to each column's visible wall silhouette — a real sky has no depth to fit
-anything to.
+Known gap: the external Mars panorama (a 4096x2048 daytime sky generated by
+tools/gensky, loaded from disk via assets.LoadSkybox — not embedded,
+section 18; colour follows NASA's description of Mars, rusty orange-brown
+paling toward the horizon with a pale-blue forward-scatter halo near the
+sun) that used to override every level's sky regardless of WAD is currently
+NOT wired into the hardware renderer — assets.LoadSkybox and
+worldgeo.Builder.SetSky (which would install it) both still exist, but
+nothing calls SetSky any more. It regressed silently when the CPU software
+rasterizer (which owned this priority) was removed; every level currently
+shows its own WAD sky texture instead of the panorama regardless of whether
+assets/skybox/mars_sky.png is present. Re-wiring it (cmd/engine calling
+SetSky after loading it) is a small, self-contained follow-up.
 
 
 11. HI-RES TEXTURES & HD WEAPONS
@@ -1366,7 +1041,7 @@ Data/jHeretic/Flats/*.png -> .../flats/ (a byte copy; -max downscales via
 Catmull-Rom and re-encodes). It ignores the PBR maps (normal / specular /
 metallic / roughness / displacement / AO — this renderer has no use for
 them), the 32-frame liquid animations (never referenced by name), and
-SKY1..3 (raster/sky.go's job). Textures.SetHeretic(true) — cmd/engine calls
+SKY1..3 (section 10's job). Textures.SetHeretic(true) — cmd/engine calls
 it when w.IsHeretic() — makes WallTexture/Flat consult hereticWalls/
 hereticFlats AHEAD of the Quake pack, the generic hi-res set and the WAD;
 the directory is separate precisely because the pack's Doom-name collisions
@@ -1562,10 +1237,11 @@ Registered in NewGame, order load-bearing:
                   always on, no config gate; every hit logs "engine: cheat:".
                   No-op without a window (tests).
   flashlightSystem  toggles the head-mounted flashlight on F (edge-
-                  triggered) and, in the vanilla path, drives its flat
-                  raster.ExtraLight brightness bump (flashlight.go). A no-op
-                  when config flashlight is false or there is no window. See
-                  "Flashlight" below.
+                  triggered), and resets raster.ExtraLight to 0 each frame
+                  so a later system (artifactSystem, for Heretic's Torch/
+                  Tome) can still bump it for its own reason (flashlight.go).
+                  A no-op when config flashlight is false or there is no
+                  window. See "Flashlight" below.
 The sector effects those spawn are advanced on the 35 Hz tic, not here.
 
 An alternate front end (cmd/isoengine, section 23) keeps this whole system
@@ -1578,18 +1254,16 @@ also drives the loop itself (Game.AdvanceSimulation per frame in
 game.Run's place), so ordering among the systems still holds.
 
 Flashlight (engine/flashlight.go). F is a persistent on/off toggle (no
-battery drain). In the enhanced and hardware tiers it is a real forward
-spot cone — Game.flashlightSpot builds a flashlightSpotLight each render
-from the live camera (with a sub-degree handheld sway and a subtle
-battery-flicker on flickerWobble), carried in render.Frame / worldgeo
-.Camera's Spot* fields and lit by light.frag / world.frag (SpotIntensity
-<= 0 = off). Its radius (1400 u) deliberately outreaches the muzzle flash
-so a monster reads as lit and detailed well before point-blank. In the
-vanilla path, which has no per-pixel dynamic lights, it is instead a flat
-raster.ExtraLight += 2 — id's own "extralight" lever, a uniform
-brightening with no beam shape.
+battery drain). It is a real forward spot cone — Game.flashlightSpot
+builds a flashlightSpotLight each render from the live camera (with a
+sub-degree handheld sway and a subtle battery-flicker on flickerWobble),
+carried in worldgeo.Camera's Spot* fields and lit by world.frag
+(SpotIntensity <= 0 = off). Its radius (1400 u) deliberately outreaches the
+muzzle flash so a monster reads as lit and detailed well before
+point-blank.
 
-engine.Game owns the Window, the render.Renderer, the raster.Renderer, the
+engine.Game owns the Window, the render.Renderer (the hardware/GPU-geometry
+backend), the raster.Renderer (the 2D overlay compositor, section 8), the
 loaded WAD/Level/BSP tree, the Camera, player movement state
 (VelX/VelY/VelZ, PlayerZ, onGround), PlayerStats, WeaponState, the
 AudioDevice, every live Mobj, the active sector thinkers and in-flight
@@ -1798,23 +1472,23 @@ Doom 1 plus the Chaingunner and Hell Knight; the other Doom II monsters
 SS, Commander Keen, Icon of Sin) are not ported, so those THINGS are
 skipped. A separate playerMobj (not in the mobj list, never drawn) mirrors
 the Camera each tic so it can be an AI target and a solid body. Game.Run
-advances all mobjs on a fixed 35 Hz accumulator (runTic). drawMobjs
-renders each thing farthest first: a voxel model when Game.Voxels has one
-for the sprite frame and it's big enough on screen (section 20), otherwise
-a wall-occluded billboard — either way shaded by the light level of the
-sector it stands in unless the frame is fullbright. Each mobj is drawn at
-its start-of-tic position/facing advanced toward its post-tic state by the
-fraction of a tic the wall clock has run past the last one (interp.go —
-mobj.prevX..prevAngle, snapshotted at the top of mobjTick), so a monster
-or an enemy fireball glides at the display rate instead of stepping at
-35 Hz while the player's own camera moves every frame; a per-tic jump too
-large to be ordinary motion (a teleport) is drawn at the new position
-uninterpolated. Presentation only — collision, AI and pickups always read
-the exact post-tic fields. Just before that, when
-config groundShadows is on (it defaults OFF), drawGroundShadows sweeps
-every grounded mobj — skipping missiles, ceiling-hung and floating things
-— plus the player, calling raster.DrawGroundShadow for a floor contact
-shadow (section 8).
+advances all mobjs on a fixed 35 Hz accumulator (runTic). Each render frame,
+collectWorldObjects (engine/mobj.go) resolves every live mobj + in-flight
+projectile into either a voxel instance (Game.Voxels has a model for the
+sprite frame — section 20) or a camera-facing sprite billboard, for
+render/worldgeo.Builder.AddVoxels/AddSprites to hand to the GPU — either
+way shaded by the light level of the sector it stands in unless the frame
+is fullbright. Each mobj is resolved at its start-of-tic position/facing
+advanced toward its post-tic state by the fraction of a tic the wall clock
+has run past the last one (interp.go — mobj.prevX..prevAngle, snapshotted
+at the top of mobjTick), so a monster or an enemy fireball glides at the
+display rate instead of stepping at 35 Hz while the player's own camera
+moves every frame; a per-tic jump too large to be ordinary motion (a
+teleport) is drawn at the new position uninterpolated. Presentation only —
+collision, AI and pickups always read the exact post-tic fields.
+collectGroundShadows (always on, no config gate — section 9) separately
+lists every grounded mobj — skipping missiles, ceiling-hung and floating
+things — plus the player, for world.frag's own floor contact-shadow pass.
 
 AI (engine/enemy.go, noise.go, map.go, sight.go, attack.go, damage.go —
 ported from p_enemy.c / p_map.c / p_inter.c). Monsters wake and hunt:
@@ -2001,9 +1675,8 @@ that path. renderFrame now also calls animFrameChanged() (an FNV hash of
 every animated surface's current live name, changing exactly on the tics an
 animation steps) and Invalidate()s the builder then.
 
-Enhanced-mode AND hardware-mode lights (engine/lights.go,
-engine/maplights.go). All lighting beyond the sector fade is these paths';
-the vanilla path ignores every render.Light. Two kinds:
+Dynamic lights (engine/lights.go, engine/maplights.go) — everything beyond
+world.frag's sector fade. Two kinds:
   Dynamic (lights.go, collectLights): the player's warm muzzle-flash light
   while firing, a per-weapon colour on each in-flight rocket/plasma/BFG with
   an explosion flare that ramps then fades — and the enemy equivalents:
@@ -2062,9 +1735,9 @@ the vanilla path ignores every render.Light. Two kinds:
   keys kept in Entry.Raw, a bad value reported but parsing continues) —
   turns it into name->*Entry. Wired: `levelname` (Game.levelDisplayName, the
   debug-HUD line + the "entered" log), `music` (Game.MapMusicLump, tried
-  first by cmd/engine's audio.PlayLevelMusic call), `skytexture` (Game.ApplyMapInfo ->
-  raster.SetSkyName + worldgeo.Builder.SetSkyName; an external skybox
-  panorama still wins), `next` / `nextsecret` / `endgame` (nextMapName
+  first by cmd/engine's audio.PlayLevelMusic call), `skytexture`
+  (Game.ApplyMapInfo -> worldgeo.Builder.SetSkyName — section 10), `next` /
+  `nextsecret` / `endgame` (nextMapName
   consults them before the ExMy/MAPxx default progression; a target not in
   the WAD falls back), `partime` (Game.parTime). Every other key
   (label, levelpic, intertext, bossaction, exitpic, ...) is parsed and
@@ -2113,14 +1786,12 @@ the vanilla path ignores every render.Light. Two kinds:
   around it; every nukage/slime sector seeds a dim sickly-green light so a
   toxic room reads green in the dark. Classified by the floor flat's family
   prefix (LAVA*/FIRELAVA, NUKAGE*/SLIME*), capped at maxLiquidLights (64)
-  per level, thin trim strips skipped. Both lighting backends get this (it
-  is just more render.Lights). Water and blood seed nothing.
-collectLights and appendMapLights reuse per-frame scratch buffers and
-buildFrame fills a reused render.Frame — the whole per-frame light gather
-is allocation-free. It packages the merged list (dynamic first, and how
-many are dynamic so the backend knows the shadow-casters), the raster
-G-buffer, and the config lightScale / exposure / shadow strength into the
-render.Frame for DrawFrameLit (section 9).
+  per level, thin trim strips skipped (it is just more render.Lights).
+  Water and blood seed nothing.
+collectLights and appendMapLights reuse per-frame scratch buffers, so the
+whole per-frame light gather is allocation-free. game.go's renderFrame
+passes the merged list (dynamic first, and how many are dynamic so
+world.frag knows the shadow-casters) straight to DrawWorld (section 9).
 
 Sound (engine/sound.go): loadSound decodes and caches a DS* lump by name
 (nil-cached on failure/absence); playSound is a nil-safe fire-and-forget
@@ -2142,7 +1813,7 @@ playWeaponSound / playWorldSound call, never set in a real run.
 15. CONTROLS
 -----------
   W / A / S / D         move forward / strafe-left / back / strafe-right
-  Mouse                 look (yaw + pitch, clamped to +-32 degrees);
+  Mouse                 look (yaw + pitch, clamped to +-89 degrees);
                         sensitivity and inverted Y are config (section 17)
   Left / Right arrows   turn (alternative to mouse yaw); rate is turnSpeed
   Shift (either)        run — or walk, if alwaysRun is set (section 17)
@@ -2211,33 +1882,30 @@ built:
   - Only F_SKY1 is recognised as the sky flat (a sky FLOOR, and the
     per-linedef sky-transfer specials 271/272, aren't handled). The per-map
     sky *texture* pick does follow PrBoom (SKY1..4 by episode / MAP range —
-    section 10), but is bypassed entirely whenever the Mars panorama asset
-    is on disk.
+    section 10). The external Mars skybox panorama that used to override it
+    is currently not wired into the hardware renderer at all (section 10) —
+    every level shows its own WAD sky texture regardless of whether
+    assets/skybox/mars_sky.png is present.
   - Resize/monitor-change recreates the Vulkan swapchain, but the render
     resolution is fixed at startup — a resize rescales the same internal
     frame via the letterbox blit, it doesn't re-render at the new size.
-  - The 3D wall/flat pass and the world-sprite / voxel pass (DrawThings)
-    run strip-parallel across the same column bands. The weapon viewmodel,
-    status bar, debug HUD and the optional ground shadows are still
-    single-threaded, but they touch far fewer pixels.
-  - Enhanced-path lighting: a light-animation sector emits ONE point light
-    at its centroid, not an area source, so a big or oddly-shaped bright
-    sector lights unevenly. The only shadowing is a screen-space depth
-    march, and only for the few leading dynamic lights (muzzle flash /
-    in-flight shots — at most 4, none in a frame with nothing firing);
-    static torches/lamps don't cast it, an occluder outside the frame
-    casts nothing, and thin geometry can leak. No thing-on-wall or
-    thing-on-thing shadow, no real shadow maps (that needs level geometry
-    on the GPU, which section 18 keeps off it). The optional ground-shadow
-    blob (config groundShadows, default off) is a floor-only contact
-    darkening, not a cast shadow. The shader loops up to activeLightBudget
-    (40) lights per pixel; a very torch-dense room still spends real GPU
-    time. bloomStrength/threshold are fixed constants in lit.go
-    (lightScale, ambientLight, exposure, shadows, groundShadows,
-    cartoonShading are config).
-  - The COLORMAP lump is not read — its effect is reproduced in RGB
-    (section 8). The only thing that raises vanilla-path ExtraLight today is
-    the flashlight (section 14); a weapon-flash room-brightening hook is
+  - Hardware-renderer lighting: a light-animation sector emits ONE point
+    light at its centroid, not an area source, so a big or oddly-shaped
+    bright sector lights unevenly. The only shadowing is a screen-space
+    depth march (worldambient.frag, section 9), and only for the leading
+    dynamic + up to two nearest static lights; an occluder outside the
+    frame casts nothing, and thin geometry can leak. No thing-on-wall or
+    thing-on-thing shadow, no real shadow maps (that needs a shadow atlas,
+    not yet built). The shader loops up to activeLightBudget (40) lights
+    per pixel; a very torch-dense room still spends real GPU time.
+    cartoonOutlineStrength / cartoonLightBands and the bloom/SSAO/god-ray
+    tuning constants are fixed in render/vulkan/world.go and worldambient.go,
+    not player knobs (lightScale, ambientLight, exposure, cartoonShading
+    are config — section 17).
+  - The COLORMAP lump is not read — its effect is reproduced directly in the
+    shader (section 9). The only thing that raises ExtraLight today is the
+    Heretic Torch/Tome artifacts (section 24); the flashlight is a real spot
+    cone instead (section 14), and a weapon-flash room-brightening hook is
     wired but unused.
   - cmd/isoengine (section 23) has no intermission flow of its own, reuses
     cmd/engine's HUD styles as-is, uploads voxel meshes lazily (a brief
@@ -2307,8 +1975,7 @@ tools/genconfig has. The full key list:
                  full screen, the window size windowed) on both axes;
                  clamped [0.25, 2.0], default 1.0. 0.5 = render a quarter
                  of the pixels and let the GPU upscale; > 1 = supersample.
-                 The single biggest performance lever the software renderer
-                 has.
+                 The single biggest performance lever the renderer has.
   windowed       false (default) = borderless fullscreen on the primary
                  monitor, rendered at `resolution` (section 12); true = a
                  normal resizable window, rendered at the window's own size.
@@ -2329,72 +1996,36 @@ tools/genconfig has. The full key list:
                  (uncapped, low-latency) when the driver offers it.
   maxFPS         frame-rate cap (a sleep at end of frame) used when vsync
                  is off; 0 (default) = uncapped. Harmless with vsync on.
-  textureQuality one global texture filter for every world surface —
-                 walls, flats, sprites, voxels (texfilter.go). "nearest"
-                 (default) = classic hard pixels, no mips, plain
-                 nearest-neighbour sampling; "bilinear"; "trilinear" =
-                 + a box-filtered mip chain by on-screen scale;
-                 "aniso2x/4x/8x/16x" = trilinear + up to N taps along the
-                 footprint's major axis, so a wall/floor at a grazing
-                 angle stays sharp. The filtered modes are CPU work in the
-                 span inner loops — roughly 3x the world-render cost at
-                 "trilinear" and 5x at "aniso16x" (1440p, after the
-                 fixed-point bilerp rework — texfilter.go's bilerpLevel is
-                 still ~half of a filtered frame) — so it is opt-in and
-                 punishing at high resolutions on the Software renderer.
-                 Unknown -> "nearest". A spriteFilter / voxelFilter key in
-                 config.json is warned about and ignored.
-  lightingMode   "enhanced" (default) = the CPU emits a G-buffer and the
-                 multi-pass Vulkan pipeline (section 9) does deferred
-                 lighting, HDR, bloom and a soft-knee; "vanilla" = the CPU
-                 shades every wall/flat through the PrBoom port (section 8)
-                 and the GPU only blits. Unknown -> "enhanced". Chosen once
-                 at startup — a failed enhanced setup falls back to
-                 vanilla. Only consulted for renderer "software".
-  renderer       "software" (default) = the CPU rasterizer in raster/,
-                 with lightingMode picking vanilla vs. enhanced; "hardware"
-                 = GPU geometry built from the BSP walk (render/worldgeo),
-                 the GPU doing texturing / depth / the vanilla scalelight
-                 fade + per-surface dynamic point lights (section 9). World
-                 sprites are billboards; voxel models and ground shadows
-                 are software-only. Unknown -> "software"; a "hardware"
-                 path that can't start falls back to "software".
-  lightScale     multiplies every sector's light level before shading,
-                 both pipelines; clamped [0.1, 2.0], default 0.75 (moodier
-                 than vanilla Doom). 1.0 = the WAD's authored brightness.
-  ambientLight   brightness-FLOOR gain for the enhanced + hardware
-                 pipelines: after lightScale and every dynamic light are
-                 summed, a wall/flat/sprite never reads darker than
-                 ambientLight * that sector's OWN authored brightness,
+  [As of the software-rendering removal (see that section below):
+  textureQuality, lightingMode, renderer, shadows, and groundShadows are
+  retired — hardware (GPU-geometry) rendering is the only renderer, so
+  there's nothing left for any of them to configure. An old config.json
+  that still sets one of these keys gets a one-line "ignoring retired
+  key(s)" log at startup (config.deprecatedKeys) rather than silent no-op.]
+  lightScale     multiplies every sector's light level before shading;
+                 clamped [0.1, 2.0], default 0.75 (moodier than vanilla
+                 Doom). 1.0 = the WAD's authored brightness. Read back by
+                 the hardware renderer's shader (raster.LightScaleValue).
+  ambientLight   brightness-FLOOR gain: after lightScale and every dynamic
+                 light are summed, a wall/flat/sprite never reads darker
+                 than ambientLight * that sector's OWN authored brightness,
                  undiminished by camera distance — so a monster across a
                  lit room stays legible instead of fading toward black,
                  while a monster in a genuinely dark sector still needs a
                  real light (torch, muzzle flash, the flashlight). Clamped
                  [0, 1], default 0.2. 0 reproduces the old crush-to-black
-                 in every sector. Ignored by the vanilla pipeline.
-  exposure       final multiply on the enhanced HDR colour before the
-                 tonemap; clamped [0.1, 4.0], default 1.0. Ignored by the
-                 vanilla pipeline.
-  shadows        true (default) = the enhanced pipeline's screen-space
-                 occlusion march for the leading dynamic lights (an
-                 occluder between a light and a surface darkens it).
-                 Vanilla mode has no dynamic lights, so this is a no-op
-                 there. An explicit false survives.
-  groundShadows  false (default) = a cheap contact-shadow blob on the
-                 floor under every thing and the player (both pipelines).
-                 Grounds sprites/voxels but reads as a plain dark ellipse
-                 up close, hence off unless you set it true. An explicit
-                 true survives.
-  cartoonShading false (default) = the HARDWARE renderer only: world.frag's
-                 fade() posterizes its 0..1 brightness into cartoonLight
-                 Bands (4) flat steps instead of a smooth gradient, and
-                 worldblit.frag's post chain darkens pixels where the depth
-                 buffer jumps sharply — a silhouette, a corner, geometry
-                 against the sky — toward black (cartoonOutlineStrength
-                 0.85). Both are fixed constants in render/vulkan/world.go,
-                 not sub-knobs. The software vanilla/enhanced pipelines
-                 ignore it. In the launcher it sits in the top bar next to
-                 the WAD/level pickers, not the scrolling list.
+                 in every sector.
+  exposure       final multiply on the HDR colour before the tonemap;
+                 clamped [0.1, 4.0], default 1.0.
+  cartoonShading false (default): world.frag's fade() posterizes its 0..1
+                 brightness into cartoonLightBands (4) flat steps instead
+                 of a smooth gradient, and worldblit.frag's post chain
+                 darkens pixels where the depth buffer jumps sharply — a
+                 silhouette, a corner, geometry against the sky — toward
+                 black (cartoonOutlineStrength 0.85). Both are fixed
+                 constants in render/vulkan/world.go, not sub-knobs. In the
+                 launcher it sits in the top bar next to the WAD/level
+                 pickers, not the scrolling list.
   fogColor       distance-fog colour, hex "RRGGBB" (a leading '#' is
                  allowed). Empty (default) = no fog. An unparseable value
                  logs and disables fog.
@@ -2402,10 +2033,8 @@ tools/genconfig has. The full key list:
                  toward fogColor by 1 - exp(-fogDensity * cameraDistance)
                  (map units). 0 (default) = off; clamped to [0, 0.02].
                  ~0.0006 is a light haze, ~0.003 a heavy murk. Fog only
-                 applies when BOTH fogColor is set and fogDensity > 0, and
-                 in all three render paths: vanilla software as a post-pass
-                 over Pix+depth (raster.ApplyFog), enhanced in light.frag,
-                 hardware in world.frag. The sky is never fogged.
+                 applies when BOTH fogColor is set and fogDensity > 0,
+                 computed in world.frag. The sky is never fogged.
   iwad           explicit path to the base IWAD to merge under a picked
                  PWAD (section 2). Empty (default) = auto-find. Only
                  consulted when the picked WAD has no PLAYPAL of its own;
@@ -2448,9 +2077,8 @@ tools/genconfig has. The full key list:
                         that IWAD, the arsenal still swaps, the new guns
                         just draw/sound blank.
   flashlight            true (default) = the F-key head-mounted flashlight
-                        is available (a forward spot cone in enhanced /
-                        hardware, a flat brightness bump in vanilla —
-                        section 14). false disables the F toggle entirely.
+                        is available (a real forward spot cone — section
+                        14). false disables the F toggle entirely.
   skill                 which map THINGS spawn: 1-2 easy, 3 normal, 4-5
                         hard. Clamped [1, 5], default 3. Spawn counts only
                         — no ITYTD half-damage / Nightmare fast+respawn.
@@ -2515,8 +2143,6 @@ tools/genconfig has. The full key list:
                         false, or a missing pack, = sprites everywhere.
   voxelScale            map units per voxel; clamped [0.25, 4.0], default
                         1.0 (Cheello's Voxel Doom is authored 1:1).
-                        (Voxel splat antialiasing follows textureQuality:
-                        on for anything but "nearest".)
   quake1Textures        false (default) = ignore any Quake 1 texture pack;
                         true = for every Doom wall/flat name the curated
                         table covers, prefer assets/textures/quake1/*.png
@@ -2526,7 +2152,7 @@ tools/genconfig has. The full key list:
                         unaffected — it layers on the hi-res set (section 11).
 
 Config.RenderSize(windowed, fbW, fbH) produces the pixel size handed to
-raster.New and vulkan.New: windowed -> the window's framebuffer (fbW/fbH);
+raster.New and vulkan.NewWorld: windowed -> the window's framebuffer (fbW/fbH);
 full screen -> the resolution preset, capped to fbW/fbH when renderScale
 <= 1 ("native" is fbW/fbH directly); then renderScale on top. So a
 windowed run renders exactly at the window size with no rescale on
@@ -2572,74 +2198,35 @@ indices built once at level load, not by rescanning the level:
     EV_BuildStairs in particular drops from O(sectors x linedefs) per step
     to O(lines touching this sector).
 
-The software rasterizer (section 8) is where the per-frame CPU budget
-mostly goes, by design (section 1). What is done about that:
-  - Screen-strip parallelism. Render fans the BSP walk to one worker per
-    vertical strip, each drawing a disjoint band of columns with its own
-    occlusion clips — near-linear speedup in core count, the largest
-    single win. The frame clear, the world-sprite / voxel pass
-    (DrawThings) and the overlay composite all split the same way.
-  - Per-seg, not per-column, texture resolution. The string-keyed
-    WallTexture/Flat lookup is done once per seg.
-  - Lighting as a table lookup + integer multiply. PrBoom's scalelight /
-    zlight tables are baked once into [16][48] / [16][128] uint16 arrays
-    of 0..256 multipliers; the per-pixel path has no float math, no
-    [4]byte round-trips.
-  - Per-row texture-coordinate stepping in drawWallSpan is incremental (a
-    constant add per row). The per-column depth / texture-X in renderSeg
-    is deliberately a direct lerp on the absolute column, NOT an
-    accumulator, so strip workers starting mid-wall stay bit-identical.
-  - Not clearing the Normal / LightParam G-buffer planes each frame
-    (section 8) — the two full-plane memsets would be pure memory traffic
-    (nothing samples a plane where depth is +Inf). The overlay plane is
-    cleared and re-uploaded dirty-rows-only.
+The GPU does the actual per-pixel work now (section 9); the CPU side's job
+each frame is building/maintaining the triangle list and culling what the
+GPU doesn't need to see. What is done about that:
+  - Static-geometry visibility culling (render/worldgeo/visgrid.go): the
+    colour pass skips a static Draw whose real bounding box fails a
+    per-frame camera-vs-FOV test, and shares more textures back-to-back for
+    fewer descriptor rebinds.
+  - NOT re-Invalidate()ing the whole static vertex buffer on a mid-glide
+    frame whose interpolated sector height rounds to the same int16 as
+    last frame (renderedSectorHeightsChanged) — it was forcing a full-level
+    walk + a blocking GPU re-upload every frame a door moved.
+  - Moving SSAO's disc gather and the god-ray march off full-res pixels
+    into one quarter-res worldambient.frag pass (1/16 the pixel count, plus
+    a 3x3 AO denoise).
+  - assets.Textures' wall/flat/sprite decode cache (section 7) takes only a
+    read lock on the (overwhelmingly common) cache-hit path, so the several
+    goroutines that resolve textures while the static geometry builds don't
+    serialise against each other for a lookup that's just a map read.
   - Render resolution is the crude but decisive lever: config's
-    resolution / renderScale set how many pixels this whole stack touches
-    per frame; the GPU upscales whatever it produces. A CPU rasterizer at
-    1440p in enhanced mode is several times the per-pixel cost of 720p —
-    the resolution/renderScale knobs are the answer if the frame rate is
-    low.
-  - config textureQuality gates the heaviest sampling in the wall/flat
-    path. "nearest" (the default) keeps the integer nearest loop above;
-    "trilinear" adds a mip chain + bilinear (~3x the world-render cost),
-    "aniso8x"/"16x" add up to N mip taps along the footprint's major axis
-    (~5x at 1440p). bilerpLevel works in fixed point (8-bit weights,
-    integer MAC, one float convert) and skips the alpha channel on an
-    all-opaque texture; it is still ~half of a filtered frame, so at high
-    resolution the resolution/renderScale lever above matters more. The
-    tap count self-limits: a face-on
-    surface's footprint is isotropic, so it collapses back to one
-    trilinear tap — only genuinely oblique walls/floors pay the full
-    price. Mip chains are built lazily, once, per texture (worldMipsCache).
-
-On the GPU side, maxFramesInFlight is 2 (section 9) so the CPU frame build
-overlaps GPU/present; the uploaded G-buffer images are double-buffered per
-slot so a frame's upload doesn't stall on the previous frame's lighting
-pass; the enhanced light shader loops up to activeLightBudget lights per
-pixel with an inverse-square-distance cull (no per-light sqrt), and the CPU
-frustum-culls the light list before upload; and the staging memcpy of the
-four big G-buffer planes is fanned across goroutines.
-
-The hardware (GPU-geometry) path has its own three levers (section 9):
-static-geometry visibility culling (worldgeo/visgrid.go — the colour pass
-skips a static Draw whose real bounding box fails a per-frame camera-vs-FOV
-test, and shares more textures back-to-back for fewer descriptor rebinds);
-NOT re-Invalidate()ing the whole static vertex buffer on a mid-glide frame
-whose interpolated sector height rounds to the same int16 as last frame
-(renderedSectorHeightsChanged — it was forcing a full-level walk + a
-blocking GPU re-upload every frame a door moved); and moving SSAO's disc
-gather and the god-ray march off full-res pixels into one quarter-res
-worldambient.frag pass (1/16 the pixel count, plus a 3x3 AO denoise).
+    resolution / renderScale set how many pixels the GPU touches per frame.
+  - maxFramesInFlight is 2, so the CPU can build/record the next frame's
+    command buffer while the GPU is still presenting the last one.
 engine/game.go + iso_render.go log a per-stage (sim / build / draw) smoothed
 frame-timing line alongside the visibility stats so the next stall is
-locatable.
-
-The CPU rasterizer's ARCHITECTURE is meant to be CPU-heavy — that is the
-point (section 1). Parallelising it across cores is fair game; moving the
-BSP walk / wall / flat rasterization onto the GPU is not. Lighting is the
-sanctioned exception: in the default "enhanced" mode the CPU still does
-all the geometry and emits a G-buffer, and only the LIGHTING runs on the
-GPU.
+locatable — sim is gameplay (Systems + the 35Hz tic), build is the CPU-side
+BSP walk / geometry prep / visibility culling, draw is DrawWorld's command
+recording + submit + whatever fence wait it hits catching up to the GPU;
+splitting them apart is what tells "a slow OS/driver" apart from "this
+engine's own code got slower."
 
 
 19. TESTING
@@ -2668,46 +2255,36 @@ GPU.
     Doom1_Voxel.pk3 if present the whole KVX pipeline (the sprite-frame
     set maps, the imp model decodes to a few thousand voxels, per-model
     AngleOffset survives, an unmapped frame returns ok=false).
-  - raster: sprite filtering (mip chain halving to 1x1, premultiplied so
-    quarter-coverage reads ~63 not a dark halo, bilinear hits texel
-    centres and clamps to edge, trilinear blends level 0 and the
-    coarsest). World texture filtering (texfilter.go: texMips alpha-
-    weighted box-halve, fixed-point wrap-addressed bilerp with a fast
-    log2 for the LOD, anisotropic taps average across the major axis and
-    collapse to trilinear when isotropic, every textureQuality renders the
-    test map without panic and byte-identical serial vs. parallel at
-    aniso8x). The lighting model (monotonic in distance and sector light,
-    full-bright / row-31 bounds, cells pinned against PrBoom's scalelight
-    & zlight, fake-contrast direction, sprite/psprite shading). The
-    enhanced G-buffer (SetGBuffer allocates the planes, a real render
-    fills Normal/LightParam for every covered pixel with unit-ish normals,
-    albedo stays unshaded, vanilla output untouched when SetGBuffer is
-    never called). Sprite-rotation selection, HUD scale, and a full E1M1 /
-    Doom2 MAP01 render from several orientations proving strip-parallel
-    output is byte-for-byte identical to a single-strip render
-    (parallel_test.go, diag_test.go, also under -race; skip if the WAD is
-    absent). Voxel splatting (a near model paints pixels and matching
-    depth, a model past the size cutoff is declined, a nearer wall
-    occludes it, "smooth" produces partial edge blends "nearest"
-    doesn't). Status bar (drawPercentField right-aligns to ST_HEALTHX
-    with the '%' after, the four small ammo counters land on
-    BULL/SHEL/RCKT/CELL, the dead face draws once health is 0).
-    Ground shadows (DrawGroundShadow
-    only ever darkens the floor pixels it covers, the sampled centre pixel
-    is darkened, SetGroundShadows(false) and a shadow centred behind the
-    camera are both no-ops).
+  - raster: the sector/distance shading tables (monotonic in distance and
+    sector light, full-bright / row-31 bounds, cells pinned against
+    PrBoom's scalelight & zlight, fake-contrast direction, sprite/psprite
+    shading, BuildLightLUT matching the package's own lookup helpers
+    exactly — light_test.go, section 8). The weapon viewmodel's shared-origin anchor
+    math (weapon_test.go: a frame with the same offset as the resting pose
+    is the identity; a differently-cropped recoil frame's own offset still
+    lands on the resting pose's anchor; bottom-padding in a frame's canvas
+    pushes the resting position down by exactly that amount, so a padded
+    HD-pack frame's actual art — not the transparent canvas edge — reaches
+    the screen's bottom edge). Status bar (drawPercentField right-aligns
+    to ST_HEALTHX with the '%' after, the four small ammo counters land on
+    BULL/SHEL/RCKT/CELL, the dead face draws once health is 0). The
+    assets.Textures cache's RWMutex fast path (section 7): many goroutines
+    resolving the same wall texture / sprite at once converge on the exact
+    same decoded *RGBA rather than each losing the race and decoding its
+    own separate copy — run under -race.
   - config: repaired() clamping/defaulting for every field, RenderSize
     (preset, native, renderScale, windowed vs. full screen, the
     above-monitor cap), that an explicit bool false survives, findFrom
     locating a repo-root config.json from bin\ / a deep subdir, and
     DefaultJSON carrying a key for every Config field (reflection over the
-    json tags) and round-tripping back to Default(). SaveMerge (the
-    launcher's writer, save_test.go): rewrites managed values while keeping
-    an existing file's comments and unknown keys, appends a key the file
-    was missing, and writes a full config when there's no file yet.
-  - render: the world-position reconstruction the enhanced shader does
-    from depth round-trips against raster's forward projection, and
-    MaxLights stays in lockstep with the shader's fixed lights[] array.
+    json tags) and round-tripping back to Default(). deprecatedKeys flags
+    an old config.json's retired software-renderer keys (renderer,
+    lightingMode, textureQuality, shadows, groundShadows) alongside the
+    older spriteFilter/voxelFilter, so upgrading logs one line instead of
+    silently dropping them. SaveMerge (the launcher's writer, save_test.go):
+    rewrites managed values while keeping an existing file's comments and
+    unknown keys, appends a key the file was missing, and writes a full
+    config when there's no file yet.
   - render/worldgeo: IsoViewProj at zero elevation degenerates to
     ViewProj's own (right, up, forward) basis; IsoUnprojectToGround round-
     trips against IsoProjectToScreen; IsoTrueElevation actually tilts the
@@ -2760,7 +2337,7 @@ GPU.
     GRAVITY/kick/hard-landing, leaving a ledge arms the -GRAVITY*2 kick
     without moving that frame, a runner clears ~2x a walker's ground, the
     ledge boost only fires above running speed and preserves direction).
-    The enhanced-mode dynamic lights (muzzle-flash light only while firing
+    The dynamic lights (muzzle-flash light only while firing
     and warm-toned, per-weapon projectile colour, the explosion flare
     ramping then fading and spreading, collectLights capping at
     activeLightBudget nearest-first and reporting the dynamic count
@@ -2787,44 +2364,28 @@ GPU.
   Liquid glow (engine/liquidlights.go: liquidKindOfFlat classifies every
     family prefix; sampleSectorPoints returns 1/2/4 in-bounds points by pool
     size; a fake 2-sector LAVA1/NUKAGE1 level seeds a warm light and a green
-    one). Liquid surfaces (raster: classifyFloorLiquid maps the FWATER /
-    LAVA*+FIRELAVA / NUKAGE*+SLIME* families; shadeLiquid brightens+warms a
-    lava pixel and sets the G-buffer emissive key, green-tints a nukage one
-    without it; blendWater darkens+cools with no sky bound and pulls toward
-    the sky colour with one; serial/parallel E1M1 stays byte-identical with
-    the liquid path compiled in. worldgeo: liquidKindOfFlat table; an E1M1
-    build emits liquid-kind floor verts and every one faces up).
-  Water ripple (raster: waterWave stays bounded and deterministic and moves
-    with time; blendWater samples a different sky texel as animTime advances
-    but is identical at a fixed animTime — the property that keeps
-    serial==parallel; at maximum grazing a black pixel under a white sky
-    stays well under 50% so it never reads as a mirror, and blue is the
-    strongest channel; G-buffer mode stamps the matWater key — inside
-    light.frag's 0.10..0.22 window — and non-G-buffer mode leaves Normal
-    untouched). Water depth (a bright bottom is much darker at the horizon
-    than underfoot, deep water trends blue as red is absorbed first, and it
-    also darkens with view distance at a fixed screen row). Water sun glint
-    (a crest pixel under the drifting sun column near the horizon is
-    brighter than the same pixel off to the side — the highlight is
-    localised, not a sheen). Lava pulse (shadeLiquid's lava output differs
-    between two clock times and is stable at a fixed one).
+    one; worldgeo: liquidKindOfFlat table; an E1M1 build emits liquid-kind
+    floor verts and every one faces up). The full-screen liquid tint
+    (hwfx_test.go's TestLiquidTintFor: lava orange / nukage green / blood
+    red, none while standing on ordinary ground). Hardware-path sector
+    interpolation (hwfx_test.go: a mid-glide door's height lerps between
+    its snapshot and the live value, a tic boundary is a no-op, a static
+    geometry rebuild is skipped when the interpolated height rounds to the
+    same int16 as last frame) and ground-shadow collection
+    (TestCollectGroundShadows: nearest-first, capped at hwGroundShadowCap,
+    a missile/ceiling-hung/floating thing excluded).
   Brightmaps (assets: loadBrightmapMask nearest-resamples a mask to the base
     size, replicates luma across channels, and returns nil for an all-black
     mask; Brightmap misses + caches the miss when nothing is indexed or the
-    base is nil. raster: applyBright stamps LightParam.g in G-buffer mode,
-    scales the pixel up hue-preserved in the vanilla path, and no-ops a
-    ~zero mask value. worldgeo: Brightmaps stays parallel to Textures and
+    base is nil. worldgeo: Brightmaps stays parallel to Textures and
     every Draw.Bright matches its texture slot's entry. tools/genbright:
     buildMask keeps a solid coloured block, rejects bright *grey*
     highlights, scattered speckle, and a wall that is bright everywhere).
   Distance fog (config: Fog() is off by default / when only colour or only
     density is set, on with the colour parsed when both are; repaired blanks
-    a bad hex and clamps density. raster: ApplyFog blends toward the fog
-    colour by distance, is a no-op when disabled, and skips the sky
-    sentinel depth).
-  Ground shadows (drawGroundShadows is a no-op with
-    config groundShadows off even with a nil renderer, and only ever
-    darkens the frame on a real level). mobjZClip (a corpse rides a
+    a bad hex and clamps density — consumed by worldgeo.Camera / world.frag,
+    section 9).
+  mobjZClip (a corpse rides a
     lowering floor down; a NOGRAVITY floater doesn't), the boss-death
     floor drop, damage (armour/pain/death/gib/kill count), player death (a
     lethal hit marks the player dead and finalises the mobj, later damage
@@ -2832,8 +2393,7 @@ GPU.
     but a crush kills regardless; checkPlayerCrush kills when a sector's
     gap drops below player height and is idempotent). IWAD integration
     tests: stand the player on every shareware item and confirm it
-    collects; walk Doom II MAP01 start -> exit with real collision and
-    assert no frame renders as mostly black void.
+    collects.
     Heretic (heretic_test.go, skipped without wad/heretic.wad):
     wad.IsHeretic() true; E1M1 spawns the yellow key + the right Heretic
     decorations (SRTC/WTRH/SKH*) via spriteOverride; the special-34 keyed
@@ -2852,11 +2412,11 @@ GPU.
     following Doom session), the crossbow's 3-bolt spread, a Quartz Flask
     healing 25, Tome/Wings setting their powers, Morph Ovum chickening a
     monster, and the Tome making the Wand a 5-shot fan + the Firemace a
-    big-radius death ball. heretic_screenshot_test.go (opt-in
-    HERETIC_SHOT=1) renders geometry + things + monsters + weapon + the
-    Heretic status bar to PNGs.
+    big-radius death ball.
 
-The GPU present path and the real input/window loop are not unit-tested.
+The GPU present path and the real input/window loop are not unit-tested;
+neither is a rendered frame's actual pixels (there is no offscreen-
+readback capability in this codebase to capture one from a test).
 The engine tests need cgo to build, since the package imports window/audio.
 
 
@@ -2901,50 +2461,31 @@ spritePrefix, frame) is a plain map lookup keyed by the lowercase
 "<prefix><a+frame>" string the engine builds from spriteNames[mo.Sprite]
 and mo.Frame.
 
-Rendering (raster/voxel.go, DrawVoxel). Called from engine.Game.drawMobjs
-when Game.Voxels has a model for the thing's current frame; it returns
-false — and drawMobjs falls back to the billboard — when the model would
-be under minVoxelHeightPx (24) tall on screen. Otherwise it splats the
-model:
-  - Each grid column's local (x, y) offset from the KVX pivot is rotated
-    about the vertical axis by (thing angle + VOXELDEF AngleOffset +
-    voxelYawBias) and added to the thing's world position. The screen
-    position and splat size are scaled at the thing's CENTRE depth, not
-    per column — an orthographic-style projection that keeps the model's
-    screen footprint equal to the billboard sprite it replaces while still
-    letting it turn to face any direction; the volumetric read comes from
-    which voxels are visible, not from internal foreshortening.
-  - Each solid voxel becomes a small screen-space square (one voxel wide
-    at the centre depth, grown ~30% so neighbours overlap), depth-tested
-    per pixel against r.depth using that voxel's REAL camera-space depth —
-    so occlusion is still true 3D — and writing depth back.
-  - Splat antialiasing follows config textureQuality (section 17): any
-    value but "nearest" treats each splat's rectangle as a float and
-    coverage-antialiases its border pixels (pixCover), claiming depth only
-    where coverage >= 0.5 — so the silhouette and the seams between splats
-    soften. "nearest" is the plain hard write. (A voxel has no texture, so
-    the mip / anisotropic machinery doesn't apply here.)
-  - Shading is the sprite model (section 8): one spriteShade(sectorLight,
-    depth) multiplier for the whole model in the vanilla path, or the
-    thing's real sector light written to LightParam per pixel in the
-    G-buffer path, plus a subtle top-lit term from each voxel's KVX face
-    bits. A fullbright frame skips all of it.
-  - voxelScale (config, default 1.0) is map units per voxel; Cheello's
-    pack is authored 1:1 with Doom units (an imp's model is ~57 voxels
-    tall).
-
-The splat pass runs strip-parallel with the sprites (DrawThings fans both
-across the same column bands, each splat clipped to its worker's band);
-its cost tracks on-screen voxel count, so a big monster filling the view
-is roughly one extra full-screen fill; the size cutoff and KVX's
-surface-only data bound it, and distance falls back to the cheap sprite.
-Orientation is two constants in raster/voxel.go: voxelYawBias (-90 degrees
-for Cheello's pack, which authors models a quarter turn off Doom's angle
-0) and voxelMirrorY (off) — retune for a different pack. Things stay
-upright (no voxel pitch/roll). Every static decoration and every Doom 1 /
-Doom II item spawns and voxelizes; the missiles/projectiles the pack
-comments out, and the Doom II monsters not yet ported (section 16), never
-reach the renderer.
+Rendering is real GPU geometry, not a CPU splat: render/worldgeo.
+BuildVoxelMesh (once per model, cached — section 9) turns a KVX model into
+a static vertex-coloured cube-face mesh, and a dedicated voxel.vert/frag
+pipeline draws one instance per visible voxelized thing inside the world
+pass, depth-sorted against the level geometry like anything else. Per
+frame, engine.Game.collectWorldObjects (engine/mobj.go) resolves each live
+mobj to a worldgeo.VoxelInstance when Game.Voxels has a model for its
+current sprite frame, else a sprite billboard (section 8's ThingSprite) —
+there is no on-screen-size cutoff any more; a model far enough to be tiny
+just draws as a tiny mesh, the same way a distant sprite draws small.
+  - Yaw is (thing angle + VOXELDEF AngleOffset + voxelKVXFrontBias — the
+    last a fixed -90 degrees, engine/mobj.go, backing every KVX model's
+    built-in "front" a quarter turn to line up with a Doom thing's facing;
+    tune per-pack via AngleOffset, not this constant). Things stay upright
+    (no voxel pitch/roll).
+  - Scale is config voxelScale (default 1.0, map units per voxel —
+    Cheello's pack is authored 1:1 with Doom units, an imp's model is ~57
+    voxels tall) times the VOXELDEF entry's own Scale multiplier.
+  - Shading is world.frag's normal per-pixel model (section 9): the
+    thing's real sector light plus every dynamic light in range, not a
+    single flat multiplier for the whole model. A fullbright frame skips
+    the sector-fade term.
+Every static decoration and every Doom 1 / Doom II item spawns and
+voxelizes; the missiles/projectiles the pack comments out, and the Doom II
+monsters not yet ported (section 16), never reach the renderer.
 
 Wall switches. There is no procedural 3D switch relief: switches render as
 their flat wall texture like any other wall (the normal wall pass), and
@@ -3102,10 +2643,10 @@ game fonts or palette — one public-domain 7x13 bitmap font (basicfont,
 canvas.go), flat rectangles, a dark neutral slate palette (the `theme`
 table, one place to re-skin). It reuses the engine's own presentation
 stack, nothing new: a fixed 900x700 window (window.NewFixed) and a plain
-vulkan.New(win, w, h, vsync=true, debug=false, lit=false) blit renderer —
-"present this RGBA8 CPU buffer", the same vanilla path lightingMode
-"vanilla" uses — which is exactly what launcher.Canvas produces. Both are
-torn down before the game's window stands up.
+vulkan.New(win, w, h, vsync=true, debug=false) blit renderer — "present
+this RGBA8 CPU buffer", the same plain CPU-buffer path the level editor's
+own GUI uses (section 25) — which is exactly what launcher.Canvas produces.
+Both are torn down before the game's window stands up.
 
   launcher.Run(config.Load()) (run.go)
     - opens the window + blit renderer, builds Canvas / UI / Poller / Model
@@ -3137,11 +2678,11 @@ IntField, plus Hint (a one-line hover tooltip: queued by a row after its
 widget draws, drawn on top by UI.End just before the dropdown overlay).
 An open dropdown's overlay list also swallows the pointer: hover() returns
 false for any widget while the mouse is inside ui.deferred.list, so a click
-on an option can't also toggle the row it visually covers (the Renderer
-list's first option sits exactly on the Lighting Mode box).
+on an option can't also toggle the row it visually covers (an open
+dropdown's list commonly extends down over the row below it).
 Cross-frame state (which field has focus and its cursor, which dropdown is
 open and its scroll, an in-progress IntField draft) lives in id-keyed maps,
-so the ~38-row settings table needs no matching struct fields. Canvas
+so the ~35-row settings table needs no matching struct fields. Canvas
 (canvas.go) is the CPU RGBA target: Fill / FillRect / StrokeRect / Text,
 with a Clip stack (the settings panel clips to its viewport; font.Drawer
 writes through a clippedRGBA wrapper).
@@ -3167,7 +2708,7 @@ was off) accounts for every field on Config, so a field added later can't
 silently go missing —
 the same guard tools/genconfig's DefaultJSON has; other tests assert every
 field has a hint and every Section has a tabTitles entry. The dropdown
-option lists (resolutionOptions, textureQualityOptions, ...) pair
+option lists (resolutionOptions, hudStyleOptions, ...) pair
 config.go's own accepted keyword constants with human labels, so the table
 can't offer a value repaired() would reject.
 
@@ -3202,10 +2743,10 @@ first-person-only and simply unread here) and playSession; Escape / window
 close returns to the launcher. TPF_WAD / a *.wad arg takes runHeadless.
 
 playSession wiring on top of a normal engine.NewGame:
-  - game.HardwareMode = true; game.WorldBuilder = worldgeo.New(...) with
-    SkipCeilings = true (a top-down camera would only ever see ceiling
-    undersides); OnLevelChange re-applies SkipCeilings + Invalidate after
-    engine/level.go rebuilds the builder for the next map.
+  - game.WorldBuilder = worldgeo.New(...) with SkipCeilings = true (a
+    top-down camera would only ever see ceiling undersides); OnLevelChange
+    re-applies SkipCeilings + Invalidate after engine/level.go rebuilds the
+    builder for the next map.
   - game.ReplaceMovementSystem(engine.IsoMovementSystem{}) and
     game.ReplaceUseSystem(engine.IsoUseSystem{}) (section 14) — slots 0/1
     swapped in place, every other System unchanged.
@@ -3277,8 +2818,7 @@ rooms stay clean:
   - playerFade: the original wider, up-to-35% dither around screen centre
     so a near wall never hides where the player is.
 Voxel meshes upload lazily on first sight (syncIsoVoxelMeshes) rather than
-warmed up front. Ground shadows and the enhanced software lighting chain
-are not in this path.
+warmed up front. Ground shadows (section 9) are not in this path.
 
 
 24. HERETIC SUPPORT
@@ -3336,10 +2876,9 @@ Game.heretic, which switches on everything below.
   only SKY1..SKY3 and picks by episode differently from Doom's SKY1..SKY4
   (E1->SKY1, E2->SKY2, E3->SKY3, E4/E5/E6 reuse SKY1/SKY3/SKY3); without
   this E4+ asked for a nonexistent SKY4 and drew the missing-texture
-  checkerboard. raster.SetPreferWADSky(true) also makes the CPU path ignore
-  the external Mars panorama for Heretic, and Textures.DropHiresOverrides
-  ("SKY1".."SKY3") removes the generated Doom sky PNGs (whose names collide),
-  so Heretic's own fantasy skies show.
+  checkerboard. Textures.DropHiresOverrides ("SKY1".."SKY3") removes the
+  generated Doom sky PNGs (whose names collide), so Heretic's own fantasy
+  skies show.
 
   HD textures (assets/textures/heretic/, section 11). cmd/engine's NewGame
   calls Textures.SetHeretic(true) for a Heretic IWAD, so a community Heretic
@@ -3366,14 +2905,12 @@ Game.heretic, which switches on everything below.
   the flame is a separate model (TFULA.kvx) its DECORATE spawns as a child,
   which this engine doesn't run. LoadVoxelPack stashes TFULA under a
   reserved key (VoxelSet.HereticTorchFlame); when a torch/brazier voxelizes,
-  the three world collectors (collectWorldObjects, drawMobjs,
-  CollectIsoWorldObjects) also emit that flame model on top via
-  Game.hereticFlameFor — FullBright, gently turning + bobbing, scaled and
+  the two world collectors (collectWorldObjects, CollectIsoWorldObjects)
+  also emit that flame model on top via Game.hereticFlameFor — a
+  worldgeo.VoxelInstance, FullBright, gently turning + bobbing, scaled and
   lifted per prep type (hereticTorchFlames), seated at the host model's
   visual top (baseZ + (ZPivot-0.5)*hostScale). The warm point light now sits
   at the same height, so the wall around a torch takes an orange cast.
-  raster.SceneThing gained ModelScale (a multiplier over config voxelScale)
-  for the software path's flame.
 
   Monsters (engine/heretic_actors.go — hereticMonsters, keyed by Heretic
   DoomEdNum). Heretic mobjs behave like Doom's, so the ported Doom AI runs
@@ -3525,8 +3062,8 @@ Game.heretic, which switches on everything below.
   instance — a live E1M1 frame is ~116 instances / 116 vkCmdDraw, all
   cache-resident. Two one-shot log lines make it visible at a glance:
   engine's "[hw] map objects this frame — N voxel instance(s), M sprite(s)"
-  (engine/game.go, mirrors drawMobjs' software-path line) and vulkan's
-  "voxel models — drew N of M instance(s) ... K model(s) resident".
+  (engine/game.go) and vulkan's "voxel models — drew N of M instance(s) ...
+  K model(s) resident".
 
 Not done: a real chicken-morph PLAYER state (single-player Heretic has no
 way to trigger one — the Morph Ovum chickens a monster instead); the
@@ -3538,9 +3075,10 @@ can't hand-alias, and monster voxels (the pack ships none).
 
 25. cmd/editor — THE LEVEL EDITOR
 ----------------------------------
-A dual-view map editor: a 2D top-down view on the left, and the same CPU
-software rasterizer the game itself uses rendering the map live on the
-right, so an edit shows up in 3D immediately. See EDITOR_MANUAL.txt
+A dual-view map editor: a 2D top-down view on the left, and the same
+hardware (GPU-geometry) renderer the game itself uses rendering the map
+live on the right, so an edit shows up in 3D immediately. See
+EDITOR_MANUAL.txt
 (repo root) for the user-facing how-to; this section is the shape of the
 code underneath it. A separate executable from cmd/engine — it shares no
 process state, only packages — built on a NEW immediate-mode UI kit
@@ -3561,24 +3099,26 @@ editor.Run(wadPath, startNew, fullscreen) (app.go) owns the whole session:
   - App.openWindow(fullscreen) creates the window (window.NewFixed at
     1600x900, or window.New(0,0,title,true) — borderless, the monitor's
     own mode, the exact mechanism cmd/engine's fullscreen uses) and its
-    vulkan.New blit renderer (section 9's vanilla path, same as the
-    launcher's own Canvas). F11 / View > Toggle Fullscreen calls it again
-    later — from App.pending, never mid-frame — tearing down the old
-    win+blit and creating new ones; imkit.Canvas.Resize keeps the SAME
-    *Canvas (so imkit.UI and every widget's cross-frame id-keyed state
-    survive the switch untouched), the 2D/3D split position rescales
-    proportionally to the new width, and the 3D view's raster.Renderer is
-    dropped so it reallocates at its new pane size. cmd/editor/main.go's
-    init() calls runtime.LockOSThread(), matching cmd/engine/
-    cmd/isoengine — every GLFW call has to stay on the thread that called
-    glfw.Init(), and editor is its own binary so it needs its own pin.
+    vulkan.NewWorld renderer (section 9's hardware path — App.blit is a
+    render/vulkan.Renderer built for GPU-geometry, not the plain CPU-buffer
+    blit the launcher's own Canvas uses; see view3d below for why). F11 /
+    View > Toggle Fullscreen calls it again later — from App.pending, never
+    mid-frame — tearing down the old win+blit and creating new ones;
+    imkit.Canvas.Resize keeps the SAME *Canvas (so imkit.UI and every
+    widget's cross-frame id-keyed state survive the switch untouched) and
+    the 2D/3D split position rescales proportionally to the new width.
+    cmd/editor/main.go's init() calls runtime.LockOSThread(), matching
+    cmd/engine/cmd/isoengine — every GLFW call has to stay on the thread
+    that called glfw.Init(), and editor is its own binary so it needs its
+    own pin.
   - The frame loop mirrors launcher.Run's shape: PollEvents -> Poller.Poll
     -> ui.Begin -> App.frame (menu bar, the VSplit, the three panes, the
-    status bar) -> ui.End -> blit.DrawFrame(canvas.Img.Pix); a deferred
-    App.pending closure runs after present (Play, Save, New Level, the
-    fullscreen toggle — anything that shouldn't mutate state mid-draw);
-    Doc.RebuildIfDirty runs last, picking up any geometry edit made this
-    frame.
+    status bar) -> ui.End -> blit.DrawWorld(v3.geom, v3.wc, cv.W, cv.H,
+    cv.Img.Pix, nil) (view3d's doc comment explains why DrawWorld, not
+    DrawFrame, presents the WHOLE editor UI); a deferred App.pending
+    closure runs after present (Play, Save, New Level, the fullscreen
+    toggle — anything that shouldn't mutate state mid-draw); Doc.
+    RebuildIfDirty runs last, picking up any geometry edit made this frame.
 
 Bank (assets.go) is the editor's merged asset set: wad.Merge across the
 WAD being edited plus every *.wad found (recursively) under the same three
@@ -3648,7 +3188,7 @@ backwards in an early version of both commitRoom and NewEmptyDoc — every
 wall backface-culled from inside the room it bounded, and the 3D view
 rendered solid black; TestCommitRoomFacesInward / TestNewEmptyDoc
 BuildsAndFacesInward in editor/doc_test.go check it the same way
-raster.renderSeg's own backface cull does, by cross product against the
+the GPU-geometry builder's own backface cull does, by cross product against the
 room's centre). Drag-and-drop (imkit.DragSource/DropTarget) is how a
 texture/flat/thing actually gets onto the map — see panel below;
 view2d.drawDropHover outlines the live drop target while a drag is in
@@ -3657,9 +3197,23 @@ top-left toolbar strip (y < rect.Y+34) is excluded from both selection and
 the draw tool, so choosing a mode or hitting DRAW can't also select or
 place a vertex on whatever geometry happens to sit under the button.
 
-view3d (view3d.go) owns a raster.Renderer sized to its pane (recreated
-whenever the pane resizes) and a free-fly raster.Camera: RMB-drag looks
-(WASD/Q/E move — see the key table below), always rendering
+view3d (view3d.go) is a live 3D preview rendered through the SAME hardware
+(GPU-geometry) path the game itself uses (render/worldgeo + render/vulkan's
+DrawWorld) rather than a separate CPU renderer — App's blit renderer is a
+vulkan.NewWorld, not the vanilla vulkan.New the rest of the editor's 2D UI
+used to use exclusively. Since the editor composites its whole UI as one
+CPU-drawn 2D plane (imkit.Canvas), the pane works the same way the game's
+own weapon/HUD overlay does, just inverted: view3d.draw cuts a fully
+transparent hole (Canvas.ClearRect) in the 2D canvas over the pane's rect,
+and App.Run's single per-frame DrawWorld call paints the GPU-rendered world
+underneath the WHOLE canvas — invisible everywhere the 2D canvas stays
+opaque (menus, the 2D map view, panels), showing through only there. The
+camera's FOV is still computed for the full window (DrawWorld has no
+notion of a sub-viewport), so the pane shows an undistorted but more
+"zoomed in" crop of that projection rather than one framed for its own
+aspect ratio. view3d keeps a worldgeo.Builder, rebuilt only when Doc.tree
+actually changes (an edit), and a free-fly raster.Camera: RMB-drag looks
+(WASD/Q/E move — see the key table below), always built from
 Doc.RenderLevel() against Doc.tree, whatever it currently is.
 FocusOn(x, y, floorZ) — the 2D selection's "jump the 3D view there" — does
 not teleport: it computes a point back along the camera's existing bearing

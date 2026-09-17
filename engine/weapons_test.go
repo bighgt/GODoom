@@ -123,34 +123,45 @@ func TestWeaponBobScaleClosestAtCentreFarthestAtExtremes(t *testing.T) {
 }
 
 // TestChainsawIdleAndFiringFrames: the running chainsaw's viewmodel should
-// vibrate on SAWG C/D while idle (id's S_SAW/S_SAWB) and grind on SAWG A/B
-// while firing (S_SAW1/S_SAW2) — not sit on a static 'A'.
+// vibrate through SAWB B/C/D while idle and grind through SAWN (windup)
+// then SAWF (the cut) while firing — not sit on a static 'A'. Also checks
+// the sprite family actually switches at the SAWN->SAWF handoff (tic 3),
+// since this is the weapon whose port most depends on WeaponFrame.Prefix.
 func TestChainsawIdleAndFiringFrames(t *testing.T) {
 	g := &Game{Weapon: WeaponState{Current: wpChainsaw, phase: weaponReady, pending: -1}}
 
+	// IdleFrames: SAWB B,C,D,C at 2 tics each (loops every 8 tics).
 	for _, tc := range []struct {
 		tics float64
 		want byte
 	}{
-		{0, 'C'}, {3, 'C'}, {4, 'D'}, {7, 'D'}, {8, 'C'}, {12, 'D'}, {800, 'C'},
+		{0, 'B'}, {3, 'C'}, {4, 'D'}, {7, 'C'}, {8, 'B'}, {12, 'D'}, {800, 'B'},
 	} {
 		g.Weapon.idleTics = tc.tics
-		gf, _, hasFlash := g.currentSprite()
+		gp, gf, _, _, hasFlash := g.currentSprite()
 		if gf != tc.want || hasFlash {
 			t.Errorf("idle @%.0ft: frame %q flash %v, want %q false", tc.tics, gf, hasFlash, tc.want)
+		}
+		if gp != "SAWB" {
+			t.Errorf("idle @%.0ft: prefix %q, want SAWB", tc.tics, gp)
 		}
 	}
 
 	g.Weapon.phase = weaponFiring
 	for _, tc := range []struct {
-		tics float64
-		want byte
+		tics       float64
+		wantFrame  byte
+		wantPrefix string
 	}{
-		{0, 'A'}, {3, 'A'}, {4, 'B'}, {7, 'B'},
+		{0, 'A', "SAWN"}, {2, 'C', "SAWN"}, {3, 'A', "SAWF"}, {7, 'B', "SAWF"},
 	} {
 		g.Weapon.fireElapsedTics = tc.tics
-		if gf, _, _ := g.currentSprite(); gf != tc.want {
-			t.Errorf("firing @%.0ft: frame %q, want %q", tc.tics, gf, tc.want)
+		gp, gf, _, _, _ := g.currentSprite()
+		if gf != tc.wantFrame {
+			t.Errorf("firing @%.0ft: frame %q, want %q", tc.tics, gf, tc.wantFrame)
+		}
+		if gp != tc.wantPrefix {
+			t.Errorf("firing @%.0ft: prefix %q, want %q", tc.tics, gp, tc.wantPrefix)
 		}
 	}
 }
@@ -159,7 +170,7 @@ func TestChainsawIdleAndFiringFrames(t *testing.T) {
 func TestNonChainsawIdlesOnFrameA(t *testing.T) {
 	for _, wp := range []int{wpFist, wpPistol, wpShotgun, wpChaingun, wpMissile, wpPlasma, wpBFG, wpSuperShotgun} {
 		g := &Game{Weapon: WeaponState{Current: wp, phase: weaponReady, pending: -1, idleTics: 777}}
-		if gf, _, _ := g.currentSprite(); gf != 'A' {
+		if _, gf, _, _, _ := g.currentSprite(); gf != 'A' {
 			t.Errorf("%s idle frame %q, want 'A'", Weapons[wp].Name, gf)
 		}
 	}
@@ -250,7 +261,7 @@ func TestIdleSoundIntervalClamped(t *testing.T) {
 }
 
 func TestFramesTotalAndLoopedFrame(t *testing.T) {
-	fs := []WeaponFrame{{'C', 4}, {'D', 4}}
+	fs := []WeaponFrame{{Frame: 'C', Tics: 4}, {Frame: 'D', Tics: 4}}
 	if got := framesTotalTics(fs); got != 8 {
 		t.Errorf("framesTotalTics = %d, want 8", got)
 	}

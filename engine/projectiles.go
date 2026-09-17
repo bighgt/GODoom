@@ -43,29 +43,35 @@ type Projectile struct {
 
 // spawnProjectile fires one from the camera's current position along its
 // facing direction (yaw and pitch both), offset slightly ahead so it
-// doesn't immediately collide with geometry right at the camera.
-func (g *Game) spawnProjectile(def *ProjectileDef) {
+// doesn't immediately collide with geometry right at the camera. Returns
+// the shot(s) just created (normally one; a spread weapon fires several at
+// once) — RocketFollow uses this to grab the exact shot to chase.
+func (g *Game) spawnProjectile(def *ProjectileDef) []*Projectile {
 	baseYaw := g.Camera.Angle
 	_, _, dz := aimDirection(g.Camera)
 	shots := def.Shots
 	if shots < 1 {
 		shots = 1
 	}
+	spawned := make([]*Projectile, 0, shots)
 	for i := 0; i < shots; i++ {
 		yaw := baseYaw
 		if shots > 1 {
 			yaw += (float64(i) - float64(shots-1)/2) * def.SpreadRad
 		}
 		dx, dy := math.Cos(yaw), math.Sin(yaw)
-		g.projectiles = append(g.projectiles, &Projectile{
+		p := &Projectile{
 			X:  g.Camera.X + dx*projectileStartDist,
 			Y:  g.Camera.Y + dy*projectileStartDist,
 			Z:  g.Camera.Z + dz*projectileStartDist,
 			DX: dx, DY: dy, DZ: dz,
 			def:   def,
 			Alive: true,
-		})
+		}
+		g.projectiles = append(g.projectiles, p)
+		spawned = append(spawned, p)
 	}
+	return spawned
 }
 
 // aimDirection is the camera's forward unit vector in full 3D, combining
@@ -115,6 +121,37 @@ func (g *Game) updateProjectiles(dt float64) {
 		}
 	}
 	g.projectiles = alive
+	// RocketFollow: the followed rocket just finished its explosion
+	// animation and was removed above — hand the camera back to the player.
+	if g.rocketCam != nil && !g.rocketCam.Alive {
+		g.rocketCam = nil
+	}
+}
+
+// rocketCamChaseDist/rocketCamLift trail RocketFollow's camera a little
+// behind and above the rocket rather than riding literally inside it —
+// avoids the view burying itself in the rocket's own sprite (or, on
+// impact, the surface it hit). Because the offset is applied along the
+// rocket's own straight flight line, the camera arrives already framed on
+// the explosion the instant the rocket stops — no separate pull-back
+// transition needed when p.exploding flips true.
+const (
+	rocketCamChaseDist = 96.0
+	rocketCamLift      = 12.0
+)
+
+// rocketFollowCamera computes RocketFollow's camera pose for the followed
+// projectile p, reusing fovDeg from the player's own camera so the follow
+// shot doesn't jump to a different field of view.
+func rocketFollowCamera(p *Projectile, fovDeg float64) raster.Camera {
+	return raster.Camera{
+		X: p.X - p.DX*rocketCamChaseDist,
+		Y: p.Y - p.DY*rocketCamChaseDist,
+		Z: p.Z - p.DZ*rocketCamChaseDist + rocketCamLift,
+		Angle:  math.Atan2(p.DY, p.DX),
+		Pitch:  math.Asin(math.Max(-1, math.Min(1, p.DZ))),
+		FOVDeg: fovDeg,
+	}
 }
 
 // advanceProjectile moves p forward by one frame's worth of travel,
@@ -156,7 +193,7 @@ func (g *Game) advanceProjectile(p *Projectile, dt float64) bool {
 			return true
 		}
 		sec := bsp.PointSector(g.BSP, g.Level, float32(nx), float32(ny))
-		if sec == nil || nz <= float64(sec.FloorHeight) || nz >= float64(sec.CeilingHeight) {
+		if sec == nil || nz <= sec.FloorZAt(nx, ny) || nz >= sec.CeilZAt(nx, ny) {
 			return true
 		}
 

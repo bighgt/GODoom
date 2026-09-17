@@ -83,29 +83,34 @@ func TestSuperShotgunReloadSoundSequence(t *testing.T) {
 	}
 }
 
+// TestSuperShotgunFireFrames checks the ported HD sequence (SmoothSuperShotgun
+// — SH2N discharge, SH2R break-open reload, SH2S snap-shut, see
+// Weapons[wpSuperShotgun]'s own doc comment for the exact tic breakdown)
+// at a spread of points across all three sprite families.
 func TestSuperShotgunFireFrames(t *testing.T) {
 	g := &Game{Weapon: WeaponState{Current: wpSuperShotgun, phase: weaponFiring, pending: -1}}
-	// A A B C D E F A A at 3,7,7,7,7,7,7,5,4 tics.
 	checks := []struct {
-		atTic float64
-		frame byte
+		atTic  float64
+		frame  byte
+		prefix string
 	}{
-		{1, 'A'}, {5, 'A'}, {12, 'B'}, {20, 'C'}, {27, 'D'}, {34, 'E'}, {41, 'F'}, {47, 'A'}, {52, 'A'},
+		{1, 'A', "SH2N"}, {5, 'A', "SH2N"}, {12, 'B', "SH2R"}, {20, 'J', "SH2R"},
+		{27, 'O', "SH2R"}, {34, 'X', "SH2R"}, {41, 'C', "SH2S"}, {47, 'G', "SH2S"}, {52, 'A', "SH2N"},
 	}
 	for _, c := range checks {
 		g.Weapon.fireElapsedTics = c.atTic
-		f, _, _ := g.currentSprite()
-		if f != c.frame {
-			t.Errorf("at tic %.0f: frame %c, want %c", c.atTic, f, c.frame)
+		p, f, _, _, _ := g.currentSprite()
+		if f != c.frame || p != c.prefix {
+			t.Errorf("at tic %.0f: %s%c, want %s%c", c.atTic, p, f, c.prefix, c.frame)
 		}
 	}
-	// Muzzle flash (I then J) only in the first ~7 tics.
+	// Muzzle flash (A then B, 4+3 tics) only in the first 7 tics.
 	g.Weapon.fireElapsedTics = 2
-	if _, ff, has := g.currentSprite(); !has || ff != 'I' {
-		t.Errorf("early flash = %c (has=%v), want I", ff, has)
+	if _, _, _, ff, has := g.currentSprite(); !has || ff != 'A' {
+		t.Errorf("early flash = %c (has=%v), want A", ff, has)
 	}
 	g.Weapon.fireElapsedTics = 30
-	if _, _, has := g.currentSprite(); has {
+	if _, _, _, _, has := g.currentSprite(); has {
 		t.Error("SSG still flashing 30 tics in")
 	}
 }

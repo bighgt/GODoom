@@ -50,12 +50,46 @@ type Sidedef struct {
 
 // Sector is one entry of the SECTORS lump (26 bytes): a floor/ceiling height
 // pair, their textures ("flats"), light level, and any special behavior.
+//
+// FloorTiltX/Y, CeilTiltX/Y and SlopePivotX/Y are not part of the vanilla
+// lump — they're set only by an optional SLOPES sidecar (engine/slopes.go),
+// following the same optional-extension convention as GLDEFS/ANIMDEFS/
+// TEXTURES. Zero (every vanilla sector, and the zero value of this struct)
+// makes FloorZAt/CeilZAt degenerate to exactly the flat FloorHeight/
+// CeilingHeight scalar everywhere — a sloped sector is the exception, never
+// the representation movers/collision/etc. have to think about. See
+// FloorZAt's own doc comment for why FloorHeight/CeilingHeight keep their
+// original meaning (the plane's value AT the pivot, not at the world
+// origin) even once a sector is tilted.
 type Sector struct {
 	FloorHeight, CeilingHeight   int16
 	FloorTexture, CeilingTexture string
 	LightLevel                   int16
 	SpecialType                  uint16
 	Tag                          uint16
+
+	FloorTiltX, FloorTiltY   float64
+	CeilTiltX, CeilTiltY     float64
+	SlopePivotX, SlopePivotY float64
+}
+
+// FloorZAt returns the sector's floor height at world (x, y): exactly the
+// flat FloorHeight scalar wherever FloorTiltX/Y are zero (every vanilla
+// sector, and any sector before a SLOPES lump is applied), or that scalar
+// plus the authored tilt evaluated relative to SlopePivotX/Y otherwise.
+// FloorHeight keeps meaning "the height at the pivot" rather than "the
+// height at world (0,0)" specifically so a mover raising/lowering the
+// sector (which only ever touches this one int16 scalar — see
+// engine/specials.go's floorMove et al.) carries the whole tilted plane
+// with it for free, and so the value stays in ordinary map-height range
+// regardless of how far the sector sits from the map origin.
+func (s *Sector) FloorZAt(x, y float64) float64 {
+	return float64(s.FloorHeight) + s.FloorTiltX*(x-s.SlopePivotX) + s.FloorTiltY*(y-s.SlopePivotY)
+}
+
+// CeilZAt is FloorZAt's ceiling counterpart.
+func (s *Sector) CeilZAt(x, y float64) float64 {
+	return float64(s.CeilingHeight) + s.CeilTiltX*(x-s.SlopePivotX) + s.CeilTiltY*(y-s.SlopePivotY)
 }
 
 // Thing is one entry of the THINGS lump (10 bytes): a placed monster, item,

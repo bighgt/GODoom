@@ -121,6 +121,21 @@ func (c *Canvas) FillRect(r Rect, col color.RGBA) {
 	draw.Draw(c.Img, image.Rect(cr.X, cr.Y, cr.X+cr.W, cr.Y+cr.H), &image.Uniform{C: col}, image.Point{}, op)
 }
 
+// ClearRect force-sets r (clipped) to col, alpha included — unlike FillRect,
+// which alpha-blends a translucent color onto whatever is already there (so
+// col.A=0 there is a no-op), this always overwrites (draw.Src), so col.A=0
+// truly clears the region to transparent. Used to cut a transparent hole in
+// the editor's 2D canvas over its 3D preview pane, which the hardware
+// (GPU-geometry) renderer draws as the world underneath the whole canvas —
+// see render.Renderer.DrawWorld's overlay parameter.
+func (c *Canvas) ClearRect(r Rect, col color.RGBA) {
+	cr := intersect(r, c.clip)
+	if cr.W <= 0 || cr.H <= 0 {
+		return
+	}
+	draw.Draw(c.Img, image.Rect(cr.X, cr.Y, cr.X+cr.W, cr.Y+cr.H), &image.Uniform{C: col}, image.Point{}, draw.Src)
+}
+
 // StrokeRect draws a t-pixel border around r.
 func (c *Canvas) StrokeRect(r Rect, col color.RGBA, t int) {
 	if t < 1 {

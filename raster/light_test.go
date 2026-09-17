@@ -131,6 +131,15 @@ func TestZLightMatchesPrBoom(t *testing.T) {
 // wall's raw light and adds it to an N-S wall's, which after >>4 is
 // r_segs.c's lightnum-- / lightnum++ — N-S brighter, E-W dimmer.
 func TestFakeContrastDirection(t *testing.T) {
+	clampInt := func(v, lo, hi int) int {
+		if v < lo {
+			return lo
+		}
+		if v > hi {
+			return hi
+		}
+		return v
+	}
 	const base int16 = 128
 	depth := 200.0
 	plain := lightFactor(base, depth)

@@ -56,11 +56,13 @@ var ExtraLight int
 // into a table row (config lightScale, section 17). 1.0 is the WAD's
 // authored brightness; SetLightScale changes it. It sits here rather than
 // on Renderer because lightnumOf / shadeMul / spriteShade are package
-// functions the whole vanilla path shares.
+// functions shared by the 2D overlay's own weapon shading (pspriteShade)
+// and, via LightScaleValue/BuildLightLUT, the hardware renderer's shader.
 var lightScale = 1.0
 
-// SetLightScale sets the global sector-light multiplier for the vanilla
-// shading path. Out-of-range values are ignored (config already clamps).
+// SetLightScale sets the global sector-light multiplier the hardware
+// renderer's shader reads back via LightScaleValue. Out-of-range values are
+// ignored (config already clamps).
 func SetLightScale(s float64) {
 	if s > 0 {
 		lightScale = s
@@ -240,9 +242,8 @@ const LightScaleRef = wallScaleRef
 func LightScaleValue() float64 { return lightScale }
 
 // ambientLight is config ambientLight (section 17): a minimum brightness
-// floor the enhanced/hardware pipelines apply after the sector fade and
-// every dynamic light are summed. The vanilla colormap path ignores it —
-// see Config.AmbientLight's doc for why.
+// floor the hardware renderer applies after the sector fade and every
+// dynamic light are summed — see Config.AmbientLight's doc for why.
 var ambientLight = 0.0
 
 // SetAmbientLight sets the global ambient-light floor. Config already

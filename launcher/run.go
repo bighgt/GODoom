@@ -39,7 +39,7 @@ func Run(initial config.Config) (Result, bool, error) {
 	// The vanilla (lit=false, hw=false) blit renderer: exactly "present an
 	// RGBA8 CPU buffer," precisely what this package's Canvas is (see
 	// canvas.go's doc comment) — no new rendering path for the launcher.
-	renderer, err := vulkan.New(win, windowW, windowH, true, false, false)
+	renderer, err := vulkan.New(win, windowW, windowH, true, false)
 	if err != nil {
 		return Result{}, false, fmt.Errorf("launcher: %w", err)
 	}

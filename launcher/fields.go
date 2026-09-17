@@ -101,23 +101,6 @@ var (
 		{"1440p", "1440p (2560x1440)"},
 		{"native", "Native (Display Resolution)"},
 	}
-	textureQualityOptions = []choice{
-		{config.TextureNearest, "Nearest (Fastest)"},
-		{config.TextureBilinear, "Bilinear"},
-		{config.TextureTrilinear, "Trilinear"},
-		{config.TextureAniso2x, "Anisotropic 2x"},
-		{config.TextureAniso4x, "Anisotropic 4x"},
-		{config.TextureAniso8x, "Anisotropic 8x"},
-		{config.TextureAniso16x, "Anisotropic 16x (Best Quality)"},
-	}
-	lightingModeOptions = []choice{
-		{config.LightingEnhanced, "Enhanced (Dynamic Lighting)"},
-		{config.LightingVanilla, "Vanilla (Classic Shading)"},
-	}
-	rendererOptions = []choice{
-		{config.RendererSoftware, "Software (CPU Renderer)"},
-		{config.RendererHardware, "Hardware (GPU Renderer)"},
-	}
 	hudStyleOptions = []choice{
 		{config.HUDStyleDoom, "Doom (Full Status Bar)"},
 		{config.HUDStyleQuake2, "Quake II (Minimal HUD)"},
@@ -174,22 +157,12 @@ var fields = []field{
 		boolAt: func(c *config.Config) *bool { return &c.ShowDebugInfo }},
 
 	// --- Rendering & Lighting ---
-	{id: "renderer", label: "Renderer", hint: "Software = classic CPU rasteriser. Hardware = GPU path with dynamic lights and effects.", section: SectionRendering, kind: kindOptions,
-		stringAt: func(c *config.Config) *string { return &c.Renderer }, options: rendererOptions},
-	{id: "lightingMode", label: "Lighting Mode", hint: "Enhanced adds dynamic lights and modern shading; Vanilla keeps the flat sector light.", section: SectionRendering, kind: kindOptions,
-		stringAt: func(c *config.Config) *string { return &c.LightingMode }, options: lightingModeOptions},
 	{id: "lightScale", label: "Light Scale", hint: "Overall brightness of dynamic lights.", section: SectionRendering, kind: kindSlider,
 		floatAt: func(c *config.Config) *float64 { return &c.LightScale }, min: config.MinLightScale, max: config.MaxLightScale, format: "%.2f"},
 	{id: "ambientLight", label: "Ambient Light", hint: "Minimum light level everywhere, so nothing falls to pure black.", section: SectionRendering, kind: kindSlider,
 		floatAt: func(c *config.Config) *float64 { return &c.AmbientLight }, min: config.MinAmbientLight, max: config.MaxAmbientLight, format: "%.2f"},
 	{id: "exposure", label: "Exposure", hint: "Tone-mapping exposure for the hardware renderer. Higher is brighter.", section: SectionRendering, kind: kindSlider,
 		floatAt: func(c *config.Config) *float64 { return &c.Exposure }, min: config.MinExposure, max: config.MaxExposure, format: "%.2f"},
-	{id: "shadows", label: "Dynamic Shadows", hint: "Cast dynamic shadows from lights (hardware renderer).", section: SectionRendering, kind: kindCheckbox,
-		boolAt: func(c *config.Config) *bool { return &c.Shadows }},
-	{id: "groundShadows", label: "Ground Shadows", hint: "Draw a simple blob shadow beneath things and the player.", section: SectionRendering, kind: kindCheckbox,
-		boolAt: func(c *config.Config) *bool { return &c.GroundShadows }},
-	{id: "textureQuality", label: "Texture Quality", hint: "Texture filtering. Anisotropic looks best but is heavy on the Software renderer; trilinear is a good balance.", section: SectionRendering, kind: kindOptions,
-		stringAt: func(c *config.Config) *string { return &c.TextureQuality }, options: textureQualityOptions},
 	{id: "voxels", label: "Voxel Models", hint: "Render supported items and decorations as 3D voxel models instead of flat sprites.", section: SectionRendering, kind: kindCheckbox,
 		boolAt: func(c *config.Config) *bool { return &c.Voxels }},
 	{id: "voxelScale", label: "Voxel Scale", hint: "Size multiplier for voxel models.", section: SectionRendering, kind: kindSlider,

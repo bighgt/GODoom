@@ -1,6 +1,7 @@
 package assets
 
 import (
+	"fmt"
 	"image"
 	"image/png"
 	"log"
@@ -17,6 +18,15 @@ import (
 // game_design.txt). Both sides read this one constant so they can never
 // drift apart.
 const HiresTexelsPerUnit = 4.0
+
+// HiresWallsDir / HiresFlatsDir are hiresWallsDir/hiresFlatsDir, exported so
+// a caller like the level editor's Import Texture command can drop a new
+// file in the exact directory this package's own startup scan (above)
+// indexes — the same loose-file convention, not a separate mechanism.
+const (
+	HiresWallsDir = hiresWallsDir
+	HiresFlatsDir = hiresFlatsDir
+)
 
 // hiresWallsDir/hiresFlatsDir are where tools/gentex writes its output,
 // and where loadHiresDir looks for it at startup — see findAssetDir for
@@ -144,6 +154,50 @@ func loadHiresOverride(path string, origWidthUnits float64) *RGBA {
 		}
 	}
 	return imageToRGBA(img, tpu)
+}
+
+// ImportWallTexture decodes the PNG at path and registers it as wall
+// texture name at 1 texel per map unit — Doom's native density, unlike the
+// hi-res replacement packs above (which stand in for an existing lower-res
+// WAD texture and so default to HiresTexelsPerUnit). name need not already
+// have a TEXTURE1/2 definition: WallTexture checks the cache this seeds
+// before ever consulting texDefs, so this is how a level references a
+// texture the loaded WAD never defined at all. Used by the editor's Import
+// Texture command; replaces any existing decode for name.
+func (t *Textures) ImportWallTexture(name, path string) error {
+	im, err := decodeImportedPNG(path)
+	if err != nil {
+		return err
+	}
+	t.mu.Lock()
+	t.walls[name] = im
+	t.mu.Unlock()
+	return nil
+}
+
+// ImportFlat is ImportWallTexture's flat-texture counterpart.
+func (t *Textures) ImportFlat(name, path string) error {
+	im, err := decodeImportedPNG(path)
+	if err != nil {
+		return err
+	}
+	t.mu.Lock()
+	t.flats[name] = im
+	t.mu.Unlock()
+	return nil
+}
+
+func decodeImportedPNG(path string) (*RGBA, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	img, err := png.Decode(f)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return imageToRGBA(img, 1), nil
 }
 
 // decodeFSName reverses tools/gentex's fsName: %XX hex escapes (used for

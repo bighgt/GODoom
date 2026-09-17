@@ -146,11 +146,8 @@ func (r *Renderer) createSyncObjects() error {
 // into the frame texture and draws the fullscreen blit triangle, submit,
 // and present.
 func (r *Renderer) DrawFrame(pix []byte) error {
-	if r.lit {
-		return fmt.Errorf("vulkan: DrawFrame called on an enhanced-lighting renderer (use DrawFrameLit)")
-	}
-	if r.hw {
-		return fmt.Errorf("vulkan: DrawFrame called on a hardware-geometry renderer (use DrawWorld)")
+	if r.hw || r.iso {
+		return fmt.Errorf("vulkan: DrawFrame called on a GPU-geometry renderer (use DrawWorld/DrawIso)")
 	}
 	// Minimized: nothing to present, and the swapchain can't be (re)built
 	// against a 0x0 surface — skip the frame entirely.

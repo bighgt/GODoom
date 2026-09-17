@@ -89,46 +89,6 @@ func TestRepairedKeepsValid(t *testing.T) {
 	}
 }
 
-func TestLightingModeDefaultAndRepair(t *testing.T) {
-	if Default().LightingMode != LightingEnhanced {
-		t.Errorf("LightingMode default = %q, want %q", Default().LightingMode, LightingEnhanced)
-	}
-	// Absent (zero value) -> default.
-	if c := (Config{Resolution: "720p", FOVDegrees: 90}).repaired(); c.LightingMode != LightingEnhanced {
-		t.Errorf("absent lightingMode -> %q, want %q", c.LightingMode, LightingEnhanced)
-	}
-	// Valid, case-insensitive; an explicit vanilla survives.
-	if c := (Config{Resolution: "720p", FOVDegrees: 90, LightingMode: "VANILLA"}).repaired(); c.LightingMode != LightingVanilla {
-		t.Errorf("lightingMode VANILLA -> %q, want %q", c.LightingMode, LightingVanilla)
-	}
-	// Unknown -> falls back to the default, doesn't fail.
-	if c := (Config{Resolution: "720p", FOVDegrees: 90, LightingMode: "raytraced"}).repaired(); c.LightingMode != LightingEnhanced {
-		t.Errorf("unknown lightingMode -> %q, want %q", c.LightingMode, LightingEnhanced)
-	}
-}
-
-func TestRendererDefaultAndRepair(t *testing.T) {
-	if Default().Renderer != RendererSoftware {
-		t.Errorf("Renderer default = %q, want %q", Default().Renderer, RendererSoftware)
-	}
-	base := Config{Resolution: "720p", FOVDegrees: 90}
-	if c := base.repaired(); c.Renderer != RendererSoftware {
-		t.Errorf("absent renderer -> %q, want %q", c.Renderer, RendererSoftware)
-	}
-	for _, want := range []string{RendererSoftware, RendererHardware} {
-		in := base
-		in.Renderer = " " + want + " "
-		if c := in.repaired(); c.Renderer != want {
-			t.Errorf("renderer %q -> %q, want %q", in.Renderer, c.Renderer, want)
-		}
-	}
-	in := base
-	in.Renderer = "raytraced"
-	if c := in.repaired(); c.Renderer != RendererSoftware {
-		t.Errorf("unknown renderer -> %q, want %q", c.Renderer, RendererSoftware)
-	}
-}
-
 func TestCrosshairDefaultAndRepair(t *testing.T) {
 	if Default().Crosshair != CrosshairDot {
 		t.Errorf("Crosshair default = %q, want %q", Default().Crosshair, CrosshairDot)
@@ -307,37 +267,23 @@ func TestWorldVolumeDefaultAndRepair(t *testing.T) {
 	}
 }
 
-func TestTextureQualityDefaultAndRepair(t *testing.T) {
-	if Default().TextureQuality != TextureNearest {
-		t.Errorf("TextureQuality default = %q, want %q", Default().TextureQuality, TextureNearest)
-	}
-	base := Config{Resolution: "720p", FOVDegrees: 90}
-	if c := base.repaired(); c.TextureQuality != TextureNearest {
-		t.Errorf("absent textureQuality -> %q, want %q", c.TextureQuality, TextureNearest)
-	}
-	for _, want := range []string{
-		TextureNearest, TextureBilinear, TextureTrilinear,
-		TextureAniso2x, TextureAniso4x, TextureAniso8x, TextureAniso16x,
-	} {
-		in := base
-		in.TextureQuality = " " + want + " " // case/space-insensitive
-		if c := in.repaired(); c.TextureQuality != want {
-			t.Errorf("textureQuality %q -> %q, want %q", in.TextureQuality, c.TextureQuality, want)
-		}
-	}
-	in := base
-	in.TextureQuality = "aniso32x"
-	if c := in.repaired(); c.TextureQuality != TextureNearest {
-		t.Errorf("unknown textureQuality -> %q, want %q", c.TextureQuality, TextureNearest)
-	}
-}
-
 func TestDeprecatedFilterKeysReported(t *testing.T) {
 	dep := deprecatedKeys([]byte(`{"spriteFilter":"nearest","voxels":true,"voxelFilter":"smooth"}`))
 	if len(dep) != 2 || dep[0] != "spriteFilter" || dep[1] != "voxelFilter" {
 		t.Errorf("deprecatedKeys = %v, want [spriteFilter voxelFilter]", dep)
 	}
-	if d := deprecatedKeys([]byte(`{"textureQuality":"aniso8x"}`)); len(d) != 0 {
+	// The software-rasterizer keys retired along with it.
+	dep = deprecatedKeys([]byte(`{"renderer":"hardware","lightingMode":"enhanced","textureQuality":"aniso8x","shadows":true,"groundShadows":false}`))
+	want := []string{"renderer", "lightingMode", "textureQuality", "shadows", "groundShadows"}
+	if len(dep) != len(want) {
+		t.Fatalf("deprecatedKeys = %v, want %v", dep, want)
+	}
+	for i, k := range want {
+		if dep[i] != k {
+			t.Errorf("deprecatedKeys[%d] = %q, want %q", i, dep[i], k)
+		}
+	}
+	if d := deprecatedKeys([]byte(`{"lightScale":1.0}`)); len(d) != 0 {
 		t.Errorf("deprecatedKeys on a clean file = %v, want none", d)
 	}
 }
@@ -374,17 +320,8 @@ func TestInputAndGameplayDefaultsAndRepair(t *testing.T) {
 	if (Config{Resolution: "720p", FOVDegrees: 90, ShowStatusBar: false}).repaired().ShowStatusBar {
 		t.Error("explicit showStatusBar:false was overridden")
 	}
-	if d.InvertMouseY || d.AlwaysRun || d.MaxFPS != 0 || !d.Voxels || d.VoxelScale != 1.0 ||
-		d.TextureQuality != TextureNearest || !d.Shadows || d.GroundShadows {
+	if d.InvertMouseY || d.AlwaysRun || d.MaxFPS != 0 || !d.Voxels || d.VoxelScale != 1.0 {
 		t.Errorf("unexpected defaults: %+v", d)
-	}
-	// An explicit shadows:false in the file survives repaired(); groundShadows
-	// defaults off and an explicit true survives.
-	if (Config{Resolution: "720p", FOVDegrees: 90, Shadows: false}).repaired().Shadows {
-		t.Error("explicit shadows:false was overridden")
-	}
-	if !(Config{Resolution: "720p", FOVDegrees: 90, GroundShadows: true}).repaired().GroundShadows {
-		t.Error("explicit groundShadows:true was overridden")
 	}
 
 	// voxelScale: absent -> default, out of range -> default, in range kept;

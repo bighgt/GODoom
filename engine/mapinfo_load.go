@@ -98,9 +98,15 @@ func (g *Game) MapMusicLump(mapName string) string {
 
 // ApplyMapInfo pushes the current level's UMAPINFO overrides that the
 // renderers own — the sky texture — to the raster path and the hardware
-// geometry builder, and caches the par time. Called on every level load
-// (NewGame, loadMap) and once by cmd/engine after it wires WorldBuilder.
-// Safe to call repeatedly and with no UMAPINFO loaded (clears any override).
+// geometry builder, caches the par time, and (piggybacking on the same
+// "renderer-owned, WorldBuilder-dependent" contract) pushes g.extraFloors'
+// room-over-room bands to the hardware geometry builder too. Called on
+// every level load (NewGame, loadMap) and once by cmd/engine after it
+// wires WorldBuilder — WorldBuilder isn't necessarily built yet at the
+// point NewGame/loadMap call applySlopes (which is what actually resolves
+// extraFloors), so this is the one place both are guaranteed to line up.
+// Safe to call repeatedly and with no UMAPINFO/SLOPES loaded (clears any
+// override).
 func (g *Game) ApplyMapInfo() {
 	sky, par := "", 0
 	if g.Level != nil {
@@ -121,11 +127,20 @@ func (g *Game) ApplyMapInfo() {
 		sky = hereticSkyTexture(g.Level.Name)
 	}
 	g.parTime = par
-	if g.Raster != nil {
-		g.Raster.SetSkyName(sky)
-	}
 	if g.WorldBuilder != nil {
 		g.WorldBuilder.SetSkyName(sky)
+		var flat map[int][]int
+		if len(g.extraFloors) > 0 {
+			flat = make(map[int][]int, len(g.extraFloors))
+			for target, bands := range g.extraFloors {
+				ctrls := make([]int, len(bands))
+				for i, b := range bands {
+					ctrls[i] = b.ControlSector
+				}
+				flat[target] = ctrls
+			}
+		}
+		g.WorldBuilder.SetExtraFloors(flat)
 	}
 }
 

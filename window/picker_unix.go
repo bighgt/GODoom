@@ -41,6 +41,38 @@ func pickWAD() (string, error) {
 		"(or kdialog), or name the WAD on the command line or in $TPF_WAD")
 }
 
+// pickImageFile is PickImageFile's zenity/kdialog backend.
+func pickImageFile() (string, error) {
+	const title = "Select a texture image"
+	args := []string{
+		"--file-selection", "--title=" + title,
+		"--file-filter=PNG images | *.png *.PNG",
+	}
+	for _, name := range []string{"zenity", "qarma", "matedialog"} {
+		if bin, err := exec.LookPath(name); err == nil {
+			return runFileChooser(bin, args...)
+		}
+	}
+	if bin, err := exec.LookPath("kdialog"); err == nil {
+		return runFileChooser(bin, "--getopenfilename", ".", "*.png *.PNG | PNG images", "--title", title)
+	}
+	return "", fmt.Errorf("window: no graphical file chooser found — install zenity (or kdialog)")
+}
+
+// pickFolder is PickFolder's zenity/kdialog backend.
+func pickFolder() (string, error) {
+	const title = "Select a folder of texture images"
+	for _, name := range []string{"zenity", "qarma", "matedialog"} {
+		if bin, err := exec.LookPath(name); err == nil {
+			return runFileChooser(bin, "--file-selection", "--directory", "--title="+title)
+		}
+	}
+	if bin, err := exec.LookPath("kdialog"); err == nil {
+		return runFileChooser(bin, "--getexistingdirectory", ".", "--title", title)
+	}
+	return "", fmt.Errorf("window: no graphical folder chooser found — install zenity (or kdialog)")
+}
+
 // pickMap shells out to a desktop list dialog — zenity/qarma/matedialog
 // (--list) or kdialog (--menu) — showing every map in the WAD so the player
 // can choose a start level without a console. Same helper discovery as

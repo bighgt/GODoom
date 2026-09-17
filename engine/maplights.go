@@ -109,7 +109,8 @@ func (g *Game) buildStaticLights() {
 			continue
 		}
 		s := &g.Level.Sectors[lt.sec]
-		z := float64(s.FloorHeight) + 0.5*float64(int(s.CeilingHeight)-int(s.FloorHeight))
+		floor, ceil := s.FloorZAt(cx, cy), s.CeilZAt(cx, cy)
+		z := floor + 0.5*(ceil-floor)
 		r, gg, b := float32(1.0), float32(0.96), float32(0.88)
 		fire := lt.mode == lmFireFlicker
 		if fire {

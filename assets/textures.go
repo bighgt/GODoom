@@ -6,7 +6,6 @@ package assets
 
 import (
 	"fmt"
-	"image"
 	"sync"
 
 	"twopointfive/wad"
@@ -35,6 +34,15 @@ type RGBA struct {
 	// resolution actually show up instead of just changing the apparent
 	// pattern scale or being silently cropped to a corner of the image.
 	TexelsPerUnit float64
+	// BottomPad is how many pixel rows (in this image's own native pixel
+	// space, same as Width/Height) at the bottom of the canvas are fully
+	// transparent — 0 for anything except an HD weapon-pack override (see
+	// weaponOverrideRGBA in weapons.go), whose canvas can leave generous
+	// padding below the actual drawn content for the pack's own animation
+	// needs. DrawWeapon subtracts this (scaled) from the height it uses to
+	// bottom-anchor the viewmodel, so the CONTENT reaches the screen's
+	// bottom edge rather than leaving a visible gap under it.
+	BottomPad int
 }
 
 // At returns the pixel at (x, y). Callers are expected to keep x/y in
@@ -77,10 +85,18 @@ type Textures struct {
 
 	// mu guards the lazily-populated caches below. The raster renderer walks
 	// the BSP on several goroutines at once (one per screen strip) and each
-	// resolves its segs' textures through WallTexture/Flat, so those map
-	// writes must be serialised. Contention is negligible: resolution is
-	// once per seg per frame and a hit is just a map read.
-	mu      sync.Mutex
+	// resolves its segs' textures through WallTexture/Flat/Sprite, so a
+	// cache-miss decode-and-insert must be serialised against every other
+	// goroutine's. A cache HIT — overwhelmingly the common case, since every
+	// texture/flat/sprite is decoded once and then just read every frame
+	// after — only needs to be serialised against a concurrent WRITE, not
+	// against other concurrent hits; WallTexture/Flat/Sprite take RLock for
+	// that fast path (letting every strip's goroutine read at once) and only
+	// escalate to the exclusive Lock on an actual miss, double-checking the
+	// map under it in case another goroutine filled the same entry in the
+	// meantime. Every other method here (setup/administrative, never called
+	// while a frame is rendering) just takes the exclusive Lock throughout.
+	mu      sync.RWMutex
 	walls   map[string]*RGBA
 	flats   map[string]*RGBA
 	sprites map[string]*RGBA
@@ -132,10 +148,11 @@ type Textures struct {
 
 	// weaponSprites are a locally-supplied HD replacement pack for the
 	// first-person weapon viewmodel sprites (assets/weapons/*.pk3 — see
-	// weapons.go), decoded eagerly and keyed by lump name. Sprite() prefers
-	// one of these over both the WAD's own psprite and any generated
-	// hi-res sprite override. nil when no pack is present.
-	weaponSprites map[string]image.Image
+	// weapons.go), decoded eagerly and keyed by lump name, each with its
+	// pack-authored display scale if its TEXTURES lump declares one.
+	// Sprite() prefers one of these over both the WAD's own psprite and
+	// any generated hi-res sprite override. nil when no pack is present.
+	weaponSprites map[string]weaponFrame
 
 	// brightmaps indexes brightmap mask PNGs (texture/flat name -> path);
 	// brightCache holds the decoded, base-sized masks (a nil entry == "no
@@ -256,6 +273,8 @@ func (t *Textures) SetSpriteFallback(fw *wad.WAD) {
 // the WAD. Used for Heretic, whose SKY1..SKY3 texture names collide with
 // Doom's generated sky PNGs — a Doom sky over a Heretic level.
 func (t *Textures) DropHiresOverrides(names ...string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	for _, n := range names {
 		delete(t.hiresWalls, n)
 		delete(t.hiresFlats, n)
@@ -306,9 +325,15 @@ func (t *Textures) WallTexture(name string) (*RGBA, bool) {
 	if name == "" || name == "-" {
 		return nil, false
 	}
+	t.mu.RLock()
+	cached, hit := t.walls[name]
+	t.mu.RUnlock()
+	if hit {
+		return cached, true
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if im, ok := t.walls[name]; ok {
+	if im, ok := t.walls[name]; ok { // re-check: another goroutine may have just filled this
 		return im, true
 	}
 	if zd, ok := t.zdWall(name); ok {
@@ -383,9 +408,15 @@ func (t *Textures) Flat(name string) (*RGBA, bool) {
 	if name == "" || name == "-" {
 		return nil, false
 	}
+	t.mu.RLock()
+	cached, hit := t.flats[name]
+	t.mu.RUnlock()
+	if hit {
+		return cached, true
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if im, ok := t.flats[name]; ok {
+	if im, ok := t.flats[name]; ok { // re-check: another goroutine may have just filled this
 		return im, true
 	}
 	if zd, ok := t.zdFlatDef(name); ok {
@@ -445,9 +476,15 @@ func (t *Textures) Flat(name string) (*RGBA, bool) {
 // code probes for several optional lumps (e.g. only IWADs newer than the
 // original shareware always ship every key/arms graphic).
 func (t *Textures) Sprite(name string) (*RGBA, bool) {
+	t.mu.RLock()
+	cached, hit := t.sprites[name]
+	t.mu.RUnlock()
+	if hit {
+		return cached, true
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if im, ok := t.sprites[name]; ok {
+	if im, ok := t.sprites[name]; ok { // re-check: another goroutine may have just filled this
 		return im, true
 	}
 	if zd, ok := t.zdSpriteDef(name); ok {
@@ -481,8 +518,8 @@ func (t *Textures) Sprite(name string) (*RGBA, bool) {
 	// It resolves even for a weapon this IWAD doesn't ship a sprite for
 	// (patch == nil), so a PWAD missing e.g. the SSG frames still gets the
 	// HD gun.
-	if wimg, ok := t.weaponSprites[name]; ok {
-		hi := weaponOverrideRGBA(wimg, patch)
+	if wf, ok := t.weaponSprites[name]; ok {
+		hi := weaponOverrideRGBA(wf.img, patch, wf)
 		t.sprites[name] = hi
 		return hi, true
 	}
