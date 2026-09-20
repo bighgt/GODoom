@@ -468,8 +468,25 @@ func aPain(g *Game, mo *Mobj) {
 		g.playSound(mo.Info.PainSound)
 	}
 }
-func aFall(g *Game, mo *Mobj)    { mo.Flags &^= MF_SOLID }
-func aExplode(g *Game, mo *Mobj) { g.pRadiusAttack(mo, mo.Target, 128) }
+func aFall(g *Game, mo *Mobj) { mo.Flags &^= MF_SOLID }
+func aExplode(g *Game, mo *Mobj) {
+	g.pRadiusAttack(mo, mo.Target, 128)
+	// Barrels are the only thing that reaches this action (see S_BEXP4 in
+	// states.go) — a bigger, sootier burst than any other explosion's.
+	// explosionBoost (set by advanceProjectile when a rocket's direct hit
+	// is what killed this barrel) scales that burst up further still, so a
+	// rocket-detonated barrel reads as one single, much bigger explosion
+	// instead of the rocket's own burst plus the barrel's overlapping.
+	scale := explosionBarrel
+	if mo.explosionBoost > 0 {
+		scale = scaledExplosion(scale, mo.explosionBoost)
+		mo.explosionBoost = 0
+	}
+	g.spawnExplosionParticles(mo.X, mo.Y, mo.Z+mo.Height*0.4, scale)
+	// A barrel is full of flammable liquid — some of it is left behind
+	// still burning on the floor. See engine/burningpuddle.go.
+	g.spawnBurningPuddle(mo.X, mo.Y, mo.Z)
+}
 
 // aBossDeath is id's A_BossDeath: on a designated "boss map", when the last
 // living boss of mo's type dies (and a player is still alive), it triggers

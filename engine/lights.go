@@ -73,8 +73,15 @@ func (g *Game) projectileLight(p *Projectile) render.Light {
 
 	if p.exploding {
 		frac := float32(explosionProgress(p)) // 0 at impact -> 1 as it dissipates
-		intensity = 3.4 * (1 - frac)
-		radius *= 1.4 + 2.0*frac
+		// The flash fades out at 2x that rate — done by the time the
+		// particles/fire are still flying outward and rising, not lingering
+		// alongside them for the sprite/particle animation's whole length.
+		flashFrac := 2 * frac
+		if flashFrac > 1 {
+			flashFrac = 1
+		}
+		intensity = 3.4 * (1 - flashFrac)
+		radius *= 1.4 + 2.0*flashFrac
 		// All blasts read as the same white-hot orange core.
 		r, gg, b = 1.0, 0.72, 0.38
 	}
@@ -233,4 +240,3 @@ func lightDist2(l render.Light, cx, cy, cz float32) float32 {
 	dx, dy, dz := l.X-cx, l.Y-cy, l.Z-cz
 	return dx*dx + dy*dy + dz*dz
 }
-

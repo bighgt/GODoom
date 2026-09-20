@@ -216,6 +216,14 @@ type Game struct {
 	soundCache map[string]*wad.Sound
 	sfxHook    func(name string) // tests only — observes every playSound call
 
+	// liquidCrossingHook, like sfxHook, is a tests-only observation point —
+	// checkPlayerLiquidCrossing (engine/liquidsplash.go) calls it on every
+	// liquid enter/exit, so a test can assert a crossing was detected. Used
+	// to also mark when a (since-removed) splash particle burst fired;
+	// there's no more visual effect to gate here now, just the crossing
+	// detection itself.
+	liquidCrossingHook func(x, y, z float64, kind int)
+
 	// ShowHUD toggles the debug text overlay (FPS, position, angle) drawn
 	// each frame by Run — on by default (config showDebugInfo).
 	// hudStyle picks the in-game HUD (config hudStyle): hudDoom = the full
@@ -330,11 +338,50 @@ type Game struct {
 	// branch copies this onto the per-frame Camera it builds.
 	cartoonShading bool
 
+	// explosionParticles (config explosionParticles, default on) gates
+	// spawnExplosionParticles — see engine/particles.go.
+	explosionParticles bool
+
+	// liquidAmbience (config liquidAmbience, default on) gates the ambient
+	// steam/mist/bubble particles (engine/liquidambience.go) and the rising
+	// teleporter-pad glitter (engine/teleportambience.go).
+	liquidAmbience bool
+
+	// liquidAmbientSectors is the level's liquid sectors, precomputed once
+	// (buildLiquidAmbientSectors) and drained per-frame by
+	// updateLiquidAmbience — see engine/liquidambience.go.
+	liquidAmbientSectors []liquidAmbientSector
+
+	// teleportAmbientSectors is the level's teleporter-pad sectors,
+	// precomputed once (buildTeleportAmbientSectors) and drained per-frame
+	// by updateTeleportAmbience — see engine/teleportambience.go.
+	teleportAmbientSectors []teleportAmbientSector
+
+	// playerLiquidKind is the liquid kind (liquidlights.go's liqNone/
+	// liqWater/liqLava/liqAcid) the player was standing in as of the last
+	// tic — see checkPlayerLiquidCrossing in engine/liquidsplash.go.
+	playerLiquidKind int
+
+	// waterRippleTimer counts down to the next wake-ripple puff while the
+	// player wades through water — see updatePlayerWaterRipple in
+	// engine/liquidripple.go. Distinct from liquidAmbientSectors' mist,
+	// which drifts at random points across a whole pool; this one is
+	// always exactly where the player is.
+	waterRippleTimer float64
+
+	// burningPuddles are barrels' spilled flammable liquid still burning
+	// on the floor after the blast, including its own toxic smoke — see
+	// engine/burningpuddle.go. The only smoke any explosion produces; a
+	// blast's own initial fireball/sparks/chunks (spawnExplosionParticles)
+	// deliberately has none of its own.
+	burningPuddles []*burningPuddle
+
 	closing       bool          // set once when Escape has asked the window to close, so the log line prints once
 	spaceWasDown  bool          // for edge-detecting the "use" key (E)
 	jumpWasDown   bool          // for edge-detecting the jump key (Space)
 	weaponKeyDown [8]bool       // for edge-detecting weapon slot keys 1-7
 	projectiles   []*Projectile // in-flight shots; see projectiles.go
+	particles     []*Particle   // cosmetic-only billboards; see engine/particles.go
 	// rocketCam, while non-nil, is the in-flight rocket RocketFollow is
 	// riding the camera along with — set in beginFire when the rocket
 	// launcher fires with the right mouse button held, cleared in
@@ -451,14 +498,17 @@ type Game struct {
 	// corpses (and, from Phase 2, missiles and the player). Stepped at the
 	// fixed 35Hz tic (see runTic); rendered every frame. ticAccum carries
 	// leftover real time between frames; levelTime counts elapsed tics.
-	mobjs      []*Mobj
-	hwSprites  []worldgeo.Sprite        // reused per-frame billboard list
-	hwVoxels   []worldgeo.VoxelInstance // reused per-frame voxel-instance list
-	hwShadows  [][4]float32             // reused per-frame ground-shadow caster list
-	playerMobj *Mobj                    // the player's own map object — AI target; kept in sync with Camera
-	ticAccum     float64
-	levelTime    int
-	killCount    int // monsters killed this level
+	mobjs                        []*Mobj
+	hwSprites                    []worldgeo.Sprite        // reused per-frame billboard list
+	hwVoxels                     []worldgeo.VoxelInstance // reused per-frame voxel-instance list
+	hwParticleSprites            []worldgeo.Sprite        // reused per-frame additive particle billboard list — see collectParticleSprites
+	hwTransparentParticleSprites []worldgeo.Sprite        // reused per-frame translucent (smoke) billboard list — see collectTransparentParticleSprites
+	hwShadows                    [][4]float32             // reused per-frame ground-shadow caster list
+	hwGroundSplats               []worldgeo.GroundSplat   // reused per-frame burning-puddle decal list — see collectGroundSplats
+	playerMobj                   *Mobj                    // the player's own map object — AI target; kept in sync with Camera
+	ticAccum                     float64
+	levelTime                    int
+	killCount                    int // monsters killed this level
 
 	// Hardware-path sector-motion interpolation: prevSectorH is every
 	// sector's floor/ceiling height (interleaved) snapshotted at the top of
@@ -562,6 +612,8 @@ func NewGame(win *window.Window, renderer render.Renderer, ras *raster.Renderer,
 		Skill:                skill,
 		MaxFPS:               cfg.MaxFPS,
 		cartoonShading:       cfg.CartoonShading,
+		explosionParticles:   cfg.ExplosionParticles,
+		liquidAmbience:       cfg.LiquidAmbience,
 		damageScale:          cfg.DamageScale,
 		weaponVolume:         cfg.WeaponVolume,
 		worldVolume:          cfg.WorldVolume,
@@ -629,14 +681,14 @@ func NewGame(win *window.Window, renderer render.Renderer, ras *raster.Renderer,
 		g.Weapon = NewWeaponState()
 	}
 
-	g.mods = loadMods()                // assets/mods/*.pk3 + loose files
-	g.loadTextureDefs(w, g.mods)       // ZDoom TEXTURES composite defs (WAD and/or mod)
-	g.gldefs = loadGLDefs(w, g.mods)   // data-driven dynamic lights (WAD and/or mod)
-	g.loadDehacked(w, g.mods, "")      // DEH/BEX table edits (WAD and/or mod lumps)
-	g.mapInfo = loadMapInfo(w, g.mods) // UMAPINFO per-map metadata (WAD and/or mod)
-	g.applyMapInfo()                   // sky / par-time for the starting level
+	g.mods = loadMods()                                   // assets/mods/*.pk3 + loose files
+	g.loadTextureDefs(w, g.mods)                          // ZDoom TEXTURES composite defs (WAD and/or mod)
+	g.gldefs = loadGLDefs(w, g.mods)                      // data-driven dynamic lights (WAD and/or mod)
+	g.loadDehacked(w, g.mods, "")                         // DEH/BEX table edits (WAD and/or mod lumps)
+	g.mapInfo = loadMapInfo(w, g.mods)                    // UMAPINFO per-map metadata (WAD and/or mod)
+	g.applyMapInfo()                                      // sky / par-time for the starting level
 	g.slopeDefs, g.extraFloorDefs = loadSlopes(w, g.mods) // SLOPES per-map sector planes + 3D floors (WAD and/or mod)
-	g.applySlopes()                     // tilt this level's sectors, if any are defined
+	g.applySlopes()                                       // tilt this level's sectors, if any are defined
 	if dn := g.levelDisplayName(); dn != "" && dn != g.Level.Name {
 		log.Printf("engine: %s — %q", g.Level.Name, dn)
 	}
@@ -851,7 +903,15 @@ func (g *Game) renderFrame() error {
 		log.Printf("engine: [hw] map objects this frame — %d voxel instance(s), %d sprite(s) to the GPU voxel/billboard pass",
 			len(voxels), len(sprites))
 	}
+	additiveParticles, transparentParticles := g.collectAllParticleSprites()
 	g.WorldBuilder.AddSprites(g.Camera.Angle, sprites)
+	g.WorldBuilder.AddParticleSprites(g.Camera.Angle, additiveParticles)
+	// Ground puddle decals first: they must land underneath the fire/smoke
+	// billboards rising off them (see AddGroundSplats' own doc comment on
+	// draw order), not drawn after and blended on top of them.
+	g.WorldBuilder.AddGroundSplats(g.collectGroundSplats())
+	g.WorldBuilder.AddTransparentSprites(float32(g.Camera.X), float32(g.Camera.Y), float32(g.Camera.Z),
+		g.Camera.Angle, transparentParticles)
 	g.WorldBuilder.AddVoxels(voxels)
 	wc := worldgeo.Camera{
 		X: g.Camera.X, Y: g.Camera.Y, Z: g.Camera.Z,

@@ -13,11 +13,6 @@ func hex(rgb uint32) color.RGBA {
 	return color.RGBA{R: byte(rgb >> 16), G: byte(rgb >> 8), B: byte(rgb), A: 255}
 }
 
-// hexA is hex with an explicit alpha (0-255).
-func hexA(rgb uint32, a byte) color.RGBA {
-	return color.RGBA{R: byte(rgb >> 16), G: byte(rgb >> 8), B: byte(rgb), A: a}
-}
-
 // Theme is a flat, dark, neutral palette — deliberately nothing like Doom's
 // browns/reds/gold: a slate background, a single blue accent for focus/
 // selection, plain text. Every widget in ui.go draws from this table, so

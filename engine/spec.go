@@ -421,6 +421,17 @@ func (g *Game) evTeleport(lineIdx int, mo *Mobj, monsterOnly bool) bool {
 	if mo.TeleportFreeze > 0 {
 		return false
 	}
+	if mo.TeleportGuard {
+		x, y := mo.X, mo.Y
+		if mo == g.playerMobj {
+			x, y = g.Camera.X, g.Camera.Y // authoritative; mo.X/Y only mirrors it once per tic
+		}
+		dx, dy := x-mo.TeleportLandX, y-mo.TeleportLandY
+		if dx*dx+dy*dy < teleportClearRadius*teleportClearRadius {
+			return false // hasn't moved off its last landing spot yet
+		}
+		mo.TeleportGuard = false
+	}
 	tag := g.Level.Linedefs[lineIdx].SectorTag
 	tags := map[int]bool{}
 	for _, s := range g.findSectorsFromTag(tag) {
@@ -461,6 +472,8 @@ func (g *Game) evTeleport(lineIdx int, mo *Mobj, monsterOnly bool) bool {
 		g.P_SpawnMobj(dest.X, dest.Y, ds.FloorZAt(dest.X, dest.Y), MT_TFOG)
 		g.playWorldSound("DSTELEPT")
 		mo.TeleportFreeze = teleportFreezeTics
+		mo.TeleportGuard = true
+		mo.TeleportLandX, mo.TeleportLandY = dest.X, dest.Y
 		return true
 	}
 	return false

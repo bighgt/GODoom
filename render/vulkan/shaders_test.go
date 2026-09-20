@@ -17,6 +17,7 @@ func TestEmbeddedSPIRV(t *testing.T) {
 		"world.vert":            worldVertSPV,
 		"world.frag":            worldFragSPV,
 		"worldblit.frag":        worldBlitFragSPV,
+		"waterrefract.frag":     waterRefractFragSPV,
 		"worldambient.frag":     worldAmbientFragSPV,
 		"worldambientblur.frag": worldAmbientBlurFragSPV,
 		"depthonly.vert":        depthOnlyVertSPV,

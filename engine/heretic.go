@@ -239,27 +239,27 @@ var hereticThings = map[int]hereticSpawn{
 	16: {sprite: "AMM2", radius: 20, height: 16, gift: hgAmmoMace},
 
 	// --- decorations (static unless frames>1) ---
-	17: {sprite: "SKH1", radius: 20, height: 70, ceiling: true, solid: true}, // skull-on-a-stick, hung
-	24: {sprite: "SKH2", radius: 20, height: 60, ceiling: true, solid: true},
-	25: {sprite: "SKH3", radius: 20, height: 45, ceiling: true, solid: true},
-	26: {sprite: "SKH4", radius: 20, height: 35, ceiling: true, solid: true},
-	27: {sprite: "SRTC", radius: 12, height: 54, frames: 3, tics: 4, solid: true}, // serpent torch
-	28: {sprite: "CHDL", radius: 20, height: 60, frames: 3, tics: 4, ceiling: true, solid: true},
-	29: {sprite: "SMPL", radius: 16, height: 34, solid: true}, // small pillar
-	37: {sprite: "STGS", radius: 8, height: 32, solid: true},
-	38: {sprite: "STGL", radius: 12, height: 64, solid: true},
-	39: {sprite: "STCS", radius: 8, height: 36, ceiling: true, solid: true},
-	40: {sprite: "STCL", radius: 12, height: 68, ceiling: true, solid: true},
-	43: {sprite: "PPOD", radius: 16, height: 40, solid: true}, // pod (visible only — doesn't burst)
-	44: {sprite: "BARL", radius: 12, height: 32, solid: true}, // Heretic barrel
-	47: {sprite: "BRPL", radius: 14, height: 128, solid: true},
-	48: {sprite: "MOS1", radius: 20, height: 23, ceiling: true},
-	49: {sprite: "MOS2", radius: 20, height: 27, ceiling: true},
-	50: {sprite: "WTRH", radius: 6, height: 16, frames: 3, tics: 4},   // wall torch
-	51: {sprite: "HCOR", radius: 8, height: 104, ceiling: true, solid: true},
-	76: {sprite: "KFR1", radius: 16, height: 44, frames: 8, tics: 3, solid: true}, // fire brazier
-	87: {sprite: "VLCO", radius: 12, height: 20, frames: 5, tics: 6, solid: true}, // volcano
-	2035: {sprite: "PPOD", radius: 16, height: 40, solid: true},                   // pod
+	17:   {sprite: "SKH1", radius: 20, height: 70, ceiling: true, solid: true}, // skull-on-a-stick, hung
+	24:   {sprite: "SKH2", radius: 20, height: 60, ceiling: true, solid: true},
+	25:   {sprite: "SKH3", radius: 20, height: 45, ceiling: true, solid: true},
+	26:   {sprite: "SKH4", radius: 20, height: 35, ceiling: true, solid: true},
+	27:   {sprite: "SRTC", radius: 12, height: 54, frames: 3, tics: 4, solid: true}, // serpent torch
+	28:   {sprite: "CHDL", radius: 20, height: 60, frames: 3, tics: 4, ceiling: true, solid: true},
+	29:   {sprite: "SMPL", radius: 16, height: 34, solid: true}, // small pillar
+	37:   {sprite: "STGS", radius: 8, height: 32, solid: true},
+	38:   {sprite: "STGL", radius: 12, height: 64, solid: true},
+	39:   {sprite: "STCS", radius: 8, height: 36, ceiling: true, solid: true},
+	40:   {sprite: "STCL", radius: 12, height: 68, ceiling: true, solid: true},
+	43:   {sprite: "PPOD", radius: 16, height: 40, solid: true}, // pod (visible only — doesn't burst)
+	44:   {sprite: "BARL", radius: 12, height: 32, solid: true}, // Heretic barrel
+	47:   {sprite: "BRPL", radius: 14, height: 128, solid: true},
+	48:   {sprite: "MOS1", radius: 20, height: 23, ceiling: true},
+	49:   {sprite: "MOS2", radius: 20, height: 27, ceiling: true},
+	50:   {sprite: "WTRH", radius: 6, height: 16, frames: 3, tics: 4}, // wall torch
+	51:   {sprite: "HCOR", radius: 8, height: 104, ceiling: true, solid: true},
+	76:   {sprite: "KFR1", radius: 16, height: 44, frames: 8, tics: 3, solid: true}, // fire brazier
+	87:   {sprite: "VLCO", radius: 12, height: 20, frames: 5, tics: 6, solid: true}, // volcano
+	2035: {sprite: "PPOD", radius: 16, height: 40, solid: true},                     // pod
 
 	// --- weapon pickups ---
 	2005: {sprite: "WGNT", radius: 20, height: 16, gift: hgWpGauntlets},

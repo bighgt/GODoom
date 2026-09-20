@@ -213,7 +213,10 @@ vec3 waterSSR(vec2 uv, vec3 baseHDR, float ez0) {
             t = t * 1.32 + 7.0;
         }
     }
-    float fres = 0.03 + 0.32 * pow(1.0 - clamp(-V.z, 0.0, 1.0), 5.0);
+    // Stronger than a physically-minimal fresnel would give (see the
+    // matching bump to world.frag's own sky-reflection fresnel) — real
+    // water reads close to a mirror at grazing angles, not a faint sheen.
+    float fres = 0.03 + 0.55 * pow(1.0 - clamp(-V.z, 0.0, 1.0), 5.0);
     return mix(baseHDR, refl, hit * edge * fres * pc.p3.z);
 }
 

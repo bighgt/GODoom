@@ -222,6 +222,15 @@ func decodeFSName(s string) string {
 	return string(b)
 }
 
+// FindAssetDir is findAssetDir, exported for a caller outside this package
+// that needs the identical "cwd first, then exe-relative up to 4 parents"
+// resolution — currently engine/particles.go's particle art, which decodes
+// a plain PNG directly (no palette/patch involved) so it has no reason to
+// route through assets.Textures, but still wants the same "works when
+// launched from bin\ or double-clicked" behaviour every other loose pack
+// gets.
+func FindAssetDir(relDir string) (string, bool) { return findAssetDir(relDir) }
+
 // findAssetDir looks for relDir (a path like "assets/textures/walls"):
 // first relative to the current working directory (how this project is run
 // during development — see game_design.txt's build instructions), then

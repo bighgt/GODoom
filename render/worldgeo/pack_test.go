@@ -11,6 +11,7 @@ func TestPackRoundTrip(t *testing.T) {
 		{X: 1.5, Y: -2, Z: 3.25, U: 0.1, V: 0.9, Light: 0.5, Nx: 1, Tex: 7, Kind: KindWall},
 		{X: -100, Y: 200.75, Z: 0, U: 4.5, V: -1.5, Light: 1, Nz: -1, Tex: SkyTex, Kind: KindSky},
 		{X: 0, Y: 0, Z: 64, U: 0, V: 0, Light: 0.25, Ny: 0.5, Nz: 0.5, Tex: 0, Kind: KindMasked},
+		{X: 8, Y: 16, Z: 24, U: 0.5, V: 0.5, Light: 0.8, Nz: 1, Alpha: 0.35, Tex: 3, Kind: KindSpriteTrans},
 	}}
 	buf := g.Pack(nil)
 	if len(buf) != len(g.Tris)*PackedVertexSize {
@@ -30,6 +31,7 @@ func TestPackRoundTrip(t *testing.T) {
 			Nx:    math.Float32frombits(le.Uint32(buf[o+28:])),
 			Ny:    math.Float32frombits(le.Uint32(buf[o+32:])),
 			Nz:    math.Float32frombits(le.Uint32(buf[o+36:])),
+			Alpha: math.Float32frombits(le.Uint32(buf[o+40:])),
 		}
 		// Tex is builder bookkeeping — deliberately not in the packed GPU layout.
 		want := src

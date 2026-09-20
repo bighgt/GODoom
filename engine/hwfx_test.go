@@ -119,13 +119,13 @@ func TestCollectGroundShadows(t *testing.T) {
 		return &Mobj{X: x, Y: y, Z: z, FloorZ: fz, Radius: r, Flags: flags, State: stateNum(1)}
 	}
 	g.mobjs = []*Mobj{
-		mk(50, 0, 0, 0, 20, 0),                  // grounded barrel -> in
-		mk(-40, 30, 8, 0, 16, 0),                // z within FloorZ+16 -> in
-		mk(0, 0, 0, 0, 20, 0),                   // right on top of the camera -> in
-		mk(100, 0, 200, 0, 20, 0),               // airborne (z >> floorZ+16) -> out
-		mk(0, 60, 0, 0, 3, 0),                   // radius < 6 -> out
-		mk(0, 0, 0, 0, 20, MF_NOGRAVITY),        // flyer -> out
-		mk(3000, 0, 0, 0, 20, 0),                // > 1600u away -> out
+		mk(50, 0, 0, 0, 20, 0),           // grounded barrel -> in
+		mk(-40, 30, 8, 0, 16, 0),         // z within FloorZ+16 -> in
+		mk(0, 0, 0, 0, 20, 0),            // right on top of the camera -> in
+		mk(100, 0, 200, 0, 20, 0),        // airborne (z >> floorZ+16) -> out
+		mk(0, 60, 0, 0, 3, 0),            // radius < 6 -> out
+		mk(0, 0, 0, 0, 20, MF_NOGRAVITY), // flyer -> out
+		mk(3000, 0, 0, 0, 20, 0),         // > 1600u away -> out
 	}
 	got := g.collectGroundShadows()
 	if len(got) != 3 {

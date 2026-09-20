@@ -11,7 +11,7 @@ package worldgeo
 
 import (
 	"math"
-	"sort"
+	"slices"
 
 	"twopointfive/assets"
 	"twopointfive/bsp"
@@ -29,15 +29,17 @@ const fakeContrast = 16
 
 // Vert kinds — the shader keys texturing / alpha-test / sky off this.
 const (
-	KindWall       uint16 = iota // opaque wall piece: sample Tex, sector fade
-	KindMasked                   // 2-sided middle texture: alpha-test, one copy (no vertical tile)
-	KindFlat                     // floor / ceiling: sample Tex, sector fade
-	KindSky                      // F_SKY1 flat or a sky wall-step: shader paints sky, still writes depth
-	KindSprite                   // camera-facing billboard (thing / monster / item): alpha-test, sector fade
-	KindSpriteFull               // billboard, full bright (projectile / muzzle flash / lit powerup)
-	KindLiquidWater              // water floor flat: fresnel sky reflection (world.frag)
-	KindLiquidLava               // lava floor flat: warm emissive glow
-	KindLiquidNukage             // nukage/slime floor flat: green emissive tint
+	KindWall         uint16 = iota // opaque wall piece: sample Tex, sector fade
+	KindMasked                     // 2-sided middle texture: alpha-test, one copy (no vertical tile)
+	KindFlat                       // floor / ceiling: sample Tex, sector fade
+	KindSky                        // F_SKY1 flat or a sky wall-step: shader paints sky, still writes depth
+	KindSprite                     // camera-facing billboard (thing / monster / item): alpha-test, sector fade
+	KindSpriteFull                 // billboard, full bright (projectile / muzzle flash / lit powerup)
+	KindLiquidWater                // water floor flat: fresnel sky reflection (world.frag)
+	KindLiquidLava                 // lava floor flat: warm emissive glow
+	KindLiquidNukage               // nukage/slime floor flat: green emissive tint
+	KindSpriteTrans                // billboard, real alpha blend (Vert.Alpha) — see AddTransparentSprites
+	KindTeleport                   // teleporter-pad floor flat: procedural blue/white shimmer, ignores Tex entirely
 )
 
 // liquidKindOfFlat classifies a floor flat's lump name for the liquid
@@ -59,6 +61,18 @@ func liquidKindOfFlat(name string) uint16 {
 	return KindFlat
 }
 
+// isTeleportFlat reports whether name is one of vanilla Doom's animated
+// teleporter-pad floor flats (GATE1-4, cycled by the WAD's own ANIMATED
+// lump — see tools/importquake/mapping.txt for the same four names). No
+// other flat family starts with this prefix. Classified separately from
+// liquidKindOfFlat since a teleporter pad isn't a liquid: emitFlatPlane
+// swaps in KindTeleport's own fully procedural shimmer (world.frag ignores
+// Tex entirely for it — see KindTeleport's own doc comment), not a
+// treatment layered on top of the real texture the way the liquids are.
+func isTeleportFlat(name string) bool {
+	return len(name) >= 4 && name[:4] == "GATE"
+}
+
 // SkyTex is Vert.Tex for a KindSky vertex (it indexes nothing in Textures).
 const SkyTex = 0xFFFF
 
@@ -68,12 +82,16 @@ const SkyTex = 0xFFFF
 // unit surface normal (world space — walls face into their sector, floors
 // up, ceilings down, billboards at the camera) that the dynamic point
 // lights use for a Lambert term, the texture slot (builder bookkeeping; not
-// in the packed GPU layout), and the kind.
+// in the packed GPU layout), the kind, and Alpha — only meaningful for
+// KindSpriteTrans (every other kind is either opaque or alpha-tested, and
+// ignores it): the blend weight a real translucent draw uses instead of
+// the hard tex.a<0.5 cutout the other sprite kinds get.
 type Vert struct {
 	X, Y, Z    float32
 	U, V       float32
 	Light      float32
 	Nx, Ny, Nz float32
+	Alpha      float32
 	Tex        uint16
 	Kind       uint16
 }
@@ -130,8 +148,39 @@ type Geometry struct {
 	// only, so grate holes don't write depth.
 	StaticOpaqueCount int
 
+	// WaterDraws is KindLiquidWater's own Draw list, indexing the same
+	// StaticTris buffer but kept separate from StaticDraws (unlike
+	// lava/nukage, which stay interleaved in StaticDraws like any other
+	// opaque flat) — a backend wanting real refraction needs to draw
+	// "everything except water" first, then water in its own pass step, so
+	// water can't just be batched wherever its texture slot happens to
+	// fall. WaterDrawVisible parallels it the same way StaticDrawVisible
+	// parallels StaticDraws — see UpdateVisibility.
+	WaterDraws       []Draw
+	WaterDrawVisible []bool
+
 	Tris  []Vert // dynamic: sprite + voxel-billboard quads, refilled per frame
 	Draws []Draw
+
+	// ParticleDraws is AddParticleSprites' own output — same Tris buffer,
+	// same texture slots as Draws, but meant for a backend's separate
+	// additive, no-depth-write pipeline (see render/vulkan's pipeParticleAdd)
+	// so a dense burst of overlapping billboards glows brighter where they
+	// overlap instead of alpha-cutout-occluding each other. Kept apart from
+	// Draws because that distinction lives at the pipeline-bind level, not
+	// per-vertex.
+	ParticleDraws []Draw
+
+	// TransparentDraws is AddTransparentSprites' own output — real alpha
+	// blending (KindSpriteTrans), for a backend's separate blend pipeline
+	// (render/vulkan's pipeParticleTrans): SrcAlpha/OneMinusSrcAlpha, not
+	// additive. Unlike Draws/ParticleDraws this is NOT batched by texture:
+	// unlike additive, translucent blending is order-dependent, so
+	// AddTransparentSprites sorts its input back-to-front by camera
+	// distance first and emits one Draw per sprite in that order, even
+	// where consecutive sprites happen to share a texture — unrelated
+	// sprites of the same texture may not be adjacent after the sort.
+	TransparentDraws []Draw
 
 	Textures []*assets.RGBA
 	// Brightmaps is parallel to Textures (same slot index): the brightmap
@@ -201,18 +250,21 @@ func (b *Builder) SetSkyName(name string) {
 // Builder walks one level's BSP into Geometry, reusing its buffers so a
 // per-frame Build allocates nothing once warm.
 type Builder struct {
-	lvl     *wad.Level
-	tree    bsp.Node
-	tex     *assets.Textures
-	texID   map[*assets.RGBA]uint16
-	g       Geometry
-	polys   [][]bsp.Point            // per subsector: the closed flat polygon (nil for a few slivers)
-	fan     []bsp.Point              // reused scratch for the seg-fan fallback
-	grid    *visGrid                 // Stage 1 visibility-culling scoping — see visgrid.go
-	curCell int32                    // this subsector's grid cell, set once per emitSubsectorIdx call
-	buckets map[uint16]map[int32][]Vert // opaque static: per texture slot (SkyTex for sky), per grid cell
-	masked  map[uint16]map[int32][]Vert // static KindMasked (2-sided middles): per texture slot, per grid cell
-	sprites map[uint16][]Vert           // per texture slot, AddSprites billboards — reused across calls
+	lvl              *wad.Level
+	tree             bsp.Node
+	tex              *assets.Textures
+	texID            map[*assets.RGBA]uint16
+	g                Geometry
+	polys            [][]bsp.Point               // per subsector: the closed flat polygon (nil for a few slivers)
+	fan              []bsp.Point                 // reused scratch for the seg-fan fallback
+	grid             *visGrid                    // Stage 1 visibility-culling scoping — see visgrid.go
+	curCell          int32                       // this subsector's grid cell, set once per emitSubsectorIdx call
+	buckets          map[uint16]map[int32][]Vert // opaque static: per texture slot (SkyTex for sky), per grid cell
+	masked           map[uint16]map[int32][]Vert // static KindMasked (2-sided middles): per texture slot, per grid cell
+	waterBuckets     map[uint16]map[int32][]Vert // static KindLiquidWater: per texture slot, per grid cell — kept apart from buckets so it can become its own Draw list (Geometry.WaterDraws)
+	sprites          map[uint16][]Vert           // per texture slot, AddSprites billboards — reused across calls
+	particleSprites  map[uint16][]Vert           // per texture slot, AddParticleSprites billboards — reused across calls
+	transparentItems []transparentItem           // AddTransparentSprites' own sort scratch — reused across calls
 
 	// SkipCeilings, when true, omits every ceiling flat from the static
 	// geometry (floors, walls, and sky are unaffected) — a top-down/
@@ -254,11 +306,13 @@ func (b *Builder) SetExtraFloors(m map[int][]int) {
 func New(lvl *wad.Level, tree bsp.Node, tex *assets.Textures) *Builder {
 	b := &Builder{
 		lvl: lvl, tree: tree, tex: tex,
-		texID:   make(map[*assets.RGBA]uint16),
-		polys:   bsp.SubsectorPolygons(tree, lvl),
-		buckets: make(map[uint16]map[int32][]Vert),
-		masked:  make(map[uint16]map[int32][]Vert),
-		sprites: make(map[uint16][]Vert),
+		texID:           make(map[*assets.RGBA]uint16),
+		polys:           bsp.SubsectorPolygons(tree, lvl),
+		buckets:         make(map[uint16]map[int32][]Vert),
+		masked:          make(map[uint16]map[int32][]Vert),
+		waterBuckets:    make(map[uint16]map[int32][]Vert),
+		sprites:         make(map[uint16][]Vert),
+		particleSprites: make(map[uint16][]Vert),
 	}
 	b.grid = newLevelVisGrid(lvl)
 	// Resolve the per-map WAD sky (a wall texture named SKY1..4) once; a
@@ -312,6 +366,11 @@ func (b *Builder) Invalidate() {
 			b.masked[slot][cell] = b.masked[slot][cell][:0]
 		}
 	}
+	for slot := range b.waterBuckets {
+		for cell := range b.waterBuckets[slot] {
+			b.waterBuckets[slot][cell] = b.waterBuckets[slot][cell][:0]
+		}
+	}
 	for i := range b.lvl.Subsectors {
 		b.emitSubsectorIdx(i)
 	}
@@ -351,6 +410,22 @@ func (b *Builder) Invalidate() {
 			}
 			minX, minY, maxX, maxY := bucketBounds(bk)
 			b.g.StaticDraws = append(b.g.StaticDraws, Draw{Tex: b.g.Textures[slot], Bright: b.g.Brightmaps[slot], First: len(b.g.StaticTris), Count: len(bk), Cell: cell, MinX: minX, MinY: minY, MaxX: maxX, MaxY: maxY})
+			b.g.StaticTris = append(b.g.StaticTris, bk...)
+		}
+	}
+	// Water is its own Draw list (Geometry.WaterDraws), not StaticDraws — a
+	// backend wanting real refraction needs to draw everything else first,
+	// then water in its own pass step. Still appended to the same
+	// StaticTris buffer as everything above.
+	b.g.WaterDraws = b.g.WaterDraws[:0]
+	for slot := uint16(0); int(slot) < len(b.g.Textures); slot++ {
+		for _, cell := range sortedCells(b.waterBuckets[slot]) {
+			bk := b.waterBuckets[slot][cell]
+			if len(bk) == 0 {
+				continue
+			}
+			minX, minY, maxX, maxY := bucketBounds(bk)
+			b.g.WaterDraws = append(b.g.WaterDraws, Draw{Tex: b.g.Textures[slot], Bright: b.g.Brightmaps[slot], First: len(b.g.StaticTris), Count: len(bk), Cell: cell, MinX: minX, MinY: minY, MaxX: maxX, MaxY: maxY})
 			b.g.StaticTris = append(b.g.StaticTris, bk...)
 		}
 	}
@@ -397,7 +472,7 @@ func sortedCells(m map[int32][]Vert) []int32 {
 	for c := range m {
 		cells = append(cells, c)
 	}
-	sort.Slice(cells, func(i, j int) bool { return cells[i] < cells[j] })
+	slices.Sort(cells)
 	return cells
 }
 
@@ -411,16 +486,27 @@ func sortedCells(m map[int32][]Vert) []int32 {
 // before purely for the existing periodic diagnostic log — the counting is
 // a free byproduct of the loop this now has to run anyway.
 func (b *Builder) UpdateVisibility(cam Camera) (visibleDraws, totalDraws, visibleVerts, totalVerts int) {
-	totalDraws = len(b.g.StaticDraws)
-	if cap(b.g.StaticDrawVisible) < totalDraws {
-		b.g.StaticDrawVisible = make([]bool, totalDraws)
+	visibleDraws, totalDraws, visibleVerts, totalVerts = cullDraws(cam, b.g.StaticDraws, &b.g.StaticDrawVisible)
+	cullDraws(cam, b.g.WaterDraws, &b.g.WaterDrawVisible)
+	return
+}
+
+// cullDraws tests each of draws' own bounding box against cam's view,
+// filling *visible (reused/resized in place, so a warm level allocates
+// nothing here) — the shared body behind UpdateVisibility's StaticDraws
+// pass (whose counts it returns, for the existing periodic diagnostic log)
+// and its WaterDraws pass (counts discarded — water has no such log line).
+func cullDraws(cam Camera, draws []Draw, visible *[]bool) (visibleDraws, totalDraws, visibleVerts, totalVerts int) {
+	totalDraws = len(draws)
+	if cap(*visible) < totalDraws {
+		*visible = make([]bool, totalDraws)
 	} else {
-		b.g.StaticDrawVisible = b.g.StaticDrawVisible[:totalDraws]
+		*visible = (*visible)[:totalDraws]
 	}
-	for i, d := range b.g.StaticDraws {
+	for i, d := range draws {
 		totalVerts += d.Count
 		vis := cellVisible(cam, d.MinX, d.MinY, d.MaxX, d.MaxY)
-		b.g.StaticDrawVisible[i] = vis
+		(*visible)[i] = vis
 		if vis {
 			visibleDraws++
 			visibleVerts += d.Count
@@ -439,6 +525,8 @@ var staticVersionSeq uint32
 func (b *Builder) Build(_, _ float32) *Geometry {
 	b.g.Tris = b.g.Tris[:0]
 	b.g.Draws = b.g.Draws[:0]
+	b.g.ParticleDraws = b.g.ParticleDraws[:0]
+	b.g.TransparentDraws = b.g.TransparentDraws[:0]
 	b.g.Voxels = b.g.Voxels[:0]
 	return &b.g
 }
@@ -462,6 +550,9 @@ type Sprite struct {
 	Light      float32
 	FullBright bool
 	Flip       bool
+	// Alpha is only read by AddTransparentSprites (real alpha blend); 0
+	// there means fully invisible, not "unset" — the caller always sets it.
+	Alpha float32
 }
 
 // AddSprites appends camera-facing billboard quads for sprs to the geometry
@@ -472,8 +563,30 @@ type Sprite struct {
 // billboards against the level and each other, so submission order here
 // doesn't matter.
 func (b *Builder) AddSprites(camAngle float64, sprs []Sprite) {
-	for k := range b.sprites {
-		b.sprites[k] = b.sprites[k][:0]
+	b.addBillboardSprites(camAngle, sprs, b.sprites, &b.g.Draws)
+}
+
+// AddParticleSprites is AddSprites' twin for a backend's separate additive,
+// no-depth-write pipeline (pipeParticleAdd in render/vulkan) — cosmetic
+// billboards (currently engine.Particle's explosion sparks) meant to glow
+// brighter where a dense burst overlaps rather than alpha-cutout-occlude
+// each other the way KindSprite/KindSpriteFull do. Same math as AddSprites,
+// writing into ParticleDraws instead of Draws; call it once per frame,
+// alongside AddSprites.
+func (b *Builder) AddParticleSprites(camAngle float64, sprs []Sprite) {
+	b.addBillboardSprites(camAngle, sprs, b.particleSprites, &b.g.ParticleDraws)
+}
+
+// addBillboardSprites is the shared quad-building and per-texture-batching
+// tail for AddSprites and AddParticleSprites — the two differ only in which
+// scratch map (reused across calls, like AddTransparentSprites' own
+// b.transparentItems) they batch quads through and which Draws list they
+// append to, not in how a Sprite becomes a quad or how quads get batched by
+// texture. scratch is reset (its slots truncated to length 0, not
+// reallocated) on every call, same as before this was split out.
+func (b *Builder) addBillboardSprites(camAngle float64, sprs []Sprite, scratch map[uint16][]Vert, dst *[]Draw) {
+	for k := range scratch {
+		scratch[k] = scratch[k][:0]
 	}
 	if len(sprs) == 0 {
 		return
@@ -528,16 +641,219 @@ func (b *Builder) AddSprites(camAngle float64, sprs []Sprite) {
 		br := mk(hx, hy, botZ, u1, 1)
 		tr := mk(hx, hy, topZ, u1, 0)
 		tl := mk(lx, ly, topZ, u0, 0)
-		b.sprites[slot] = append(b.sprites[slot], bl, br, tr, bl, tr, tl)
+		scratch[slot] = append(scratch[slot], bl, br, tr, bl, tr, tl)
 	}
 
 	for slot := uint16(0); int(slot) < len(b.g.Textures); slot++ {
-		bk := b.sprites[slot]
+		bk := scratch[slot]
 		if len(bk) == 0 {
 			continue
 		}
-		b.g.Draws = append(b.g.Draws, Draw{Tex: b.g.Textures[slot], Bright: b.g.Brightmaps[slot], First: len(b.g.Tris), Count: len(bk)})
+		*dst = append(*dst, Draw{Tex: b.g.Textures[slot], Bright: b.g.Brightmaps[slot], First: len(b.g.Tris), Count: len(bk)})
 		b.g.Tris = append(b.g.Tris, bk...)
+	}
+}
+
+// transparentDepthBucketSize is how far apart (in world units) two
+// translucent sprites' distances from the camera can be while still
+// counting as "the same depth" for AddTransparentSprites' batching — see
+// its own doc comment. Small enough that reordering sprites within one
+// bucket is visually negligible (a handful of overlapping, similarly-sized
+// soft particles), large enough that a typical burst of particles spans
+// only a few buckets rather than one per sprite.
+const transparentDepthBucketSize = 96.0
+
+// transparentItem is AddTransparentSprites' own per-sprite sort key: idx
+// indexes back into the caller's sprs slice rather than copying the whole
+// Sprite, so sorting only moves a few bytes per item.
+type transparentItem struct {
+	idx    uint32
+	bucket int32
+	slot   uint16
+	valid  bool
+}
+
+// AddTransparentSprites appends real-alpha-blended billboard quads for sprs
+// (KindSpriteTrans — see pipeParticleTrans in render/vulkan). Blending here
+// is order-dependent, unlike AddSprites/AddParticleSprites, so sprites
+// still can't be freely batched by texture the way those are — but strict
+// per-sprite back-to-front order is stricter than actually needed: two
+// sprites close enough in depth to be in the same transparentDepthBucketSize
+// band read the same however they're ordered against each other (they're
+// small, similar, and mostly overlap the same background either way).
+// So this sorts by (depth bucket descending, texture slot ascending)
+// instead of pure distance, then coalesces consecutive same-bucket
+// same-texture quads into one Draw (appendTransparentQuad's coalesce
+// flag) — batched within a bucket, still strictly ordered bucket-to-bucket.
+// A big burst that used to cost one draw call per sprite now costs
+// roughly (bucket count × distinct textures per bucket), which for this
+// engine's small set of procedural particle textures is a large reduction.
+func (b *Builder) AddTransparentSprites(camX, camY, camZ float32, camAngle float64, sprs []Sprite) {
+	if len(sprs) == 0 {
+		return
+	}
+	// b.transparentItems is reused across calls (like b.sprites/
+	// b.particleSprites above) instead of allocating a fresh scratch slice
+	// every frame — this runs on every frame with any live fire/smoke
+	// particle. Each item stores an index into sprs rather than a copy of
+	// the whole Sprite, so sorting swaps a few bytes instead of the full
+	// ~40-byte struct.
+	items := b.transparentItems[:0]
+	if cap(items) < len(sprs) {
+		items = make([]transparentItem, 0, len(sprs))
+	}
+	for i := range sprs {
+		s := &sprs[i]
+		it := transparentItem{idx: uint32(i)}
+		if s.Tex != nil && s.Tex.Width > 0 && s.Tex.Height > 0 && s.Alpha > 0 {
+			d := float32(math.Sqrt(float64(sqDist(*s, camX, camY, camZ))))
+			it.bucket = int32(d / transparentDepthBucketSize)
+			it.slot = b.slot(s.Tex, nil)
+			it.valid = true
+		}
+		items = append(items, it)
+	}
+	slices.SortFunc(items, func(a, c transparentItem) int {
+		if a.valid != c.valid {
+			if a.valid {
+				return -1 // invalid (skipped) entries sink to the end
+			}
+			return 1
+		}
+		if a.bucket != c.bucket {
+			return int(c.bucket - a.bucket) // farther bucket first
+		}
+		return int(a.slot) - int(c.slot)
+	})
+	b.transparentItems = items
+
+	rx := float32(math.Sin(camAngle))
+	ry := float32(-math.Cos(camAngle))
+	snx := float32(-math.Cos(camAngle))
+	sny := float32(-math.Sin(camAngle))
+
+	haveLast := false
+	var lastBucket int32
+	var lastSlot uint16
+	for _, it := range items {
+		if !it.valid {
+			continue
+		}
+		s := sprs[it.idx]
+		tpu := s.Tex.TexelsPerUnit
+		if tpu <= 0 {
+			tpu = 1
+		}
+		sm := s.SizeMul
+		if sm <= 0 {
+			sm = 1
+		}
+		worldW := float32(float64(s.Tex.Width) / tpu * float64(sm))
+		worldH := float32(float64(s.Tex.Height) / tpu * float64(sm))
+		offX := float32(float64(s.Tex.OffsetX) / tpu * float64(sm))
+		offY := float32(float64(s.Tex.OffsetY) / tpu * float64(sm))
+
+		topZ := s.Z + s.Lift + offY
+		botZ := topZ - worldH
+		oL, oR := -offX, worldW-offX
+
+		u0, u1 := float32(0), float32(1)
+		if s.Flip {
+			u0, u1 = 1, 0
+		}
+
+		lx, ly := s.X+rx*oL, s.Y+ry*oL
+		hx, hy := s.X+rx*oR, s.Y+ry*oR
+		coalesce := haveLast && it.bucket == lastBucket && it.slot == lastSlot
+		b.appendTransparentQuad(s.Tex, it.slot, [4]quadCorner{
+			{X: lx, Y: ly, Z: botZ, U: u0, V: 1},
+			{X: hx, Y: hy, Z: botZ, U: u1, V: 1},
+			{X: hx, Y: hy, Z: topZ, U: u1, V: 0},
+			{X: lx, Y: ly, Z: topZ, U: u0, V: 0},
+		}, snx, sny, 0, s.Light, s.Alpha, coalesce)
+		lastBucket, lastSlot, haveLast = it.bucket, it.slot, true
+	}
+}
+
+// quadCorner is one vertex's world position + UV for appendTransparentQuad.
+type quadCorner struct {
+	X, Y, Z float32
+	U, V    float32
+}
+
+// appendTransparentQuad appends one real-alpha-blended (KindSpriteTrans)
+// quad — 4 corners in order (bottom-left, bottom-right, top-right,
+// top-left), triangulated as (0,1,2)+(0,2,3) — to g.Tris/g.TransparentDraws.
+// Shared tail for AddTransparentSprites (camera-facing billboards) and
+// AddGroundSplats (flat floor decals): the two differ only in how the 4
+// corners/UVs and normal are computed, not in how the resulting quad
+// reaches the GPU. slot is the caller's already-resolved b.slot(tex, nil)
+// (AddTransparentSprites needs it early anyway, for its sort key, so
+// resolving it again here would be redundant). If coalesce is true, this
+// extends the immediately-preceding Draw's Count instead of starting a new
+// one — callers set it when this quad shares both texture and (if
+// relevant) depth bucket with the previous one; AddGroundSplats always
+// passes false since it doesn't batch (see AddTransparentSprites for why
+// splats don't need to: their count is always small).
+func (b *Builder) appendTransparentQuad(tex *assets.RGBA, slot uint16, c [4]quadCorner, nx, ny, nz, light, alpha float32, coalesce bool) {
+	mk := func(q quadCorner) Vert {
+		return Vert{X: q.X, Y: q.Y, Z: q.Z, U: q.U, V: q.V, Light: light, Alpha: alpha, Nx: nx, Ny: ny, Nz: nz, Tex: slot, Kind: KindSpriteTrans}
+	}
+	first := len(b.g.Tris)
+	b.g.Tris = append(b.g.Tris, mk(c[0]), mk(c[1]), mk(c[2]), mk(c[0]), mk(c[2]), mk(c[3]))
+	if coalesce && len(b.g.TransparentDraws) > 0 {
+		b.g.TransparentDraws[len(b.g.TransparentDraws)-1].Count += 6
+		return
+	}
+	b.g.TransparentDraws = append(b.g.TransparentDraws, Draw{Tex: tex, Bright: b.g.Brightmaps[slot], First: first, Count: 6})
+}
+
+// sqDist is the squared distance from a Sprite's anchor to a camera
+// position — cheap and order-preserving, which is all the back-to-front
+// sort in AddTransparentSprites needs.
+func sqDist(s Sprite, camX, camY, camZ float32) float32 {
+	dx, dy, dz := s.X-camX, s.Y-camY, s.Z-camZ
+	return dx*dx + dy*dy + dz*dz
+}
+
+// GroundSplat is a flat, floor-aligned quad — a shrinking puddle of liquid
+// burning on the floor, for instance — unlike every other sprite type in
+// this file, which are camera-facing billboards. A billboard viewed nearly
+// edge-on (looking down at a floor puddle, which is the common case for
+// something lying on the ground) collapses toward a thin line; a real flat
+// decal reads correctly from any angle, the same way the floor's own
+// texture does. Real alpha-blended (KindSpriteTrans) so it fades out and
+// blends into whatever floor it's sitting on rather than a hard cutout.
+type GroundSplat struct {
+	X, Y, Z float32 // Z should already be nudged slightly above the floor by the caller to avoid z-fighting
+	Radius  float32
+	Rot     float32 // radians — vary per splat so a cluster of puddles doesn't look identical
+	Light   float32
+	Alpha   float32
+	Tex     *assets.RGBA
+}
+
+// AddGroundSplats emits one flat quad per splat, lying on the XY plane
+// (not billboarded) — see GroundSplat's doc comment for why floor decals
+// need this instead of the billboard path every other Add* here uses.
+// Appends to the same TransparentDraws list AddTransparentSprites does;
+// call this first if both run the same frame so puddles land underneath
+// whatever fire/smoke billboards are rising off them, not on top.
+func (b *Builder) AddGroundSplats(splats []GroundSplat) {
+	corners := [4][2]float32{{-1, -1}, {1, -1}, {1, 1}, {-1, 1}}
+	uvs := [4][2]float32{{0, 1}, {1, 1}, {1, 0}, {0, 0}}
+	for i := range splats {
+		s := &splats[i]
+		if s.Tex == nil || s.Tex.Width <= 0 || s.Tex.Height <= 0 || s.Alpha <= 0 || s.Radius <= 0 {
+			continue
+		}
+		cr, sr := float32(math.Cos(float64(s.Rot))), float32(math.Sin(float64(s.Rot)))
+		var c [4]quadCorner
+		for k, o := range corners {
+			lx, ly := o[0]*s.Radius, o[1]*s.Radius
+			c[k] = quadCorner{X: s.X + lx*cr - ly*sr, Y: s.Y + lx*sr + ly*cr, Z: s.Z, U: uvs[k][0], V: uvs[k][1]}
+		}
+		b.appendTransparentQuad(s.Tex, b.slot(s.Tex, nil), c, 0, 0, 1, s.Light, s.Alpha, false)
 	}
 }
 
@@ -563,12 +879,18 @@ func (b *Builder) slot(t, bright *assets.RGBA) uint16 {
 
 // emit appends one triangle to the bucket for its (texture slot, grid cell)
 // — the masked set for KindMasked (alpha-tested 2-sided middles, kept out
-// of the depth pre-pass), the opaque set otherwise. b.curCell is set once
-// per subsector by emitSubsectorIdx before any of its triangles reach here.
+// of the depth pre-pass), the water set for KindLiquidWater (kept apart so
+// it can become its own Draw list — see Geometry.WaterDraws; lava/nukage
+// are NOT split out, they stay in the opaque set like any other flat), the
+// opaque set otherwise. b.curCell is set once per subsector by
+// emitSubsectorIdx before any of its triangles reach here.
 func (b *Builder) emit(a, c, d Vert) {
 	m := b.buckets
-	if a.Kind == KindMasked {
+	switch a.Kind {
+	case KindMasked:
 		m = b.masked
+	case KindLiquidWater:
+		m = b.waterBuckets
 	}
 	byCell := m[a.Tex]
 	if byCell == nil {
@@ -689,6 +1011,15 @@ func (b *Builder) emitFlatPlane(poly []bsp.Point, texName string, zAt func(x, y 
 			if lk := liquidKindOfFlat(texName); lk != KindFlat {
 				kind = lk
 			}
+		}
+		// Unlike liquids, a teleporter pad's ceiling is a real, common
+		// setup — maps often sandwich the effect with the same GATE flat
+		// on both floor and ceiling so the shimmer reads as a bounded
+		// column, not just a lit floor — so this applies regardless of
+		// facing (kind is still KindFlat here if the liquid check above
+		// didn't already claim it).
+		if kind == KindFlat && isTeleportFlat(texName) {
+			kind = KindTeleport
 		}
 	} else {
 		return // unresolved flat — nothing to draw (matches raster's nil-flat skip)

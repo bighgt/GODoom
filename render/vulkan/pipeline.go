@@ -139,61 +139,12 @@ func (r *Renderer) destroyPipeline() {
 
 // litImage is a device-local image + its memory + one full-image view — the
 // shape every offscreen render target here (world's ambient/bloom/HDR
-// targets, the iso viewer's offscreen scene) is built from. litMakeImage
-// builds one.
+// targets, the iso viewer's offscreen scene) is built from. wMakeImage
+// (worldsetup.go) builds one.
 type litImage struct {
 	image  vk.Image
 	memory vk.DeviceMemory
 	view   vk.ImageView
-}
-
-// litMakeImage creates a w x h device-local 2D image (format/usage as
-// given), backs it with freshly allocated device-local memory, and builds
-// one full-image view over it.
-func (r *Renderer) litMakeImage(w, h int, format vk.Format, usage vk.ImageUsageFlags) (litImage, error) {
-	var li litImage
-	info := vk.ImageCreateInfo{
-		SType:         vk.StructureTypeImageCreateInfo,
-		ImageType:     vk.ImageType2d,
-		Format:        format,
-		Extent:        vk.Extent3D{Width: uint32(w), Height: uint32(h), Depth: 1},
-		MipLevels:     1,
-		ArrayLayers:   1,
-		Samples:       vk.SampleCount1Bit,
-		Tiling:        vk.ImageTilingOptimal,
-		Usage:         usage,
-		SharingMode:   vk.SharingModeExclusive,
-		InitialLayout: vk.ImageLayoutUndefined,
-	}
-	if res := vk.CreateImage(r.device, &info, nil, &li.image); res != vk.Success {
-		return li, fmt.Errorf("vulkan: create image: %s", vk.Error(res))
-	}
-	var memReq vk.MemoryRequirements
-	vk.GetImageMemoryRequirements(r.device, li.image, &memReq)
-	memReq.Deref()
-	mt, err := r.findMemoryType(memReq.MemoryTypeBits, vk.MemoryPropertyFlags(vk.MemoryPropertyDeviceLocalBit))
-	if err != nil {
-		return li, fmt.Errorf("vulkan: image memory: %w", err)
-	}
-	alloc := vk.MemoryAllocateInfo{SType: vk.StructureTypeMemoryAllocateInfo, AllocationSize: memReq.Size, MemoryTypeIndex: mt}
-	if res := vk.AllocateMemory(r.device, &alloc, nil, &li.memory); res != vk.Success {
-		return li, fmt.Errorf("vulkan: image alloc: %s", vk.Error(res))
-	}
-	if res := vk.BindImageMemory(r.device, li.image, li.memory, 0); res != vk.Success {
-		return li, fmt.Errorf("vulkan: image bind: %s", vk.Error(res))
-	}
-	viewInfo := vk.ImageViewCreateInfo{
-		SType:            vk.StructureTypeImageViewCreateInfo,
-		Image:            li.image,
-		ViewType:         vk.ImageViewType2d,
-		Format:           format,
-		Components:       vk.ComponentMapping{R: vk.ComponentSwizzleIdentity, G: vk.ComponentSwizzleIdentity, B: vk.ComponentSwizzleIdentity, A: vk.ComponentSwizzleIdentity},
-		SubresourceRange: vk.ImageSubresourceRange{AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit), LevelCount: 1, LayerCount: 1},
-	}
-	if res := vk.CreateImageView(r.device, &viewInfo, nil, &li.view); res != vk.Success {
-		return li, fmt.Errorf("vulkan: image view: %s", vk.Error(res))
-	}
-	return li, nil
 }
 
 // samplerBinding is a combined-image-sampler descriptor binding at binding

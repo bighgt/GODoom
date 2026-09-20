@@ -47,8 +47,6 @@ func (s *selection) clearAll() {
 	clear(s.Things)
 }
 
-func (s *selection) count() int { return len(s.Verts) + len(s.Lines) + len(s.Sectors) + len(s.Things) }
-
 // selectOne clears every selection set and selects a single element of the
 // given kind.
 func (s *selection) selectOne(m editMode, idx int) {

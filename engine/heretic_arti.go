@@ -25,7 +25,7 @@ const (
 	artiEgg                         // Morph Ovum
 	artiWings                       // Wings of Wrath
 	artiTeleport                    // Chaos Device
-	artiNone artifact = -1
+	artiNone        artifact = -1
 )
 
 // numArtifacts is untyped so it compares cleanly with plain ints.
@@ -50,8 +50,8 @@ const (
 	tomeTics       = 40 * 35
 	torchTics      = 20 * 35 // 60*35 in Heretic; shorter here
 	flightTics     = 40 * 35
-	timeBombDelay  = 35      // ~1s fuse
-	timeBombDamage = 128     // pRadiusAttack range
+	timeBombDelay  = 35  // ~1s fuse
+	timeBombDamage = 128 // pRadiusAttack range
 )
 
 // doubled returns v with every element doubled (Bag of Holding on the

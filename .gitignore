@@ -52,6 +52,13 @@
 !/assets/mods/TEXTURES.example
 !/assets/mods/README.txt
 
+# Native particle-effect billboard art (engine/particles.go) — extracted
+# once from a third-party mod pack the user supplied locally (see that
+# file's doc comment), same "supply your own locally" reasoning as the
+# packs above. Missing entirely is a supported, non-fatal state (no
+# particles spawn) so this is never required to build or run.
+/assets/particles/
+
 # Auto-installed local tooling (shader compiler, etc.) — not committed.
 /.tooling/
 

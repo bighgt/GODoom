@@ -19,6 +19,10 @@ const (
 	// a huge open sector with no wall in range would otherwise fly forever,
 	// staying in the slice and drawn every frame. ~128 tiles.
 	projectileMaxRange = 8192.0
+	// rocketBarrelExplosionBoost is how much bigger a barrel's own
+	// explosion gets when a rocket's direct hit is what kills it — see
+	// advanceProjectile and aExplode.
+	rocketBarrelExplosionBoost = 4.0
 )
 
 // Projectile is a weapon's true traveling shot in flight (see
@@ -39,6 +43,18 @@ type Projectile struct {
 	// def.ExplodeFrames in place before disappearing.
 	exploding      bool
 	explodeElapsed float64 // seconds since impact
+
+	// flameTrailTimer/smokeTrailTimer count down to the next rocket exhaust
+	// flame/smoke spawn — see updateRocketTrail in particles.go. Unused by
+	// any non-rocket shot.
+	flameTrailTimer float64
+	smokeTrailTimer float64
+
+	// skipOwnExplosion suppresses this shot's own spawnExplosionParticles
+	// call on impact — set when it just landed the killing hit on a barrel
+	// (see updateProjectiles), so that death's own (boosted) explosion is
+	// the only one that plays instead of two overlapping bursts.
+	skipOwnExplosion bool
 }
 
 // spawnProjectile fires one from the camera's current position along its
@@ -106,6 +122,18 @@ func (g *Game) updateProjectiles(dt float64) {
 			p.exploding = true
 			p.explodeElapsed = 0
 			g.playSound(p.def.ExplodeSound)
+			if !p.skipOwnExplosion {
+				scale := explosionDefault
+				switch p.def.ExplodePrefix {
+				case "MISL": // rocket: bigger, denser burst
+					scale = explosionRocket
+				case "PLSE": // plasma: energy blast, no smoke to burn
+					scale = explosionEnergy
+				case "BFE1": // BFG: a massive energy blast — much bigger, no smoke, huge lingering fire
+					scale = explosionBFG
+				}
+				g.spawnExplosionParticles(p.X, p.Y, p.Z, scale)
+			}
 			// Rockets (and any blast-radius shot) hurt everything nearby.
 			if p.def.ExplodeRadius > 0 {
 				g.pRadiusAttack(&Mobj{X: p.X, Y: p.Y, Z: p.Z}, g.playerMobj, p.def.ExplodeRadius)
@@ -115,6 +143,9 @@ func (g *Game) updateProjectiles(dt float64) {
 			if p.def.Spray && g.playerMobj != nil {
 				g.aBFGSpray(g.playerMobj)
 			}
+		}
+		if p.Alive && !p.exploding && p.def.ExplodePrefix == "MISL" {
+			g.updateRocketTrail(p, dt)
 		}
 		if p.Alive {
 			alive = append(alive, p)
@@ -145,9 +176,9 @@ const (
 // shot doesn't jump to a different field of view.
 func rocketFollowCamera(p *Projectile, fovDeg float64) raster.Camera {
 	return raster.Camera{
-		X: p.X - p.DX*rocketCamChaseDist,
-		Y: p.Y - p.DY*rocketCamChaseDist,
-		Z: p.Z - p.DZ*rocketCamChaseDist + rocketCamLift,
+		X:      p.X - p.DX*rocketCamChaseDist,
+		Y:      p.Y - p.DY*rocketCamChaseDist,
+		Z:      p.Z - p.DZ*rocketCamChaseDist + rocketCamLift,
 		Angle:  math.Atan2(p.DY, p.DX),
 		Pitch:  math.Asin(math.Max(-1, math.Min(1, p.DZ))),
 		FOVDeg: fovDeg,
@@ -182,9 +213,20 @@ func (g *Game) advanceProjectile(p *Projectile, dt float64) bool {
 		nz := p.Z + p.DZ*seg
 
 		if mo := g.projectileHitMobj(nx, ny, nz); mo != nil {
+			// A rocket landing the killing blow on a barrel would otherwise
+			// produce two overlapping explosions: this shot's own burst
+			// right now, then the barrel's own (a few tics later, once its
+			// death animation reaches S_BEXP4 — see aExplode). Detect that
+			// exact case and merge them into one, bigger burst instead: this
+			// shot skips its own, and the barrel's gets boosted.
+			rocketBarrel := p.def.ExplodePrefix == "MISL" && mo.Type == MT_BARREL && mo.Health > 0
 			if p.def.Damage > 0 {
 				dmg := (pRandom()%8 + 1) * p.def.Damage
 				g.pDamageMobj(mo, nil, g.playerMobj, dmg)
+			}
+			if rocketBarrel && mo.Health <= 0 {
+				mo.explosionBoost = rocketBarrelExplosionBoost
+				p.skipOwnExplosion = true
 			}
 			p.X, p.Y, p.Z = nx, ny, nz // explode on the target so the blast is centred there
 			return true

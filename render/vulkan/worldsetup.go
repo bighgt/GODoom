@@ -179,7 +179,24 @@ func (r *Renderer) worldCreateSamplers() error {
 	return nil
 }
 
-func (r *Renderer) worldCreateSceneRenderPass() error {
+// worldCreateOpaqueRenderPass builds rpOpaque: the opaque static geometry
+// pass (walls/flats minus water, sky, depth pre-pass), always built
+// regardless of wr.waterRefraction. Its FinalLayout/exit dependency differ
+// by that toggle: off, this is the ONLY pass this frame (water draws inside
+// it too, via the plain pipeline — see recordWorldCommandBuffer), so it
+// hands straight to the present/ambient passes' fragment reads exactly like
+// the old single rpScene did; on, its very next consumer is the capture
+// copy ahead of rpWater, so it hands off to a transfer read instead.
+func (r *Renderer) worldCreateOpaqueRenderPass() error {
+	wr := r.wr
+	finalLayout := vk.ImageLayoutShaderReadOnlyOptimal
+	exitDstStage := vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit)
+	exitDstAccess := vk.AccessFlags(vk.AccessShaderReadBit)
+	if wr.waterRefraction {
+		finalLayout = vk.ImageLayoutColorAttachmentOptimal // depth attachment below uses its own DepthStencilAttachmentOptimal
+		exitDstStage = vk.PipelineStageFlags(vk.PipelineStageTransferBit)
+		exitDstAccess = vk.AccessFlags(vk.AccessTransferReadBit)
+	}
 	color := vk.AttachmentDescription{
 		Format:         sceneHDRFormat, // RGBA16F — dynamic lights can push past 1.0 for the bloom/tonemap
 		Samples:        vk.SampleCount1Bit,
@@ -188,19 +205,25 @@ func (r *Renderer) worldCreateSceneRenderPass() error {
 		StencilLoadOp:  vk.AttachmentLoadOpDontCare,
 		StencilStoreOp: vk.AttachmentStoreOpDontCare,
 		InitialLayout:  vk.ImageLayoutUndefined,
-		FinalLayout:    vk.ImageLayoutShaderReadOnlyOptimal,
+		FinalLayout:    finalLayout,
+	}
+	depthFinalLayout := vk.ImageLayoutShaderReadOnlyOptimal
+	if wr.waterRefraction {
+		depthFinalLayout = vk.ImageLayoutDepthStencilAttachmentOptimal
 	}
 	depth := vk.AttachmentDescription{
-		Format:        vk.FormatD32Sfloat,
-		Samples:       vk.SampleCount1Bit,
-		LoadOp:        vk.AttachmentLoadOpClear,
+		Format:  vk.FormatD32Sfloat,
+		Samples: vk.SampleCount1Bit,
+		LoadOp:  vk.AttachmentLoadOpClear,
 		// Kept (was DontCare) so the present blit can sample it for the water
-		// SSR march; rpScene's finalLayout hands it over as shader-read.
+		// SSR march; this pass's finalLayout hands it over as shader-read
+		// (waterRefraction off) or attachment-writable (on, rpWater
+		// continues into it via LoadOpLoad).
 		StoreOp:        vk.AttachmentStoreOpStore,
 		StencilLoadOp:  vk.AttachmentLoadOpDontCare,
 		StencilStoreOp: vk.AttachmentStoreOpDontCare,
 		InitialLayout:  vk.ImageLayoutUndefined,
-		FinalLayout:    vk.ImageLayoutShaderReadOnlyOptimal,
+		FinalLayout:    depthFinalLayout,
 	}
 	colorRef := vk.AttachmentReference{Attachment: 0, Layout: vk.ImageLayoutColorAttachmentOptimal}
 	depthRef := vk.AttachmentReference{Attachment: 1, Layout: vk.ImageLayoutDepthStencilAttachmentOptimal}
@@ -219,7 +242,85 @@ func (r *Renderer) worldCreateSceneRenderPass() error {
 			SrcAccessMask: vk.AccessFlags(vk.AccessShaderReadBit),
 			DstAccessMask: vk.AccessFlags(vk.AccessColorAttachmentWriteBit) | vk.AccessFlags(vk.AccessDepthStencilAttachmentWriteBit),
 		},
-		{ // our colour + depth writes are visible to the present pass's fragment reads
+		{ // our colour + depth writes are visible to whatever reads them next (see exitDstStage/exitDstAccess above)
+			SrcSubpass: 0,
+			DstSubpass: vk.SubpassExternal,
+			SrcStageMask: vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit) |
+				vk.PipelineStageFlags(vk.PipelineStageLateFragmentTestsBit),
+			DstStageMask: exitDstStage,
+			SrcAccessMask: vk.AccessFlags(vk.AccessColorAttachmentWriteBit) |
+				vk.AccessFlags(vk.AccessDepthStencilAttachmentWriteBit),
+			DstAccessMask: exitDstAccess,
+		},
+	}
+	info := vk.RenderPassCreateInfo{
+		SType:           vk.StructureTypeRenderPassCreateInfo,
+		AttachmentCount: 2,
+		PAttachments:    []vk.AttachmentDescription{color, depth},
+		SubpassCount:    1,
+		PSubpasses:      []vk.SubpassDescription{sub},
+		DependencyCount: uint32(len(deps)),
+		PDependencies:   deps,
+	}
+	var rp vk.RenderPass
+	if res := vk.CreateRenderPass(r.device, &info, nil, &rp); res != vk.Success {
+		return fmt.Errorf("vulkan: world opaque render pass: %s", vk.Error(res))
+	}
+	wr.rpOpaque = rp
+	return nil
+}
+
+// worldCreateWaterRenderPass builds rpWater: water (real refraction) +
+// sprites/voxels/particles, continuing from rpOpaque's already-drawn
+// colour/depth via LoadOpLoad. A no-op (rpWater stays nil) when
+// wr.waterRefraction is off — see recordWorldCommandBuffer's fallback.
+// Its FinalLayout is ShaderReadOnlyOptimal — identical to the old single
+// rpScene's — so the ambient/bloom/blit passes downstream need no changes
+// either way.
+func (r *Renderer) worldCreateWaterRenderPass() error {
+	if !r.wr.waterRefraction {
+		return nil
+	}
+	color := vk.AttachmentDescription{
+		Format:         sceneHDRFormat,
+		Samples:        vk.SampleCount1Bit,
+		LoadOp:         vk.AttachmentLoadOpLoad,
+		StoreOp:        vk.AttachmentStoreOpStore,
+		StencilLoadOp:  vk.AttachmentLoadOpDontCare,
+		StencilStoreOp: vk.AttachmentStoreOpDontCare,
+		InitialLayout:  vk.ImageLayoutColorAttachmentOptimal,
+		FinalLayout:    vk.ImageLayoutShaderReadOnlyOptimal,
+	}
+	depth := vk.AttachmentDescription{
+		Format:         vk.FormatD32Sfloat,
+		Samples:        vk.SampleCount1Bit,
+		LoadOp:         vk.AttachmentLoadOpLoad,
+		StoreOp:        vk.AttachmentStoreOpStore,
+		StencilLoadOp:  vk.AttachmentLoadOpDontCare,
+		StencilStoreOp: vk.AttachmentStoreOpDontCare,
+		InitialLayout:  vk.ImageLayoutDepthStencilAttachmentOptimal,
+		FinalLayout:    vk.ImageLayoutShaderReadOnlyOptimal,
+	}
+	colorRef := vk.AttachmentReference{Attachment: 0, Layout: vk.ImageLayoutColorAttachmentOptimal}
+	depthRef := vk.AttachmentReference{Attachment: 1, Layout: vk.ImageLayoutDepthStencilAttachmentOptimal}
+	sub := vk.SubpassDescription{
+		PipelineBindPoint:       vk.PipelineBindPointGraphics,
+		ColorAttachmentCount:    1,
+		PColorAttachments:       []vk.AttachmentReference{colorRef},
+		PDepthStencilAttachment: &depthRef,
+	}
+	deps := []vk.SubpassDependency{
+		{ // belt-and-suspenders on top of recordWorldCommandBuffer's own explicit
+			// capture-copy barriers (which already fully synchronize this hand-off) —
+			// redundant but harmless, and cheap insurance against a barrier mistake.
+			SrcSubpass:    vk.SubpassExternal,
+			DstSubpass:    0,
+			SrcStageMask:  vk.PipelineStageFlags(vk.PipelineStageTransferBit),
+			DstStageMask:  vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit) | vk.PipelineStageFlags(vk.PipelineStageEarlyFragmentTestsBit),
+			SrcAccessMask: vk.AccessFlags(vk.AccessTransferWriteBit),
+			DstAccessMask: vk.AccessFlags(vk.AccessColorAttachmentWriteBit) | vk.AccessFlags(vk.AccessDepthStencilAttachmentWriteBit),
+		},
+		{ // our colour + depth writes are visible to the present pass's fragment reads — identical to the old rpScene's own exit dependency
 			SrcSubpass: 0,
 			DstSubpass: vk.SubpassExternal,
 			SrcStageMask: vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit) |
@@ -241,9 +342,9 @@ func (r *Renderer) worldCreateSceneRenderPass() error {
 	}
 	var rp vk.RenderPass
 	if res := vk.CreateRenderPass(r.device, &info, nil, &rp); res != vk.Success {
-		return fmt.Errorf("vulkan: world scene render pass: %s", vk.Error(res))
+		return fmt.Errorf("vulkan: world water render pass: %s", vk.Error(res))
 	}
-	r.wr.rpScene = rp
+	r.wr.rpWater = rp
 	return nil
 }
 
@@ -261,9 +362,22 @@ func (r *Renderer) worldCreateOffscreen() error {
 		if sl.depth, err = r.wMakeImage(wr.w, wr.h, vk.FormatD32Sfloat, depUsage, vk.ImageAspectFlags(vk.ImageAspectDepthBit), 1); err != nil {
 			return err
 		}
+		if wr.waterRefraction {
+			// Copy targets only (never rendered into — not framebuffer
+			// attachments), so just TransferDst + Sampled, no attachment bit.
+			captureColUsage := vk.ImageUsageFlags(vk.ImageUsageTransferDstBit) | vk.ImageUsageFlags(vk.ImageUsageSampledBit)
+			if sl.preWaterColor, err = r.wMakeImage(wr.w, wr.h, sceneHDRFormat, captureColUsage, vk.ImageAspectFlags(vk.ImageAspectColorBit), 1); err != nil {
+				return err
+			}
+			if sl.preWaterDepth, err = r.wMakeImage(wr.w, wr.h, vk.FormatD32Sfloat, captureColUsage, vk.ImageAspectFlags(vk.ImageAspectDepthBit), 1); err != nil {
+				return err
+			}
+			sl.preWaterColorLayout = vk.ImageLayoutUndefined
+			sl.preWaterDepthLayout = vk.ImageLayoutUndefined
+		}
 		fbInfo := vk.FramebufferCreateInfo{
 			SType:           vk.StructureTypeFramebufferCreateInfo,
-			RenderPass:      wr.rpScene,
+			RenderPass:      wr.rpOpaque,
 			AttachmentCount: 2,
 			PAttachments:    []vk.ImageView{sl.scene.view, sl.depth.view},
 			Width:           uint32(wr.w),
@@ -365,21 +479,37 @@ func (r *Renderer) worldCreateDescriptorLayouts() error {
 	if wr.dslBlit, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0), samplerBinding(1), samplerBinding(2), samplerBinding(3), uboBindingBlit}); err != nil {
 		return err
 	}
+	if wr.waterRefraction {
+		// waterrefract.frag set 2: uPreWaterColor, uPreWaterDepth.
+		if wr.dslWaterCapture, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0), samplerBinding(1)}); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 func (r *Renderer) worldCreateDescriptors() error {
 	wr := r.wr
 
+	// waterCaptureSets/Samplers: one extra set per slot (setWaterCapture),
+	// 2 combined-image-samplers each (uPreWaterColor, uPreWaterDepth) — only
+	// when waterRefraction actually builds those sets (see the per-slot loop
+	// below); zero otherwise, so the pool isn't oversized when the feature
+	// is off.
+	waterCaptureSets, waterCaptureSamplers := 0, 0
+	if wr.waterRefraction {
+		waterCaptureSets = maxFramesInFlight
+		waterCaptureSamplers = 2 * maxFramesInFlight
+	}
 	framePoolInfo := vk.DescriptorPoolCreateInfo{
 		SType:         vk.StructureTypeDescriptorPoolCreateInfo,
-		MaxSets:       uint32(2 * maxFramesInFlight), // set1 + setBlit per slot
+		MaxSets:       uint32(2*maxFramesInFlight + waterCaptureSets), // set1 + setBlit (+ setWaterCapture) per slot
 		PoolSizeCount: 2,
 		PPoolSizes: []vk.DescriptorPoolSize{
 			// per slot: set1 = 0 samplers (its 2 LUT samplers were removed as
 			// dead code), setBlit = 4 samplers (scene, bloom, overlay,
-			// depth); +2 slack.
-			{Type: vk.DescriptorTypeCombinedImageSampler, DescriptorCount: uint32(4*maxFramesInFlight + 2)},
+			// depth), setWaterCapture = 2 samplers when built; +2 slack.
+			{Type: vk.DescriptorTypeCombinedImageSampler, DescriptorCount: uint32(4*maxFramesInFlight + 2 + waterCaptureSamplers)},
 			// per slot: set1 + setBlit each bind the world UBO; +1 slack.
 			{Type: vk.DescriptorTypeUniformBuffer, DescriptorCount: uint32(2*maxFramesInFlight + 1)},
 		},
@@ -394,7 +524,7 @@ func (r *Renderer) worldCreateDescriptors() error {
 	// unique wall/flat names (the cache never evicts within a session).
 	const maxTextures = 1024
 	texPoolInfo := vk.DescriptorPoolCreateInfo{
-		SType:         vk.StructureTypeDescriptorPoolCreateInfo,
+		SType:   vk.StructureTypeDescriptorPoolCreateInfo,
 		MaxSets: maxTextures,
 		// Each set-0 has 2 combined-image-samplers now (base + brightmap).
 		PoolSizeCount: 1,
@@ -441,6 +571,15 @@ func (r *Renderer) worldCreateDescriptors() error {
 		}
 		if sl.setBlit, err = alloc(wr.framePool, wr.dslBlit); err != nil {
 			return err
+		}
+		if wr.waterRefraction {
+			if sl.setWaterCapture, err = alloc(wr.framePool, wr.dslWaterCapture); err != nil {
+				return err
+			}
+			writes = append(writes,
+				imgW(sl.setWaterCapture, 0, wr.clampSampler, sl.preWaterColor.view),
+				imgW(sl.setWaterCapture, 1, wr.depthSampler, sl.preWaterDepth.view),
+			)
 		}
 		writes = append(writes,
 			vk.WriteDescriptorSet{
@@ -586,7 +725,7 @@ func (r *Renderer) worldCreatePipelines() error {
 		PColorBlendState:    &colorBlend,
 		PDynamicState:       &dynamic,
 		Layout:              wr.plWorld,
-		RenderPass:          wr.rpScene,
+		RenderPass:          wr.rpOpaque,
 		Subpass:             0,
 	}
 	out := make([]vk.Pipeline, 1)
@@ -595,12 +734,166 @@ func (r *Renderer) worldCreatePipelines() error {
 	}
 	wr.pipeWorld = out[0]
 
+	// Particle pipeline: same shaders/vertex-input/layout as pipeWorld (a
+	// particle billboard is drawn with the ordinary KindSprite/KindSpriteFull
+	// vertex kind — nothing shader-side distinguishes it), but depth-write
+	// off and additive colour blending, so a dense burst of overlapping
+	// billboards (engine.Particle) glows brighter where they overlap instead
+	// of alpha-cutout-occluding each other the way the regular sprite pass
+	// does. Depth TEST stays on (LESS_OR_EQUAL, against the already-written
+	// world depth) so particles are still correctly hidden behind walls.
+	// Alpha is excluded from ColorWriteMask so this pass can never flip the
+	// scene alpha's water-reflection tag (world.frag writes alpha 0 for
+	// water, 1 otherwise; see worldblit.frag).
+	particleDepthStencil := vk.PipelineDepthStencilStateCreateInfo{
+		SType:           vk.StructureTypePipelineDepthStencilStateCreateInfo,
+		DepthTestEnable: vk.True, DepthWriteEnable: vk.False, DepthCompareOp: vk.CompareOpLessOrEqual,
+	}
+	particleCBA := vk.PipelineColorBlendAttachmentState{
+		BlendEnable:         vk.True,
+		SrcColorBlendFactor: vk.BlendFactorOne,
+		DstColorBlendFactor: vk.BlendFactorOne,
+		ColorBlendOp:        vk.BlendOpAdd,
+		SrcAlphaBlendFactor: vk.BlendFactorZero,
+		DstAlphaBlendFactor: vk.BlendFactorOne,
+		AlphaBlendOp:        vk.BlendOpAdd,
+		ColorWriteMask: vk.ColorComponentFlags(vk.ColorComponentRBit) | vk.ColorComponentFlags(vk.ColorComponentGBit) |
+			vk.ColorComponentFlags(vk.ColorComponentBBit),
+	}
+	particleColorBlend := vk.PipelineColorBlendStateCreateInfo{
+		SType: vk.StructureTypePipelineColorBlendStateCreateInfo, AttachmentCount: 1,
+		PAttachments: []vk.PipelineColorBlendAttachmentState{particleCBA},
+	}
+	particleInfo := vk.GraphicsPipelineCreateInfo{
+		SType:               vk.StructureTypeGraphicsPipelineCreateInfo,
+		StageCount:          2,
+		PStages:             stages,
+		PVertexInputState:   &vertexInput,
+		PInputAssemblyState: &inputAssembly,
+		PViewportState:      &viewportState,
+		PRasterizationState: &rasterizer,
+		PMultisampleState:   &multisample,
+		PDepthStencilState:  &particleDepthStencil,
+		PColorBlendState:    &particleColorBlend,
+		PDynamicState:       &dynamic,
+		Layout:              wr.plWorld,
+		RenderPass:          wr.rpOpaque,
+		Subpass:             0,
+	}
+	particleOut := make([]vk.Pipeline, 1)
+	if res := vk.CreateGraphicsPipelines(r.device, nil, 1, []vk.GraphicsPipelineCreateInfo{particleInfo}, nil, particleOut); res != vk.Success {
+		return fmt.Errorf("vulkan: particle pipeline: %s", vk.Error(res))
+	}
+	wr.pipeParticleAdd = particleOut[0]
+
+	// Translucent particle pipeline: same shaders/vertex-input/layout again,
+	// but real SrcAlpha/OneMinusSrcAlpha blending instead of additive — for
+	// KindSpriteTrans (engine.Particle's smoke), which wants to look like
+	// haze that dims what's behind it, not another glowing light source.
+	// Depth state and the alpha write mask match pipeParticleAdd exactly
+	// (test only, no write; colour-only write mask to protect the scene
+	// alpha's water-reflection tag) — only the blend factors differ. The
+	// CPU side (worldgeo.Builder.AddTransparentSprites) sorts back-to-front
+	// before this ever runs, since unlike additive this pipeline IS
+	// order-dependent.
+	transCBA := vk.PipelineColorBlendAttachmentState{
+		BlendEnable:         vk.True,
+		SrcColorBlendFactor: vk.BlendFactorSrcAlpha,
+		DstColorBlendFactor: vk.BlendFactorOneMinusSrcAlpha,
+		ColorBlendOp:        vk.BlendOpAdd,
+		SrcAlphaBlendFactor: vk.BlendFactorZero,
+		DstAlphaBlendFactor: vk.BlendFactorOne,
+		AlphaBlendOp:        vk.BlendOpAdd,
+		ColorWriteMask: vk.ColorComponentFlags(vk.ColorComponentRBit) | vk.ColorComponentFlags(vk.ColorComponentGBit) |
+			vk.ColorComponentFlags(vk.ColorComponentBBit),
+	}
+	transColorBlend := vk.PipelineColorBlendStateCreateInfo{
+		SType: vk.StructureTypePipelineColorBlendStateCreateInfo, AttachmentCount: 1,
+		PAttachments: []vk.PipelineColorBlendAttachmentState{transCBA},
+	}
+	transInfo := vk.GraphicsPipelineCreateInfo{
+		SType:               vk.StructureTypeGraphicsPipelineCreateInfo,
+		StageCount:          2,
+		PStages:             stages,
+		PVertexInputState:   &vertexInput,
+		PInputAssemblyState: &inputAssembly,
+		PViewportState:      &viewportState,
+		PRasterizationState: &rasterizer,
+		PMultisampleState:   &multisample,
+		PDepthStencilState:  &particleDepthStencil,
+		PColorBlendState:    &transColorBlend,
+		PDynamicState:       &dynamic,
+		Layout:              wr.plWorld,
+		RenderPass:          wr.rpOpaque,
+		Subpass:             0,
+	}
+	transOut := make([]vk.Pipeline, 1)
+	if res := vk.CreateGraphicsPipelines(r.device, nil, 1, []vk.GraphicsPipelineCreateInfo{transInfo}, nil, transOut); res != vk.Success {
+		return fmt.Errorf("vulkan: translucent particle pipeline: %s", vk.Error(res))
+	}
+	wr.pipeParticleTrans = transOut[0]
+
 	// Depth pre-pass pipeline: positions only (depthonly.vert), empty frag,
 	// colour writes masked off, LESS depth write. Reuses plWorld (no
 	// descriptor sets touched) + the interleaved static VBO (stride matches;
 	// only attribute 0 is fetched).
 	if err := r.worldCreateDepthPipeline(); err != nil {
 		return err
+	}
+
+	if wr.waterRefraction {
+		// Water (real refraction): same vertex stage/input/rasterizer/
+		// multisample state as pipeWorld (world.vert is kind-agnostic, so
+		// it's reused unmodified — see waterrefract.frag's own doc
+		// comment), a dedicated fragment module, and its own pipeline
+		// layout (set 2 = dslWaterCapture, on top of plWorld's set 0/1).
+		// Depth test/write on (LessOrEqual) — must depth-test against
+		// rpOpaque's already-written statics, and still write depth so
+		// sprites/voxels/particles drawn after it in rpWater occlude
+		// correctly, same as every other opaque-ish pass here.
+		liqLayoutInfo := vk.PipelineLayoutCreateInfo{
+			SType:                  vk.StructureTypePipelineLayoutCreateInfo,
+			SetLayoutCount:         3,
+			PSetLayouts:            []vk.DescriptorSetLayout{wr.dsl0, wr.dsl1, wr.dslWaterCapture},
+			PushConstantRangeCount: 1,
+			PPushConstantRanges:    []vk.PushConstantRange{{StageFlags: vk.ShaderStageFlags(vk.ShaderStageVertexBit), Offset: 0, Size: 64}},
+		}
+		var liqLayout vk.PipelineLayout
+		if res := vk.CreatePipelineLayout(r.device, &liqLayoutInfo, nil, &liqLayout); res != vk.Success {
+			return fmt.Errorf("vulkan: water liquid pipeline layout: %s", vk.Error(res))
+		}
+		wr.plWorldLiquid = liqLayout
+
+		liqFrag, err := r.createShaderModule(waterRefractFragSPV)
+		if err != nil {
+			return fmt.Errorf("vulkan: water refract frag: %w", err)
+		}
+		defer vk.DestroyShaderModule(r.device, liqFrag, nil)
+		liqStages := []vk.PipelineShaderStageCreateInfo{
+			{SType: vk.StructureTypePipelineShaderStageCreateInfo, Stage: vk.ShaderStageVertexBit, Module: vert, PName: nz("main")},
+			{SType: vk.StructureTypePipelineShaderStageCreateInfo, Stage: vk.ShaderStageFragmentBit, Module: liqFrag, PName: nz("main")},
+		}
+		liqInfo := vk.GraphicsPipelineCreateInfo{
+			SType:               vk.StructureTypeGraphicsPipelineCreateInfo,
+			StageCount:          2,
+			PStages:             liqStages,
+			PVertexInputState:   &vertexInput,
+			PInputAssemblyState: &inputAssembly,
+			PViewportState:      &viewportState,
+			PRasterizationState: &rasterizer,
+			PMultisampleState:   &multisample,
+			PDepthStencilState:  &depthStencil,
+			PColorBlendState:    &colorBlend,
+			PDynamicState:       &dynamic,
+			Layout:              wr.plWorldLiquid,
+			RenderPass:          wr.rpWater,
+			Subpass:             0,
+		}
+		liqOut := make([]vk.Pipeline, 1)
+		if res := vk.CreateGraphicsPipelines(r.device, nil, 1, []vk.GraphicsPipelineCreateInfo{liqInfo}, nil, liqOut); res != vk.Success {
+			return fmt.Errorf("vulkan: water liquid pipeline: %s", vk.Error(res))
+		}
+		wr.pipeWorldLiquid = liqOut[0]
 	}
 
 	// Present blit: the fullscreen triangle (blit.vert) + worldblit.frag,
@@ -658,7 +951,7 @@ func (r *Renderer) worldCreateDepthPipeline() error {
 		SType:           vk.StructureTypePipelineDepthStencilStateCreateInfo,
 		DepthTestEnable: vk.True, DepthWriteEnable: vk.True, DepthCompareOp: vk.CompareOpLess,
 	}
-	// One colour attachment (rpScene has one) but write nothing.
+	// One colour attachment (rpOpaque has one) but write nothing.
 	cba := vk.PipelineColorBlendAttachmentState{ColorWriteMask: 0}
 	colorBlend := vk.PipelineColorBlendStateCreateInfo{
 		SType: vk.StructureTypePipelineColorBlendStateCreateInfo, AttachmentCount: 1,
@@ -681,7 +974,7 @@ func (r *Renderer) worldCreateDepthPipeline() error {
 		PColorBlendState:    &colorBlend,
 		PDynamicState:       &dynamic,
 		Layout:              wr.plWorld,
-		RenderPass:          wr.rpScene,
+		RenderPass:          wr.rpOpaque,
 		Subpass:             0,
 	}
 	out := make([]vk.Pipeline, 1)

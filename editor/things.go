@@ -19,11 +19,6 @@ const (
 	catLight
 )
 
-func (c thingCat) String() string {
-	return [...]string{"Other", "Player Starts", "Monsters", "Weapons", "Ammo",
-		"Health & Armor", "Keys", "Powerups", "Decorations", "Lamps & Lights"}[c]
-}
-
 func (c thingCat) color() color.RGBA {
 	switch c {
 	case catStart:
@@ -185,13 +180,6 @@ func thingCategory(num int) thingCat {
 		return d.Cat
 	}
 	return catOther
-}
-
-func thingName(num int) string {
-	if d, ok := thingByNum[num]; ok {
-		return d.Name
-	}
-	return "type " + itoa(num)
 }
 
 func itoa(n int) string {

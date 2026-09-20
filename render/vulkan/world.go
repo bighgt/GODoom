@@ -53,6 +53,9 @@ var worldFragSPV []byte
 //go:embed shaders/worldblit.frag.spv
 var worldBlitFragSPV []byte
 
+//go:embed shaders/waterrefract.frag.spv
+var waterRefractFragSPV []byte
+
 //go:embed shaders/depthonly.vert.spv
 var depthOnlyVertSPV []byte
 
@@ -171,8 +174,22 @@ type worldSlot struct {
 	depth litImage // D32 depth for the world pass
 	fb    vk.Framebuffer
 
-	set1    vk.DescriptorSet // world.frag set 1: World UBO
-	setBlit vk.DescriptorSet // worldblit.frag: uScene, uOverlay
+	// preWaterColor/preWaterDepth are a snapshot of scene/depth taken right
+	// after the opaque (water-excluded) pass and right before the water
+	// pass — see recordWorldCommandBuffer and waterrefract.frag's own doc
+	// comment. Only allocated/used when wr.waterRefraction is on.
+	// preWaterColorLayout/preWaterDepthLayout persist each image's current
+	// layout across frames the same way ovLayout does for the overlay
+	// image, so the first-ever transition (Undefined -> TransferDst) can
+	// use the right stage/access masks instead of a bogus prior-write wait.
+	preWaterColor       litImage
+	preWaterDepth       litImage
+	preWaterColorLayout vk.ImageLayout
+	preWaterDepthLayout vk.ImageLayout
+
+	set1            vk.DescriptorSet // world.frag set 1: World UBO
+	setBlit         vk.DescriptorSet // worldblit.frag: uScene, uOverlay
+	setWaterCapture vk.DescriptorSet // waterrefract.frag set 2: uPreWaterColor, uPreWaterDepth — only when wr.waterRefraction
 }
 
 // worldTex is one resident GPU texture (a wall texture, flat, or the sky),
@@ -187,7 +204,17 @@ type worldTex struct {
 type worldResources struct {
 	w, h int // render resolution (offscreen size)
 
-	rpScene vk.RenderPass
+	// waterRefraction is a construction-time-only gate (config
+	// waterRefraction, threaded through NewWorld): when true, rpWater/the
+	// capture images/dslWaterCapture/plWorldLiquid/pipeWorldLiquid are all
+	// built and recordWorldCommandBuffer captures the opaque scene and
+	// draws water with real depth/refraction; when false, none of that is
+	// built at all and water draws through the plain pipeWorld pipeline
+	// inside rpOpaque instead, exactly like every other opaque flat.
+	waterRefraction bool
+
+	rpOpaque vk.RenderPass // opaque static geometry (water excluded when waterRefraction), always built
+	rpWater  vk.RenderPass // water (real refraction) + sprites/voxels/particles — only built when waterRefraction
 
 	texSampler   vk.Sampler // wall/flat: linear + mip + anisotropic, REPEAT
 	clampSampler vk.Sampler // LUT / scene / overlay: linear, clamp-to-edge
@@ -195,15 +222,20 @@ type worldResources struct {
 
 	dummyTex litImage // 1x1 black — set-0 binding 1 for textures with no brightmap
 
-	dsl0    vk.DescriptorSetLayout // set 0: per-texture sampler2D
-	dsl1    vk.DescriptorSetLayout // set 1: World UBO
-	dslBlit vk.DescriptorSetLayout // present: uScene, uOverlay
+	dsl0            vk.DescriptorSetLayout // set 0: per-texture sampler2D
+	dsl1            vk.DescriptorSetLayout // set 1: World UBO
+	dslBlit         vk.DescriptorSetLayout // present: uScene, uOverlay
+	dslWaterCapture vk.DescriptorSetLayout // waterrefract.frag set 2: uPreWaterColor, uPreWaterDepth — only when waterRefraction
 
-	plWorld   vk.PipelineLayout
-	plBlit    vk.PipelineLayout
-	pipeWorld vk.Pipeline
-	pipeDepth vk.Pipeline // opaque static depth pre-pass (reuses plWorld)
-	pipeBlit  vk.Pipeline
+	plWorld           vk.PipelineLayout
+	plBlit            vk.PipelineLayout
+	plWorldLiquid     vk.PipelineLayout // [dsl0, dsl1, dslWaterCapture] — only when waterRefraction
+	pipeWorld         vk.Pipeline
+	pipeDepth         vk.Pipeline // opaque static depth pre-pass (reuses plWorld)
+	pipeParticleAdd   vk.Pipeline // additive, no depth-write particle billboards (reuses plWorld) — see worldCreatePipelines
+	pipeParticleTrans vk.Pipeline // real alpha-blended, no depth-write particle billboards (reuses plWorld) — see worldCreatePipelines
+	pipeWorldLiquid   vk.Pipeline // real depth/refraction water (waterrefract.frag) — only when waterRefraction
+	pipeBlit          vk.Pipeline
 
 	framePool vk.DescriptorPool // set1 + setBlit, one pair per slot
 	texPool   vk.DescriptorPool // per-texture set0, grows over a session
@@ -247,17 +279,22 @@ type worldResources struct {
 
 // NewWorld stands up the Vulkan backend on the hardware-geometry path.
 // srcW/srcH is the render resolution (the offscreen scene size); vsync
-// prefers FIFO; debug enables the validation layer when present. Shares the
-// vanilla bring-up (instance … sync objects) and adds the world resources.
-func NewWorld(win *window.Window, srcW, srcH int, vsync, debug bool) (*Renderer, error) {
+// prefers FIFO; debug enables the validation layer when present.
+// waterRefraction gates the real depth/refraction water pipeline (config
+// waterRefraction — see worldResources.waterRefraction's own doc comment
+// for what building with this on vs. off actually changes); it's a
+// construction-time-only choice, not a per-frame toggle. Shares the vanilla
+// bring-up (instance … sync objects) and adds the world resources.
+func NewWorld(win *window.Window, srcW, srcH int, vsync, debug, waterRefraction bool) (*Renderer, error) {
 	r := &Renderer{win: win, vsync: vsync, debug: debug, hw: true}
 	r.srcWidth, r.srcHeight = srcW, srcH // letterboxViewport reads these
 
 	r.wr = &worldResources{
 		w: srcW, h: srcH,
-		texCache:      make(map[*assets.RGBA]*worldTex),
-		voxCache:      make(map[*assets.VoxelModel]*voxelMesh),
-		lightScaleRef: float32(raster.LightScaleRef),
+		waterRefraction: waterRefraction,
+		texCache:        make(map[*assets.RGBA]*worldTex),
+		voxCache:        make(map[*assets.VoxelModel]*voxelMesh),
+		lightScaleRef:   float32(raster.LightScaleRef),
 	}
 
 	steps := []func() error{
@@ -273,7 +310,8 @@ func NewWorld(win *window.Window, srcW, srcH int, vsync, debug bool) (*Renderer,
 		r.createCommandBuffers,
 		r.createSyncObjects,
 		r.worldCreateSamplers,
-		r.worldCreateSceneRenderPass,
+		r.worldCreateOpaqueRenderPass,
+		r.worldCreateWaterRenderPass, // no-ops when !waterRefraction
 		r.worldCreateOffscreen,
 		r.worldCreateBloom, // before descriptors — setBlit samples bloom mip 0
 		r.worldCreateDummyTex,
@@ -653,6 +691,131 @@ func computeCamBasis(cam worldgeo.Camera, h int) camBasis {
 	}
 }
 
+// drawTextureRuns binds buf and issues one CmdDraw per run in runs,
+// skipping empty and (per visible, when non-nil) culled runs, and rebinding
+// the set-0 texture descriptor only when the resolved texture actually
+// changes from the previous drawn run. Shared by the main world renderer
+// (recordWorldCommandBuffer, with StaticDrawVisible as visible for the
+// static-geometry pass and nil for everything else) and the isometric
+// renderer (recordIsoWorld, always nil — it has no visibility grid).
+//
+// lastTex/lastWT track the texture (and its resolved descriptor) bound by
+// the PREVIOUS drawn (not skipped) run: since the static-geometry
+// visibility grid splits what used to be one Draw per texture into several
+// — one per (texture, cell) — consecutive runs often share a texture, and
+// both rebinding the identical descriptor set AND re-doing the texCache map
+// lookup for it are pure waste. haveLast (rather than comparing lastTex to
+// nil) is what forces the very first run to always do both: tex itself can
+// legitimately be nil (an unresolved sky run, sky == nil), and that must
+// still miss the cache instead of matching lastTex's own zero value and
+// skipping straight to an unguarded CmdDraw with whatever descriptor set
+// happened to be bound before this pass.
+func drawTextureRuns(cmd vk.CommandBuffer, plWorld vk.PipelineLayout, texCache map[*assets.RGBA]*worldTex, sky *assets.RGBA, buf vk.Buffer, runs []worldgeo.Draw, visible []bool) {
+	if buf == nil || len(runs) == 0 {
+		return
+	}
+	vk.CmdBindVertexBuffers(cmd, 0, 1, []vk.Buffer{buf}, []vk.DeviceSize{0})
+	var lastTex *assets.RGBA
+	var lastWT *worldTex
+	haveLast := false
+	for i, d := range runs {
+		if d.Count == 0 {
+			continue
+		}
+		if visible != nil && i < len(visible) && !visible[i] {
+			continue
+		}
+		tex := d.Tex
+		if tex == nil { // sky run
+			tex = sky
+		}
+		wt := lastWT
+		if !haveLast || tex != lastTex {
+			wt = texCache[tex]
+			if wt == nil {
+				continue // texture unresolved / not uploaded — skip the run
+			}
+			vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, plWorld, 0, 1, []vk.DescriptorSet{wt.set}, 0, nil)
+			lastTex, lastWT, haveLast = tex, wt, true
+		}
+		vk.CmdDraw(cmd, uint32(d.Count), 1, uint32(d.First), 0)
+	}
+}
+
+// recordWaterCapture hands rpOpaque's just-drawn (water-excluded) scene
+// colour/depth to the water pass as a sampled snapshot — see
+// waterrefract.frag's own doc comment for why: a render pass can't sample
+// the attachment it's still writing to, so the water pass needs a separate
+// copy of "the scene so far" to read from. Only called when
+// wr.waterRefraction is on (rpOpaque's own FinalLayout already differs by
+// that same toggle — see worldCreateOpaqueRenderPass).
+//
+// Sequence: rpOpaque's FinalLayout already left sl.scene/sl.depth in
+// ColorAttachmentOptimal/DepthStencilAttachmentOptimal (not shader-read —
+// this capture, not a sampler, is their very next consumer); transition
+// both to TransferSrcOptimal, transition the capture images to
+// TransferDstOptimal (respecting each one's own first-use Undefined case,
+// same as sl.ovLayout's dance above), copy, transition the captures to
+// ShaderReadOnlyOptimal for the water shader to sample, then transition
+// sl.scene/sl.depth back to attachment-writable so rpWater's own
+// LoadOpLoad has the layout it expects.
+func (r *Renderer) recordWaterCapture(cmd vk.CommandBuffer, sl *worldSlot) {
+	wr := r.wr
+	fullColor := vk.ImageSubresourceRange{AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit), LevelCount: 1, LayerCount: 1}
+	fullDepth := vk.ImageSubresourceRange{AspectMask: vk.ImageAspectFlags(vk.ImageAspectDepthBit), LevelCount: 1, LayerCount: 1}
+
+	barrier(cmd, sl.scene.image, fullColor, vk.ImageLayoutColorAttachmentOptimal, vk.ImageLayoutTransferSrcOptimal,
+		vk.AccessFlags(vk.AccessColorAttachmentWriteBit), vk.AccessFlags(vk.AccessTransferReadBit),
+		vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit), vk.PipelineStageFlags(vk.PipelineStageTransferBit))
+	barrier(cmd, sl.depth.image, fullDepth, vk.ImageLayoutDepthStencilAttachmentOptimal, vk.ImageLayoutTransferSrcOptimal,
+		vk.AccessFlags(vk.AccessDepthStencilAttachmentWriteBit), vk.AccessFlags(vk.AccessTransferReadBit),
+		vk.PipelineStageFlags(vk.PipelineStageLateFragmentTestsBit), vk.PipelineStageFlags(vk.PipelineStageTransferBit))
+
+	pwcSrcStage, pwcSrcAccess := vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), vk.AccessFlags(vk.AccessShaderReadBit)
+	if sl.preWaterColorLayout == vk.ImageLayoutUndefined {
+		pwcSrcStage, pwcSrcAccess = vk.PipelineStageFlags(vk.PipelineStageTopOfPipeBit), 0
+	}
+	barrier(cmd, sl.preWaterColor.image, fullColor, sl.preWaterColorLayout, vk.ImageLayoutTransferDstOptimal,
+		pwcSrcAccess, vk.AccessFlags(vk.AccessTransferWriteBit), pwcSrcStage, vk.PipelineStageFlags(vk.PipelineStageTransferBit))
+
+	pwdSrcStage, pwdSrcAccess := vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), vk.AccessFlags(vk.AccessShaderReadBit)
+	if sl.preWaterDepthLayout == vk.ImageLayoutUndefined {
+		pwdSrcStage, pwdSrcAccess = vk.PipelineStageFlags(vk.PipelineStageTopOfPipeBit), 0
+	}
+	barrier(cmd, sl.preWaterDepth.image, fullDepth, sl.preWaterDepthLayout, vk.ImageLayoutTransferDstOptimal,
+		pwdSrcAccess, vk.AccessFlags(vk.AccessTransferWriteBit), pwdSrcStage, vk.PipelineStageFlags(vk.PipelineStageTransferBit))
+
+	extent := vk.Extent3D{Width: uint32(wr.w), Height: uint32(wr.h), Depth: 1}
+	vk.CmdCopyImage(cmd, sl.scene.image, vk.ImageLayoutTransferSrcOptimal, sl.preWaterColor.image, vk.ImageLayoutTransferDstOptimal, 1,
+		[]vk.ImageCopy{{
+			SrcSubresource: vk.ImageSubresourceLayers{AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit), LayerCount: 1},
+			DstSubresource: vk.ImageSubresourceLayers{AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit), LayerCount: 1},
+			Extent:         extent,
+		}})
+	vk.CmdCopyImage(cmd, sl.depth.image, vk.ImageLayoutTransferSrcOptimal, sl.preWaterDepth.image, vk.ImageLayoutTransferDstOptimal, 1,
+		[]vk.ImageCopy{{
+			SrcSubresource: vk.ImageSubresourceLayers{AspectMask: vk.ImageAspectFlags(vk.ImageAspectDepthBit), LayerCount: 1},
+			DstSubresource: vk.ImageSubresourceLayers{AspectMask: vk.ImageAspectFlags(vk.ImageAspectDepthBit), LayerCount: 1},
+			Extent:         extent,
+		}})
+
+	barrier(cmd, sl.preWaterColor.image, fullColor, vk.ImageLayoutTransferDstOptimal, vk.ImageLayoutShaderReadOnlyOptimal,
+		vk.AccessFlags(vk.AccessTransferWriteBit), vk.AccessFlags(vk.AccessShaderReadBit),
+		vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit))
+	sl.preWaterColorLayout = vk.ImageLayoutShaderReadOnlyOptimal
+	barrier(cmd, sl.preWaterDepth.image, fullDepth, vk.ImageLayoutTransferDstOptimal, vk.ImageLayoutShaderReadOnlyOptimal,
+		vk.AccessFlags(vk.AccessTransferWriteBit), vk.AccessFlags(vk.AccessShaderReadBit),
+		vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit))
+	sl.preWaterDepthLayout = vk.ImageLayoutShaderReadOnlyOptimal
+
+	barrier(cmd, sl.scene.image, fullColor, vk.ImageLayoutTransferSrcOptimal, vk.ImageLayoutColorAttachmentOptimal,
+		vk.AccessFlags(vk.AccessTransferReadBit), vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
+		vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit))
+	barrier(cmd, sl.depth.image, fullDepth, vk.ImageLayoutTransferSrcOptimal, vk.ImageLayoutDepthStencilAttachmentOptimal,
+		vk.AccessFlags(vk.AccessTransferReadBit), vk.AccessFlags(vk.AccessDepthStencilAttachmentWriteBit)|vk.AccessFlags(vk.AccessDepthStencilAttachmentReadBit),
+		vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageEarlyFragmentTestsBit)|vk.PipelineStageFlags(vk.PipelineStageLateFragmentTestsBit))
+}
+
 func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uint32, frame int, g *worldgeo.Geometry, cam worldgeo.Camera) error {
 	wr := r.wr
 	sl := &wr.slots[frame]
@@ -681,11 +844,14 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 		vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit))
 	sl.ovLayout = vk.ImageLayoutShaderReadOnlyOptimal
 
-	// (2) world pass -> offscreen scene colour (+ depth).
+	// (2) opaque pass -> offscreen scene colour (+ depth). Water is excluded
+	// from g.StaticDraws (see worldgeo.Geometry.WaterDraws) when
+	// waterRefraction is on — it draws in its own step below instead, once
+	// this pass's result has been captured for it to sample.
 	clears := []vk.ClearValue{vk.NewClearValue([]float32{0, 0, 0, 1}), vk.NewClearDepthStencil(1, 0)}
 	vk.CmdBeginRenderPass(cmd, &vk.RenderPassBeginInfo{
 		SType:           vk.StructureTypeRenderPassBeginInfo,
-		RenderPass:      wr.rpScene,
+		RenderPass:      wr.rpOpaque,
 		Framebuffer:     sl.fb,
 		RenderArea:      vk.Rect2D{Extent: vk.Extent2D{Width: uint32(wr.w), Height: uint32(wr.h)}},
 		ClearValueCount: 2,
@@ -738,58 +904,111 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 	// view (worldgeo.Geometry.StaticDrawVisible, from Builder.UpdateVisibility
 	// — see render/worldgeo/visgrid.go). Only g.StaticDraws carries this;
 	// the per-frame sprite/voxel Draws list (g.Draws) is passed nil, i.e.
-	// unfiltered, same as before.
+	// unfiltered, same as before. See drawTextureRuns for the shared body
+	// (also used by isoworld.go's recorder, with visible always nil).
 	drawRuns := func(buf vk.Buffer, runs []worldgeo.Draw, visible []bool) {
-		if buf == nil || len(runs) == 0 {
-			return
-		}
-		vk.CmdBindVertexBuffers(cmd, 0, 1, []vk.Buffer{buf}, []vk.DeviceSize{0})
-		// lastTex/lastWT track the texture (and its resolved descriptor)
-		// bound by the PREVIOUS drawn (not skipped) run: since the
-		// static-geometry visibility grid split what used to be one Draw
-		// per texture into several — one per (texture, cell) — consecutive
-		// runs now share a texture far more often than before, and both
-		// rebinding the identical descriptor set AND re-doing the
-		// wr.texCache map lookup for it are pure waste. haveLast (rather than
-		// comparing lastTex to nil) is what forces the very first run to
-		// always do both: tex itself can legitimately be nil (an unresolved
-		// sky run, g.Sky == nil), and that must still miss the cache instead
-		// of matching lastTex's own zero value and skipping straight to an
-		// unguarded CmdDraw with whatever descriptor set happened to be
-		// bound before this pass.
-		var lastTex *assets.RGBA
-		var lastWT *worldTex
-		haveLast := false
-		for i, d := range runs {
-			if d.Count == 0 {
-				continue
-			}
-			if visible != nil && i < len(visible) && !visible[i] {
-				continue
-			}
-			tex := d.Tex
-			if tex == nil { // sky run
-				tex = g.Sky
-			}
-			wt := lastWT
-			if !haveLast || tex != lastTex {
-				wt = wr.texCache[tex]
-				if wt == nil {
-					continue // texture unresolved / not uploaded — skip the run
-				}
-				vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, wr.plWorld, 0, 1, []vk.DescriptorSet{wt.set}, 0, nil)
-				lastTex, lastWT, haveLast = tex, wt, true
-			}
-			vk.CmdDraw(cmd, uint32(d.Count), 1, uint32(d.First), 0)
-		}
+		drawTextureRuns(cmd, wr.plWorld, wr.texCache, g.Sky, buf, runs, visible)
 	}
 	drawRuns(wr.staticVBO, g.StaticDraws, g.StaticDrawVisible) // level walls + flats (device-local), visibility-culled
-	drawRuns(sl.vbuf, g.Draws, nil)                            // this frame's sprite / voxel-billboard quads, unfiltered
+
+	if !wr.waterRefraction {
+		// Fallback: water draws right here with the plain pipeline, same as
+		// every other opaque flat, then falls straight into the shared
+		// sprite/voxel/particle tail below inside this one pass — exactly
+		// how this worked before water became its own Draw list.
+		drawRuns(wr.staticVBO, g.WaterDraws, g.WaterDrawVisible)
+	} else {
+		r.recordWaterCapture(cmd, sl)
+
+		vk.CmdBeginRenderPass(cmd, &vk.RenderPassBeginInfo{
+			SType:       vk.StructureTypeRenderPassBeginInfo,
+			RenderPass:  wr.rpWater,
+			Framebuffer: sl.fb,
+			RenderArea:  vk.Rect2D{Extent: vk.Extent2D{Width: uint32(wr.w), Height: uint32(wr.h)}},
+			// LoadOpLoad on both attachments — nothing to clear.
+		}, vk.SubpassContentsInline)
+		vk.CmdSetViewport(cmd, 0, 1, []vk.Viewport{fullViewport(wr.w, wr.h)})
+		vk.CmdSetScissor(cmd, 0, 1, []vk.Rect2D{fullScissor(wr.w, wr.h)})
+
+		if wr.pipeWorldLiquid != nil && len(g.WaterDraws) > 0 {
+			vk.CmdBindPipeline(cmd, vk.PipelineBindPointGraphics, wr.pipeWorldLiquid)
+			vk.CmdPushConstants(cmd, wr.plWorldLiquid, vk.ShaderStageFlags(vk.ShaderStageVertexBit), 0, 64, unsafe.Pointer(&vp[0]))
+			vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, wr.plWorldLiquid, 1, 1, []vk.DescriptorSet{sl.set1}, 0, nil)
+			vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, wr.plWorldLiquid, 2, 1, []vk.DescriptorSet{sl.setWaterCapture}, 0, nil)
+			drawTextureRuns(cmd, wr.plWorldLiquid, wr.texCache, nil, wr.staticVBO, g.WaterDraws, g.WaterDrawVisible)
+		}
+
+		// Re-bind pipeWorld/plWorld before the shared sprite/voxel/particle
+		// tail below: pipeWorldLiquid uses a different pipeline LAYOUT
+		// object (plWorldLiquid) than pipeWorld's plWorld, even though set 1
+		// binds the identical descriptor set both times — Vulkan tracks
+		// bindings per pipeline-layout object, not just by set index, so
+		// both the pipeline and set 1 need re-establishing here. Same class
+		// of gotcha recordVoxels' own comment below already flags for its
+		// own pipeline-layout swap.
+		vk.CmdBindPipeline(cmd, vk.PipelineBindPointGraphics, wr.pipeWorld)
+		vk.CmdPushConstants(cmd, wr.plWorld, vk.ShaderStageFlags(vk.ShaderStageVertexBit), 0, 64, unsafe.Pointer(&vp[0]))
+		vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, wr.plWorld, 1, 1, []vk.DescriptorSet{sl.set1}, 0, nil)
+	}
+
+	drawRuns(sl.vbuf, g.Draws, nil) // this frame's sprite / voxel-billboard quads, unfiltered
 	// Voxel models — own pipeline, still inside the world pass so the depth
-	// buffer sorts them against the level and the textured geometry.
+	// buffer sorts them against the level and the textured geometry. Must
+	// come before the particle passes below: voxels are opaque replacements
+	// for monster/item sprites, and smoke/fire's real alpha blend needs
+	// them already in the depth+color buffers to draw over, the same way it
+	// already draws over ordinary (non-voxel) sprites from g.Draws above —
+	// recording them after the particle passes instead (as this used to)
+	// painted every voxel monster back over the smoke/fire meant to be
+	// hiding it, regardless of how opaque the smoke actually was.
 	r.recordVoxels(cmd, sl, g, cam)
+	// recordVoxels binds sl.set1 at set 0 under plVoxel's layout, which
+	// isn't compatible with plWorld's own completely different set-0 schema
+	// (a per-texture sampler, not the world UBO) — per Vulkan's pipeline
+	// layout compatibility rules, that invalidates set 1 too (the world UBO
+	// itself: lights/camera/fog/water-clock), even though voxels never
+	// touch set 1 directly. drawRuns below only ever rebinds set 0 (the
+	// per-texture descriptor, on its first run each call), so without
+	// this, the particle passes' fragment shaders would read undefined
+	// set-1 data — which is exactly why moving recordVoxels earlier (see
+	// above) silently broke every particle effect instead of just fixing
+	// the occlusion this was meant to fix.
+	vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, wr.plWorld, 1, 1, []vk.DescriptorSet{sl.set1}, 0, nil)
+	// recordVoxels ALSO overwrites push-constant bytes [0:64) with each
+	// voxel instance's own per-model MVP matrix (see its CmdPushConstants
+	// calls) - the SAME byte range/stage the vertex shader above reads its
+	// camera view-projection matrix from. Left un-restored, every particle
+	// drawn below would be transformed by whichever voxel model happened
+	// to be pushed last this frame instead of the camera, scattering its
+	// geometry off-screen/degenerate - a far more complete breakage than
+	// the descriptor-set issue above, and the real reason moving
+	// recordVoxels earlier made every particle effect (explosion fire and
+	// smoke, the rocket exhaust trail) disappear outright.
+	vk.CmdPushConstants(cmd, wr.plWorld, vk.ShaderStageFlags(vk.ShaderStageVertexBit), 0, 64, unsafe.Pointer(&vp[0]))
+	if wr.pipeParticleAdd != nil && len(g.ParticleDraws) > 0 {
+		// Same vertex buffer (g.Pack wrote all of g.Tris, Draws' and
+		// ParticleDraws' vertices both), same descriptor-set-1 binding
+		// (still bound from above) — only the pipeline changes, so
+		// overlapping billboards additively glow instead of alpha-cutout
+		// occluding each other. See pipeParticleAdd's creation in
+		// worldsetup.go (worldCreatePipelines) for the blend/depth state.
+		vk.CmdBindPipeline(cmd, vk.PipelineBindPointGraphics, wr.pipeParticleAdd)
+		drawRuns(sl.vbuf, g.ParticleDraws, nil)
+	}
+	if wr.pipeParticleTrans != nil && len(g.TransparentDraws) > 0 {
+		// Same vertex buffer, same descriptor-set-1 binding — just the
+		// blend pipeline swapped again. g.TransparentDraws is already
+		// sorted back-to-front by AddTransparentSprites, one Draw per
+		// sprite (not batched by texture — see its own doc comment), so
+		// drawRuns's texture-change tracking still does the right thing,
+		// it just rebinds more often than the batched passes above.
+		vk.CmdBindPipeline(cmd, vk.PipelineBindPointGraphics, wr.pipeParticleTrans)
+		drawRuns(sl.vbuf, g.TransparentDraws, nil)
+	}
 	vk.CmdEndRenderPass(cmd)
-	// rpScene's finalLayout transitions the scene image to shader-read for us.
+	// Whichever pass just ended (rpWater when waterRefraction is on, the
+	// single rpOpaque otherwise)'s finalLayout transitions the scene image
+	// to shader-read for us.
 
 	// (3) ambient term: quarter-res shadow/AO/god-ray buffer (worldambient.go)
 	// — its low resolution plus the present pass's bilinear read of it is
@@ -878,12 +1097,12 @@ func (r *Renderer) destroyWorldResources() {
 	r.destroyAmbientPass()
 	r.destroyVoxelResources()
 
-	for _, p := range []vk.Pipeline{wr.pipeWorld, wr.pipeDepth, wr.pipeBlit} {
+	for _, p := range []vk.Pipeline{wr.pipeWorld, wr.pipeDepth, wr.pipeParticleAdd, wr.pipeParticleTrans, wr.pipeWorldLiquid, wr.pipeBlit} {
 		if p != nil {
 			vk.DestroyPipeline(dev, p, nil)
 		}
 	}
-	for _, l := range []vk.PipelineLayout{wr.plWorld, wr.plBlit} {
+	for _, l := range []vk.PipelineLayout{wr.plWorld, wr.plBlit, wr.plWorldLiquid} {
 		if l != nil {
 			vk.DestroyPipelineLayout(dev, l, nil)
 		}
@@ -894,7 +1113,7 @@ func (r *Renderer) destroyWorldResources() {
 	if wr.framePool != nil {
 		vk.DestroyDescriptorPool(dev, wr.framePool, nil)
 	}
-	for _, l := range []vk.DescriptorSetLayout{wr.dsl0, wr.dsl1, wr.dslBlit} {
+	for _, l := range []vk.DescriptorSetLayout{wr.dsl0, wr.dsl1, wr.dslBlit, wr.dslWaterCapture} {
 		if l != nil {
 			vk.DestroyDescriptorSetLayout(dev, l, nil)
 		}
@@ -912,6 +1131,8 @@ func (r *Renderer) destroyWorldResources() {
 		}
 		freeLitImage(dev, sl.scene)
 		freeLitImage(dev, sl.depth)
+		freeLitImage(dev, sl.preWaterColor)
+		freeLitImage(dev, sl.preWaterDepth)
 		freeLitImage(dev, sl.ovImg)
 		freeHostBuffer(dev, sl.ubo, sl.uboMem, sl.uboMapped)
 		freeHostBuffer(dev, sl.vbuf, sl.vbufMem, sl.vbufMapped)
@@ -922,8 +1143,11 @@ func (r *Renderer) destroyWorldResources() {
 		vk.FreeMemory(dev, wr.staticVBOMem, nil)
 		wr.staticVBO, wr.staticVBOMem = nil, nil
 	}
-	if wr.rpScene != nil {
-		vk.DestroyRenderPass(dev, wr.rpScene, nil)
+	if wr.rpOpaque != nil {
+		vk.DestroyRenderPass(dev, wr.rpOpaque, nil)
+	}
+	if wr.rpWater != nil {
+		vk.DestroyRenderPass(dev, wr.rpWater, nil)
 	}
 	for _, s := range []vk.Sampler{wr.texSampler, wr.clampSampler, wr.depthSampler} {
 		if s != nil {

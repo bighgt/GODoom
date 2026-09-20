@@ -48,7 +48,7 @@ type voxelMesh struct {
 }
 
 // worldCreateVoxelPipeline builds the voxel model pipeline + its layout.
-// Run as a NewWorld step after worldCreatePipelines (needs dsl1 + rpScene).
+// Run as a NewWorld step after worldCreatePipelines (needs dsl1 + rpOpaque).
 func (r *Renderer) worldCreateVoxelPipeline() error {
 	wr := r.wr
 
@@ -149,8 +149,16 @@ func (r *Renderer) worldCreateVoxelPipeline() error {
 		PColorBlendState:    &colorBlend,
 		PDynamicState:       &dynamic,
 		Layout:              wr.plVoxel,
-		RenderPass:          wr.rpScene,
-		Subpass:             0,
+		// rpOpaque and rpWater are render-pass compatible (identical
+		// attachment formats/sample counts/subpass shape — only
+		// LoadOp/InitialLayout/FinalLayout differ, none of which affect
+		// compatibility), so a pipeline created against one is valid to
+		// bind during an instance of the other. Voxels actually draw
+		// inside rpWater (waterRefraction on) or the single retained
+		// rpOpaque (off) — see recordWorldCommandBuffer — either way this
+		// pipeline object works.
+		RenderPass: wr.rpOpaque,
+		Subpass:    0,
 	}
 	out := make([]vk.Pipeline, 1)
 	if res := vk.CreateGraphicsPipelines(r.device, nil, 1, []vk.GraphicsPipelineCreateInfo{info}, nil, out); res != vk.Success {
@@ -386,6 +394,13 @@ func (r *Renderer) recordVoxels(cmd vk.CommandBuffer, sl *worldSlot, g *worldgeo
 	vp := worldgeo.ViewProj(cam, wr.w, wr.h) // once per frame, not per instance
 	var pc [voxelPushBytes / 4]float32       // 28 float32
 	nDrawn, nUncached := 0, 0
+	// lastVM tracks the model bound by the previous drawn instance: a
+	// pack of identical monsters/items shares one model, so consecutive
+	// instances very often don't need a new vertex-buffer bind at all.
+	// haveLast (rather than comparing lastVM to nil) forces the first
+	// instance to always bind.
+	var lastVM *voxelMesh
+	haveLast := false
 	for i := range g.Voxels {
 		inst := g.Voxels[i]
 		vm := wr.voxCache[inst.Model]
@@ -410,7 +425,10 @@ func (r *Renderer) recordVoxels(cmd vk.CommandBuffer, sl *worldSlot, g *worldgeo
 			0, voxelPushVert, unsafe.Pointer(&pc[0]))
 		vk.CmdPushConstants(cmd, wr.plVoxel, vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
 			voxelPushVert, voxelPushFrag, unsafe.Pointer(&pc[24]))
-		vk.CmdBindVertexBuffers(cmd, 0, 1, []vk.Buffer{vm.vbuf}, []vk.DeviceSize{0})
+		if !haveLast || vm != lastVM {
+			vk.CmdBindVertexBuffers(cmd, 0, 1, []vk.Buffer{vm.vbuf}, []vk.DeviceSize{0})
+			lastVM, haveLast = vm, true
+		}
 		vk.CmdDraw(cmd, vm.count, 1, 0, 0)
 	}
 	// One line, the first frame any voxel model reaches the GPU, so the log

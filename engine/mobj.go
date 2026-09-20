@@ -80,6 +80,34 @@ type Mobj struct {
 	// clear; for the player that reads as "stuck".
 	TeleportFreeze int
 
+	// TeleportGuard/TeleportLandX/Y are TeleportFreeze's companion: a timer
+	// alone still lets a mobj get bounced straight back if it hasn't
+	// physically moved off the landing spot by the time the timer expires
+	// (stand still on a pad wedged against another teleport line and the
+	// instant the freeze lifts, the very same trigger fires again). While
+	// TeleportGuard is set, evTeleport refuses to fire until the mobj has
+	// moved at least teleportClearRadius from TeleportLandX/Y — the
+	// destination genuinely doesn't work again until you actually get off
+	// it, not just after half a second passes.
+	TeleportGuard                bool
+	TeleportLandX, TeleportLandY float64
+
+	// explosionBoost, when >0, is a one-shot multiplier aExplode applies to
+	// explosionBarrel before spawning this barrel's death burst, then
+	// resets to 0 — set by a rocket's killing hit (see advanceProjectile)
+	// so that single, merged explosion reads as bigger than an ordinary
+	// barrel's, instead of the rocket's own burst and the barrel's playing
+	// as two separate explosions.
+	explosionBoost float64
+
+	// barrelBubbleTimer/barrelFogTimer count down to this barrel's next
+	// ambient bubble/fog puff while it's still intact — see
+	// updateBarrelAmbience in engine/barrelambience.go. Unused by any
+	// non-barrel mobj, the same way Projectile's own flameTrailTimer/
+	// smokeTrailTimer are unused by any non-rocket shot.
+	barrelBubbleTimer float64
+	barrelFogTimer    float64
+
 	removed bool
 }
 
@@ -87,6 +115,13 @@ type Mobj struct {
 // teleported again — long enough to walk off a cramped landing pad, short
 // enough not to block a map's deliberate back-to-back teleporter chain.
 const teleportFreezeTics = 18 // 1/2 second at 35 tics/sec
+
+// teleportClearRadius is how far a mobj must move from where it landed
+// (TeleportLandX/Y) before TeleportGuard lets evTeleport fire again — see
+// TeleportGuard's doc comment. A little more than playerRadius*2 so a
+// landing pad barely wider than the player still counts as "left" once
+// they've stepped off it, not just shifted a few units within it.
+const teleportClearRadius = 40.0
 
 // Z-spawn sentinels (id's ONFLOORZ / ONCEILINGZ).
 const (
@@ -475,6 +510,8 @@ func (g *Game) runTic() {
 	g.animateWalls()
 	g.checkPlayerCrush()
 	g.playerInSpecialSector()
+	g.checkPlayerLiquidCrossing()
+	g.checkFireDamage()
 	if g.heretic {
 		g.tickTimeBombs()
 	}
@@ -549,6 +586,13 @@ func (g *Game) collectWorldObjects() ([]worldgeo.Sprite, []worldgeo.VoxelInstanc
 		if (mo.X-cx)*fdx+(mo.Y-cy)*fdy < -160 {
 			continue // behind the view plane (160u margin covers the largest radius)
 		}
+		if g.explosionParticles && mo.Type == MT_BARREL && mo.State >= S_BEXP1 && mo.State <= S_BEXP5 {
+			// The native particle burst (spawned once, in aExplode) replaces
+			// the vanilla BEXP flip-book entirely when the feature is on —
+			// same treatment as a rocket's own ExplodeFrames in the
+			// projectile loop below.
+			continue
+		}
 		name := mobjSpriteName(mo)
 		ix, iy, iz, iang := mo.renderState(frac)
 		if g.Voxels != nil {
@@ -586,6 +630,13 @@ func (g *Game) collectWorldObjects() ([]worldgeo.Sprite, []worldgeo.VoxelInstanc
 		})
 	}
 	for _, p := range g.projectiles {
+		if p.exploding && g.explosionParticles {
+			// The native particle burst (spawnExplosionParticles) replaces
+			// the vanilla explosion-frame sprite entirely when the feature
+			// is on; falls back to it when off, so the toggle still shows
+			// *something* at the impact point either way.
+			continue
+		}
 		name, ok := p.CurrentSprite()
 		if !ok {
 			continue

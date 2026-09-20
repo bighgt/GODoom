@@ -50,6 +50,12 @@ func (combatSystem) Update(g *Game, dt float32) {
 		// (hidden) viewmodel animation settle.
 		g.updateWeapon(float64(dt))
 		g.updateProjectiles(float64(dt))
+		g.updateParticles(float64(dt))
+		g.updateLiquidAmbience(float64(dt))
+		g.updateTeleportAmbience(float64(dt))
+		g.updatePlayerWaterRipple(float64(dt))
+		g.updateBurningPuddles(float64(dt))
+		g.updateBarrelAmbience(float64(dt))
 		return
 	}
 	// Weapon slots 1-7 (classic Doom layout). Edge-triggered so holding a
@@ -85,4 +91,10 @@ func (combatSystem) Update(g *Game, dt float32) {
 	}
 	g.updateWeapon(float64(dt))
 	g.updateProjectiles(float64(dt))
+	g.updateParticles(float64(dt))
+	g.updateLiquidAmbience(float64(dt))
+	g.updateTeleportAmbience(float64(dt))
+	g.updatePlayerWaterRipple(float64(dt))
+	g.updateBurningPuddles(float64(dt))
+	g.updateBarrelAmbience(float64(dt))
 }

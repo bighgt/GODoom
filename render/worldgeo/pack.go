@@ -5,12 +5,12 @@ import (
 	"math"
 )
 
-// PackedVertexSize is one vertex's byte size in Pack's output: eight float32
-// (position xyz, uv, light, normal xyz) with one uint32 (kind) between light
-// and normal. 40 bytes, every field 4-byte aligned — a straight Vulkan
-// vertex buffer. The texture is bound per draw (Geometry.Draws), not per
-// vertex.
-const PackedVertexSize = 40
+// PackedVertexSize is one vertex's byte size in Pack's output: nine float32
+// (position xyz, uv, light, normal xyz, alpha) with one uint32 (kind)
+// between light and normal. 44 bytes, every field 4-byte aligned — a
+// straight Vulkan vertex buffer. The texture is bound per draw
+// (Geometry.Draws), not per vertex.
+const PackedVertexSize = 44
 
 // Pack serialises g.Tris (the per-frame dynamic geometry) into a
 // little-endian GPU vertex buffer. Reuses buf when it has the capacity.
@@ -39,6 +39,7 @@ func PackVerts(verts []Vert, buf []byte) []byte {
 		le.PutUint32(buf[o+28:], math.Float32bits(v.Nx))
 		le.PutUint32(buf[o+32:], math.Float32bits(v.Ny))
 		le.PutUint32(buf[o+36:], math.Float32bits(v.Nz))
+		le.PutUint32(buf[o+40:], math.Float32bits(v.Alpha))
 	}
 	return buf
 }
@@ -59,6 +60,7 @@ type VertexAttribute struct {
 //	2  float light      (sector light 0..1, fake contrast folded in for walls)
 //	3  uint  kind       (Kind* — the shader keys texturing / alpha-test / sky off it)
 //	4  vec3  normal      (unit world-space surface normal, for the dynamic-light Lambert term)
+//	5  float alpha      (KindSpriteTrans's real blend weight; ignored by every other kind)
 func VertexAttributes() []VertexAttribute {
 	return []VertexAttribute{
 		{Location: 0, Format: "R32G32B32_SFLOAT", Offset: 0},
@@ -66,5 +68,6 @@ func VertexAttributes() []VertexAttribute {
 		{Location: 2, Format: "R32_SFLOAT", Offset: 20},
 		{Location: 3, Format: "R32_UINT", Offset: 24},
 		{Location: 4, Format: "R32G32B32_SFLOAT", Offset: 28},
+		{Location: 5, Format: "R32_SFLOAT", Offset: 40},
 	}
 }

@@ -256,6 +256,12 @@ func (r *Renderer) recordIsoVoxels(cmd vk.CommandBuffer, g *worldgeo.Geometry, v
 	halfW, halfH := float64(ir.w)*0.5, float64(ir.h)*0.5
 
 	var pc [voxelPushBytes / 4]float32
+	// lastVM/haveLast track the model bound by the previous drawn
+	// instance — see worldvoxel.go's recordVoxels, which uses the same
+	// guard to skip a redundant vertex-buffer rebind when consecutive
+	// instances share one model.
+	var lastVM *voxelMesh
+	haveLast := false
 	for i := range g.Voxels {
 		inst := g.Voxels[i]
 		vm := ir.voxCache[inst.Model]
@@ -283,7 +289,10 @@ func (r *Renderer) recordIsoVoxels(cmd vk.CommandBuffer, g *worldgeo.Geometry, v
 			0, voxelPushVert, unsafe.Pointer(&pc[0]))
 		vk.CmdPushConstants(cmd, ir.plVoxel, vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
 			voxelPushVert, voxelPushFrag, unsafe.Pointer(&pc[24]))
-		vk.CmdBindVertexBuffers(cmd, 0, 1, []vk.Buffer{vm.vbuf}, []vk.DeviceSize{0})
+		if !haveLast || vm != lastVM {
+			vk.CmdBindVertexBuffers(cmd, 0, 1, []vk.Buffer{vm.vbuf}, []vk.DeviceSize{0})
+			lastVM, haveLast = vm, true
+		}
 		vk.CmdDraw(cmd, vm.count, 1, 0, 0)
 	}
 }
@@ -614,33 +623,18 @@ func (r *Renderer) recordIsoCommandBuffer(cmd vk.CommandBuffer, imageIndex uint3
 	vk.Memcopy(ir.revealMapped[frame], unsafe.Slice((*byte)(unsafe.Pointer(&revealUBO)), unsafe.Sizeof(revealUBO)))
 	vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, ir.plWorld, 1, 1, []vk.DescriptorSet{ir.revealSet[frame]}, 0, nil)
 
+	// See drawTextureRuns (world.go) for the shared body; the isometric
+	// renderer has no visibility grid, so visible is always nil here.
 	drawRuns := func(buf vk.Buffer, runs []worldgeo.Draw) {
-		if buf == nil || len(runs) == 0 {
-			return
-		}
-		vk.CmdBindVertexBuffers(cmd, 0, 1, []vk.Buffer{buf}, []vk.DeviceSize{0})
-		var lastTex *assets.RGBA
-		haveLast := false
-		for _, d := range runs {
-			if d.Count == 0 {
-				continue
-			}
-			tex := d.Tex
-			if tex == nil {
-				tex = g.Sky
-			}
-			if !haveLast || tex != lastTex {
-				wt := ir.texCache[tex]
-				if wt == nil {
-					continue
-				}
-				vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, ir.plWorld, 0, 1, []vk.DescriptorSet{wt.set}, 0, nil)
-				lastTex, haveLast = tex, true
-			}
-			vk.CmdDraw(cmd, uint32(d.Count), 1, uint32(d.First), 0)
-		}
+		drawTextureRuns(cmd, ir.plWorld, ir.texCache, g.Sky, buf, runs, nil)
 	}
 	drawRuns(ir.staticVBO, g.StaticDraws)
+	// Water is its own Draw list now (see worldgeo.Geometry.WaterDraws' doc
+	// comment) — the FPS renderer draws it with a dedicated refraction
+	// pipeline, but the isometric view has no such pass, so this just draws
+	// it through the same plain pipeline as everything else above,
+	// restoring the exact look it had before water was split out.
+	drawRuns(ir.staticVBO, g.WaterDraws)
 	drawRuns(ir.dynVBO, g.Draws)
 	// Voxel models — own pipeline, still inside the world pass so the depth
 	// buffer sorts them against the level and the textured geometry (same

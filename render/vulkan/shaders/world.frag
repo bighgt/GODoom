@@ -12,6 +12,7 @@ layout(location = 2) in flat uint vKind;
 layout(location = 3) in float vDepth;   // camera-forward distance, map units
 layout(location = 4) in vec3 vWorldPos; // world position, map units
 layout(location = 5) in vec3 vNormal;   // unit surface normal
+layout(location = 6) in float vAlpha;   // KindSpriteTrans's real blend weight
 
 layout(location = 0) out vec4 outColor;
 
@@ -57,6 +58,8 @@ const uint KIND_SPRITE_FULL  = 5u; // billboard, full bright (projectile / attac
 const uint KIND_LIQUID_WATER = 6u; // water floor: fresnel sky reflection
 const uint KIND_LIQUID_LAVA  = 7u; // lava floor: warm emissive glow
 const uint KIND_LIQUID_NUKAGE= 8u; // nukage/slime floor: green emissive tint
+const uint KIND_SPRITE_TRANS = 9u; // billboard, real alpha blend (vAlpha) — additive-pipeline particles' translucent sibling
+const uint KIND_TELEPORT     = 10u; // teleporter-pad floor: procedural blue/white shimmer, ignores uTex entirely
 
 // AMBIENT: the fallback faint cool floor a fully-shadowed world pixel
 // settles to instead of pure black — used only when the engine hasn't
@@ -186,6 +189,50 @@ vec3 waterWave(vec2 wp, float t) {
     vec2 grad = vec2(a - c + 0.4 * e, b - 0.5 * c + 0.3 * e);
     float crest = clamp(hgt * 0.4 + 0.5, 0.0, 1.0);
     return vec3(grad, crest);
+}
+
+// teleportHash turns a 2D coordinate into a pseudo-random 0..1 value — used
+// by the KIND_TELEPORT branch below so each patch of a teleporter pad
+// twinkles on its own independent, uncorrelated phase instead of sharing
+// one continuous phase gradient across the surface (a shared gradient is
+// exactly what a sine of a raw linear x/y combination produces, and reads
+// as a moving line/band, not a scattered twinkle). Not shared with
+// worldblit.frag's own similar hash12 — this codebase has no GLSL
+// #include, so every fragment shader here already duplicates small
+// helpers like this rather than sharing them across files.
+float teleportHash(vec2 p) {
+    p = fract(p * vec2(127.1, 311.7));
+    p += dot(p, p + 34.23);
+    return fract(p.x * p.y);
+}
+
+// lavaWave is waterWave's molten-rock counterpart: one bespoke function per
+// liquid kind (not a shared parameterized helper) so each stays tunable on
+// its own terms, same as waterWave itself. Slow, large-wavelength, low-
+// frequency swell — thick and viscous, not choppy. .xy distorts the crust
+// texture sample so it seems to slowly churn; .z is a 0..1 "crest" factor
+// used to make bright cracks glow hotter than the rest of the pool.
+vec3 lavaWave(vec2 wp, float t) {
+    vec2 p = wp * 0.012;
+    float a = sin(p.x * 1.0 + p.y * 0.5 + t * 0.35);
+    float b = sin(p.x * -0.6 + p.y * 1.1 + t * 0.22);
+    float hgt = (a + 0.6 * b) * 0.5;
+    vec2 grad = vec2(a - b * 0.4, b - a * 0.3) * 0.5;
+    float crest = clamp(hgt * 0.5 + 0.5, 0.0, 1.0);
+    return vec3(grad, crest);
+}
+
+// nukageWave is waterWave's thin-toxic-pool counterpart: quicker and
+// tighter-wavelength than lavaWave, lower-amplitude than waterWave (a
+// shallow pool, not open water). .z is a sparse bubbling "fizz" glint
+// factor rather than a broad crest.
+vec3 nukageWave(vec2 wp, float t) {
+    vec2 p = wp * 0.045;
+    float a = sin(p.x * 1.3 + p.y * 0.8 + t * 2.6);
+    float b = sin(p.x * -0.9 + p.y * 1.4 + t * 3.4);
+    vec2 grad = vec2(a - b * 0.5, b - a * 0.4) * 0.5;
+    float fizz = clamp(a * 0.5 + b * 0.3 + 0.5, 0.0, 1.0);
+    return vec3(grad, fizz);
 }
 
 // dynamicDiffuse sums this frame's point lights at vWorldPos: a smooth
@@ -336,6 +383,56 @@ void main() {
         return;
     }
 
+    if (vKind == KIND_TELEPORT) {
+        // Teleporter pad: a fully procedural blue/white mirror — no
+        // sampling of uTex (the real GATE1-4 texture) at all, so the old
+        // art is completely replaced rather than tinted/warped like the
+        // liquid floors are. Every term below is either purely time-based
+        // (no spatial dependence — shimmer), radially symmetric about a
+        // tile centre (core), or built from PER-CELL random phase/speed
+        // (twinkle) — deliberately never a sine of a raw linear combination
+        // of world X/Y, which is exactly what reads as a moving "line" or
+        // band sweeping across the pad (a shared phase gradient IS a
+        // wavefront): two earlier cuts of this both had that bug. A bright
+        // pulsing core sits at the centre of each flat tile (fract(vUV) —
+        // GATE tiles at the standard 64-unit flat size, so a single-sector
+        // pad's own centre lands here) for the "light shining up from the
+        // middle" — combined with the real rising glitter particles
+        // (engine/teleportambience.go) for the upward motion a flat floor
+        // plane can't itself show.
+        float t = W.nLights.y;
+        vec2 local = fract(vUV) - 0.5;
+        float r = length(local) * 1.4142136; // 0 at tile centre, ~1 at a corner
+
+        // Ambient shimmer: a slow global brightness breathe, no spatial
+        // term at all, so there's no gradient across the surface to read
+        // as a line.
+        float shimmer = mix(0.9, 1.1, 0.5 + 0.5 * sin(t * 1.1));
+        // Central bright pulsing core — radially symmetric.
+        float core = pow(clamp(1.0 - r, 0.0, 1.0), 3.0) * (0.85 + 0.15 * sin(t * 2.0));
+        // Twinkle: small cells across the pad, each with its own
+        // teleportHash-derived phase/speed, so sparkles pop independently
+        // instead of riding one shared wavefront.
+        vec2 cell = floor(vWorldPos.xy * 0.35);
+        float ph = teleportHash(cell) * 6.2831853;
+        float spd = 2.0 + 3.0 * teleportHash(cell + 17.0);
+        float twinkle = pow(max(sin(t * spd + ph), 0.0), 14.0);
+
+        vec3 deep = vec3(0.04, 0.09, 0.22);  // dark blue mirror base
+        vec3 bright = vec3(0.75, 0.9, 1.0);  // centre light / twinkle colour
+        vec3 col = deep * shimmer + bright * core * 2.2 + bright * twinkle * 0.9;
+
+        float lit = max(fade(true), 0.5); // always reads as its own light source, even in a dark room
+        // Alpha 0 tags this pixel the same way water does, so
+        // worldblit.frag's existing screen-space reflection march runs on
+        // it unchanged — the pad is a flat, Z-up plane exactly like a
+        // water floor is, so that same reflection math (Fresnel-gated:
+        // strong at grazing angles, faint looking straight down) turns
+        // this into a genuine mirror of the room around it.
+        outColor = vec4(applyFog(col * lit), 0.0);
+        return;
+    }
+
     vec4 tex = texture(uTex, vUV);
 
     // Liquid floors. Same intent as the software rasterizer's drawFlatSpan /
@@ -363,10 +460,15 @@ void main() {
         vec3 absorb = vec3(exp(-2.3 * depth), exp(-1.15 * depth), exp(-0.5 * depth));
         body = body * absorb * caustic + vec3(0.02, 0.06, 0.09) * depth;
 
-        // Reflection: a rippled, desaturated hint of sky, sharp fresnel.
-        float fres = 0.02 + 0.18 * pow(graz, 5.0);
+        // Reflection: a rippled hint of sky, sharp fresnel — pushed
+        // stronger at grazing angles than a physically-minimal fresnel
+        // curve would (real water gets close to a full mirror near the
+        // horizon; the old 0.18 cap read as barely more than a tint) and
+        // desaturated less, so the reflection reads as sky-colored rather
+        // than washed toward gray.
+        float fres = 0.03 + 0.5 * pow(graz, 4.0);
         vec3 refl = skyColorAt(gl_FragCoord.xy + wv.xy * (3.0 + 6.0 * graz));
-        refl = mix(refl, vec3(dot(refl, vec3(0.30, 0.59, 0.11))), 0.30);
+        refl = mix(refl, vec3(dot(refl, vec3(0.30, 0.59, 0.11))), 0.12);
 
         vec3 outc = mix(body, refl, fres);
         // Dynamic light as a damped crest glint, not a wash. Flat normal +
@@ -406,26 +508,47 @@ void main() {
         outColor = vec4(applyFog(outc), 0.0);
         return;
     }
-    if (vKind == KIND_LIQUID_LAVA) {
+    // Lava and nukage/acid share one shape — wave-churned UV sample, a
+    // bright-crest glint, a tinted emissive glow, a dynamic-light nudge —
+    // with different wave functions (lavaWave/nukageWave, kept separate:
+    // lava's is slow/viscous, nukage's is quick/thin) and constants
+    // (isLava below) rather than two near-duplicate branches. All
+    // fragments of one liquid surface take the same isLava path, so this
+    // costs nothing extra over the two-branch version it replaces.
+    if (vKind == KIND_LIQUID_LAVA || vKind == KIND_LIQUID_NUKAGE) {
+        bool isLava = (vKind == KIND_LIQUID_LAVA);
         float t = W.nLights.y;
-        float pulse = 0.92 + 0.13 * sin(vWorldPos.x * 0.018 + vWorldPos.y * 0.021 + t * 2.3);
-        float lit = max(fade(true), 0.55);                   // never fully dark
-        vec3 glow = tex.rgb * vec3(1.15, 0.50, 0.18) * (0.9 * pulse); // warm emissive (>1 -> bloom)
+        vec3 wv = isLava ? lavaWave(vWorldPos.xy, t) : nukageWave(vWorldPos.xy, t);
+        vec4 texW = texture(uTex, vUV + wv.xy * (isLava ? 0.010 : 0.014));
+        float lit = max(fade(true), isLava ? 0.55 : 0.35); // lava never fully dark; nukage a little dimmer
+        vec3 tint = isLava ? vec3(1.15, 0.50, 0.18) : vec3(0.10, 0.42, 0.14);
+        float glint = pow(wv.z, isLava ? 3.0 : 4.0); // lava: sharp cracks; nukage: sparse bubbling fizz
+        float glowShape = isLava
+            ? 0.9 * (0.92 + 0.13 * sin(vWorldPos.x * 0.018 + vWorldPos.y * 0.021 + t * 2.3)) + 0.6 * glint
+            : 1.0 + 0.8 * glint;
+        vec3 glow = texW.rgb * tint * glowShape;
         // Lava is already self-lit; a dynamic light (muzzle flash) only
-        // nudges it so firing over lava keeps the molten look.
-        outColor = vec4(applyFog(tex.rgb * lit + glow + tex.rgb * dynamicDiffuse(normalize(vNormal), 0.0) * 0.35), 1.0);
-        return;
-    }
-    if (vKind == KIND_LIQUID_NUKAGE) {
-        float lit = max(fade(true), 0.35);
-        vec3 glow = tex.rgb * vec3(0.10, 0.42, 0.14);        // subtle green lift
-        outColor = vec4(applyFog(tex.rgb * lit + glow + tex.rgb * dynamicDiffuse(normalize(vNormal), 0.0)), 1.0);
+        // nudges it, so firing over lava keeps the molten look. Nukage gets
+        // the ordinary full weight.
+        float dynWeight = isLava ? 0.35 : 1.0;
+        outColor = vec4(applyFog(texW.rgb * lit + glow + texW.rgb * dynamicDiffuse(normalize(vNormal), 0.0) * dynWeight), 1.0);
         return;
     }
 
     if (vKind == KIND_SPRITE_FULL) {
         if (tex.a < 0.5) discard;
         outColor = vec4(applyFog(tex.rgb * 1.35), 1.0); // emissive: pushed >1 so bloom catches it
+        return;
+    }
+    if (vKind == KIND_SPRITE_TRANS) {
+        // Real alpha blend (pipeParticleTrans: SrcAlpha/OneMinusSrcAlpha),
+        // unlike every other sprite kind's hard tex.a<0.5 cutout — shaded by
+        // vLight like an ordinary surface (not pushed emissive/bloomed like
+        // KIND_SPRITE_FULL), so it reads as haze lit by its surroundings
+        // rather than another light source.
+        float a = tex.a * vAlpha;
+        if (a < 0.01) discard;
+        outColor = vec4(applyFog(tex.rgb * vLight), a);
         return;
     }
     if (vKind == KIND_MASKED) {

@@ -413,6 +413,11 @@ func TestHereticTomeOfPower(t *testing.T) {
 	g.beginFire()
 	if len(g.projectiles) != 1 || g.projectiles[0].def.ExplodeRadius < 100 {
 		t.Errorf("powered firemace: %d projectiles, radius %d", len(g.projectiles),
-			func() int { if len(g.projectiles) > 0 { return g.projectiles[0].def.ExplodeRadius }; return -1 }())
+			func() int {
+				if len(g.projectiles) > 0 {
+					return g.projectiles[0].def.ExplodeRadius
+				}
+				return -1
+			}())
 	}
 }

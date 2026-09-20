@@ -215,7 +215,7 @@ func (a *App) openWindow(fullscreen bool) error {
 	if fw == 0 || fh == 0 {
 		fw, fh = a.windowedW, a.windowedH
 	}
-	blit, err := vulkan.NewWorld(win, fw, fh, true, false)
+	blit, err := vulkan.NewWorld(win, fw, fh, true, false, false) // waterRefraction: editor preview doesn't need real refraction
 	if err != nil {
 		win.Destroy()
 		return fmt.Errorf("open %s renderer: %w", fullscreenWord(fullscreen), err)

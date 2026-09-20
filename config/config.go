@@ -197,6 +197,32 @@ type Config struct {
 	// (silhouettes, corners, and geometry seen against the sky) into black
 	// outlines. Default false.
 	CartoonShading bool `json:"cartoonShading"`
+	// ExplosionParticles turns on a handful of flying-spark billboards on
+	// every projectile blast (rocket/plasma/BFG/monster fireballs) — see
+	// engine/particles.go. Purely cosmetic (no gameplay effect either way);
+	// silently does nothing even when true if the spark art isn't present
+	// locally. Default true.
+	ExplosionParticles bool `json:"explosionParticles"`
+	// LiquidAmbience turns on cosmetic particles around water/lava/nukage
+	// sectors — steam off lava, mist over water, bubbles in acid — plus the
+	// particle burst (not the sound, which always plays) when something
+	// crosses into or out of a liquid sector. See engine/liquidambience.go
+	// and engine/liquidsplash.go. Purely cosmetic; silently does nothing if
+	// the underlying art isn't present locally. Default true.
+	LiquidAmbience bool `json:"liquidAmbience"`
+	// WaterRefraction turns on real depth-based refraction/murk for water
+	// surfaces in the hardware renderer: the opaque scene is captured into a
+	// texture right before water draws, so water can sample what's actually
+	// behind/beneath it instead of only a fake fresnel/distance cue. Only
+	// visibly differs from the fake shading on a specially-authored
+	// room-over-room map with real floor geometry beneath a transparent
+	// water surface — an ordinary map's water looks the same either way,
+	// since there's nothing real to capture beneath it. Default false: this
+	// is a genuinely new render-pass shape (the frame splits into two
+	// passes with an explicit mid-frame image copy between them) rather
+	// than a per-frame shader branch, so it's opt-in rather than silently
+	// changing every map's render path by default.
+	WaterRefraction bool `json:"waterRefraction"`
 	// SwitchWeapons swaps the two games' arsenals: a Doom WAD is then played
 	// with Heretic's weapons (Elven Wand, Ethereal Crossbow, Dragon Claw,
 	// Hellstaff, Phoenix Rod, Firemace) and a Heretic WAD with Doom's
@@ -371,6 +397,9 @@ func Default() Config {
 		AmbientLight:         0.2,
 		Exposure:             1.0,
 		CartoonShading:       false,
+		ExplosionParticles:   true,
+		LiquidAmbience:       true,
+		WaterRefraction:      false,
 		SwitchWeapons:        false,
 		FogColor:             "",
 		FogDensity:           0,

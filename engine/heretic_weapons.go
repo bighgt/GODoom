@@ -116,7 +116,7 @@ func applyHereticWeapons() {
 	Weapons[wpFist] = WeaponDef{
 		Name: "Staff", SpritePrefix: "STFF", FireSound: "STFHIT",
 		AmmoType: -1, AmmoCost: 0, Melee: true,
-		FireFrames:     []WeaponFrame{{Frame: 'B', Tics: 6}, {Frame: 'C', Tics: 8}, {Frame: 'B', Tics: 8}},
+		FireFrames:      []WeaponFrame{{Frame: 'B', Tics: 6}, {Frame: 'C', Tics: 8}, {Frame: 'B', Tics: 8}},
 		PoweredMeleeMul: 4,
 	}
 	Weapons[wpChainsaw] = WeaponDef{

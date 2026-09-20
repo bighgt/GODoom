@@ -145,4 +145,3 @@ func (g *Game) ApplyMapInfo() {
 }
 
 func (g *Game) applyMapInfo() { g.ApplyMapInfo() }
-

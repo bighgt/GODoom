@@ -163,6 +163,14 @@ func (g *Game) buildStaticLights() {
 	// (liquidlights.go).
 	g.appendLiquidLights(seed)
 
+	// Ambient liquid particles (steam/mist/bubbles) — a one-time sector
+	// scan just like the liquid lights above (liquidambience.go).
+	g.buildLiquidAmbientSectors()
+
+	// Rising teleporter-pad glitter — same one-time sector scan idiom,
+	// for GATE1-4 floor flats (engine/teleportambience.go).
+	g.buildTeleportAmbientSectors()
+
 	for i := range g.staticLights {
 		g.staticLights[i].setCullR2()
 	}

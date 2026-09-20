@@ -273,7 +273,7 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 	// latency; keep them off unless explicitly asked for (TPF_VK_DEBUG=1).
 	vkDebug := os.Getenv("TPF_VK_DEBUG") != ""
 	done = stageTimer("create GPU renderer (device + pipelines + shaders)")
-	renderer, err := vulkan.NewWorld(win, renderW, renderH, cfg.VSync, vkDebug)
+	renderer, err := vulkan.NewWorld(win, renderW, renderH, cfg.VSync, vkDebug, cfg.WaterRefraction)
 	if err != nil {
 		return fmt.Errorf("engine: hardware renderer failed to initialise: %w", err)
 	}
@@ -473,4 +473,3 @@ func resolveMapChoice(line string, maps []string, def string) (chosen, msg strin
 	}
 	return "", fmt.Sprintf("%q is not one of the maps", s)
 }
-

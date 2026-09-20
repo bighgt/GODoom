@@ -99,7 +99,7 @@ type WeaponDef struct {
 	// hitscan weapon (the Elven Wand) that many shots while empowered;
 	// PoweredMeleeMul multiplies a melee weapon's damage (Staff / Gauntlets)
 	// and, if PoweredLeech, heals the player for a quarter of it.
-	Powered            *ProjectileDef
+	Powered             *ProjectileDef
 	PoweredHitscanShots int
 	PoweredMeleeMul     int
 	PoweredLeech        bool
@@ -430,7 +430,7 @@ var Weapons = [numWeapons]WeaponDef{
 			Sprite: "BFS1A0", Speed: 875,
 			ExplodePrefix: "BFE1", ExplodeFrames: []byte{'A', 'B', 'C', 'D'}, ExplodeTics: 8,
 			ExplodeSound: "DSRXPLOD",
-			Damage:       100, // MT_BFG: direct hit (P_Random%8+1)*100
+			Damage:       100,  // MT_BFG: direct hit (P_Random%8+1)*100
 			Spray:        true, // plus the room-clearing spray on impact — see aBFGSpray
 		},
 	},

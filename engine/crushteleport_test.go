@@ -39,8 +39,53 @@ func TestTeleporterRepeats(t *testing.T) {
 		t.Fatalf("freeze stuck at %d after %d tics — it never counts down", g.playerMobj.TeleportFreeze, teleportFreezeTics+2)
 	}
 
+	// TeleportGuard (see mobj.go) additionally refuses a re-fire from the
+	// exact spot the player landed at, freeze or no freeze — walk away
+	// first, same as a real player would have to.
+	g.Camera.X += teleportClearRadius * 2
+	g.Camera.Y += teleportClearRadius * 2
+
 	if !g.evTeleport(line, g.playerMobj, false) {
 		t.Error("teleporter refused a second use — it only works once")
+	}
+}
+
+// TestTeleporterGuardBlocksImmediateBounceBack is the bug report this
+// covers directly: landing on a pad that sits hard against another
+// teleport line (or its own) must not bounce the player straight back the
+// instant TeleportFreeze's timer expires if they never actually moved off
+// the landing spot — see TeleportGuard.
+func TestTeleporterGuardBlocksImmediateBounceBack(t *testing.T) {
+	g := loadRealLevel(t, "../wad/heretic.wad", "E1M1")
+
+	line := -1
+	for i := range g.Level.Linedefs {
+		if g.Level.Linedefs[i].SpecialType == 97 {
+			line = i
+			break
+		}
+	}
+	if line < 0 {
+		t.Skip("no special-97 teleport line on this map")
+	}
+
+	if !g.evTeleport(line, g.playerMobj, false) {
+		t.Fatal("first teleport did nothing (no reachable MT_TELEPORTMAN?)")
+	}
+	for i := 0; i < teleportFreezeTics+2 && g.playerMobj.TeleportFreeze > 0; i++ {
+		g.runTic()
+	}
+
+	// Never moved from the landing spot: even with the freeze timer fully
+	// expired, the guard must still refuse it.
+	if g.evTeleport(line, g.playerMobj, false) {
+		t.Error("teleporter fired again from the exact landing spot — this is the reported bounce-back loop")
+	}
+
+	// Step away, then it should work again.
+	g.Camera.X += teleportClearRadius * 2
+	if !g.evTeleport(line, g.playerMobj, false) {
+		t.Error("teleporter still refused after moving away from the landing spot")
 	}
 }
 
