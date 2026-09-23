@@ -15,8 +15,12 @@ type Renderer interface {
 	// the BSP walk and the camera, and the GPU rasterizes, textures,
 	// depth-tests and shades it. w/h is the render-target size; overlay is
 	// the un-composited 2D HUD/weapon layer (RGBA8, straight alpha) to blend
-	// on top; lights is this frame's dynamic emitters.
-	DrawWorld(g *worldgeo.Geometry, cam worldgeo.Camera, w, h int, overlay []byte, lights []Light) error
+	// on top; overlayY0/overlayY1 is the row range of overlay that changed
+	// since the previous call (raster.Renderer.OverlayDirty) — a backend may
+	// use it to avoid re-uploading the whole plane every frame when most of
+	// it (typically all but a HUD/weapon strip) is unchanged; lights is this
+	// frame's dynamic emitters.
+	DrawWorld(g *worldgeo.Geometry, cam worldgeo.Camera, w, h int, overlay []byte, overlayY0, overlayY1 int, lights []Light) error
 	// Destroy releases every GPU resource the renderer owns. It blocks until
 	// the GPU has finished all outstanding work first, so callers can invoke
 	// it directly on shutdown.

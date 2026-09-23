@@ -263,10 +263,10 @@ func (g *Game) activateLine(lineIdx int, mo *Mobj, trig lineTrigger) bool {
 
 	// ---- exits ----
 	case 11, 52, 197:
-		g.exitLevel = 1
+		g.startExit(1, trig)
 		did = true
 	case 51, 124, 198:
-		g.exitLevel = 2
+		g.startExit(2, trig)
 		did = true
 
 	default:
@@ -281,6 +281,33 @@ func (g *Game) activateLine(lineIdx int, mo *Mobj, trig lineTrigger) bool {
 		ld.SpecialType = 0
 	}
 	return true
+}
+
+// switchExitDoorTics is how long a SWITCH-triggered exit waits before the
+// level actually ends — long enough to read as "a door somewhere just
+// opened" (it plays the same DSDOROPN sound, and the delay is on the same
+// order as an ordinary door's own raise time — see vdoorSpeed) rather than
+// vanishing straight to the intermission screen the instant the switch is
+// pressed. Doesn't touch existing map geometry — see startExit's own doc
+// comment for why this only applies to switches, not walkovers.
+const switchExitDoorTics = 52 // ~1.5s at 35 tics/sec
+
+// startExit begins a pending level exit of kind (1 normal, 2 secret).
+// Only a genuine switch press (trig == trUse — the only way specials 11/51
+// can fire at all, per switchSpecials) gets the delayed "door" treatment;
+// a walkover exit (52/124/197/198) already requires the player to
+// physically walk somewhere to trigger it in the first place, so it still
+// takes effect immediately, same as vanilla — this only changes the "press
+// a switch and instantly vanish" case a plain wall switch could never
+// otherwise avoid.
+func (g *Game) startExit(kind int, trig lineTrigger) {
+	g.exitLevel = kind
+	if trig == trUse {
+		g.exitDelay = switchExitDoorTics
+		g.playWorldSound("DSDOROPN")
+	} else {
+		g.exitDelay = 0
+	}
 }
 
 // --- tag-scoped helpers ---

@@ -111,6 +111,19 @@ func (g *Game) updateProjectiles(dt float64) {
 	if len(g.projectiles) == 0 {
 		return
 	}
+	// Refresh mobjGrid (mobjgrid.go) here too, not just once at the top of
+	// runTic: this runs every rendered frame (combatSystem.Update), not
+	// just every 35Hz tic, and a thing spawned since runTic's own rebuild
+	// (e.g. a scripted spawn the same tic a shot goes off — see
+	// TestProjectileDirectHitDamagesMonster, which spawns and fires
+	// without an intervening runTic at all) must still be a valid
+	// projectileHitMobj target. Mobj positions themselves are frozen
+	// between tics, so on every OTHER frame this just re-buckets the same
+	// data runTic already did — redundant, but cheap (O(mobjs), same
+	// budget headroom that made the old per-query O(mobjs) scan a non-issue
+	// at today's mobj counts) and simpler than tracking exactly when a
+	// rebuild is actually needed.
+	g.rebuildMobjGrid()
 	alive := g.projectiles[:0]
 	for _, p := range g.projectiles {
 		if p.exploding {
@@ -133,6 +146,12 @@ func (g *Game) updateProjectiles(dt float64) {
 					scale = explosionBFG
 				}
 				g.spawnExplosionParticles(p.X, p.Y, p.Z, scale)
+				// The BFG's own signature: a big extra burst of sparks
+				// thrown outward from the same explosion, on top of its
+				// ordinary explosionBFG burst — see spawnBFGExtraSparks.
+				if p.def.ExplodePrefix == "BFE1" {
+					g.spawnBFGExtraSparks(p.X, p.Y, p.Z)
+				}
 			}
 			// Rockets (and any blast-radius shot) hurt everything nearby.
 			if p.def.ExplodeRadius > 0 {
@@ -211,6 +230,16 @@ func (g *Game) advanceProjectile(p *Projectile, dt float64) bool {
 		nx := p.X + p.DX*seg
 		ny := p.Y + p.DY*seg
 		nz := p.Z + p.DZ*seg
+		// Advance to this step's candidate position BEFORE testing it for an
+		// impact, not just on a confirmed clean step: every return below
+		// (mobj/wall/floor-ceiling/out-of-bounds) is a stop, and the
+		// explosion this triggers (updateProjectiles' own caller) always
+		// bursts at p's CURRENT position — leaving it at the END of the
+		// PREVIOUS step instead of at the actual impact point (up to one
+		// projectileRadius short of the wall/floor/ceiling it just hit) is
+		// exactly why a rocket's blast used to visibly land short of where
+		// it hit instead of centred there.
+		p.X, p.Y, p.Z = nx, ny, nz
 
 		if mo := g.projectileHitMobj(nx, ny, nz); mo != nil {
 			// A rocket landing the killing blow on a barrel would otherwise
@@ -228,7 +257,6 @@ func (g *Game) advanceProjectile(p *Projectile, dt float64) bool {
 				mo.explosionBoost = rocketBarrelExplosionBoost
 				p.skipOwnExplosion = true
 			}
-			p.X, p.Y, p.Z = nx, ny, nz // explode on the target so the blast is centred there
 			return true
 		}
 		if g.projectileHitsWall(nx, ny) {
@@ -239,7 +267,6 @@ func (g *Game) advanceProjectile(p *Projectile, dt float64) bool {
 			return true
 		}
 
-		p.X, p.Y, p.Z = nx, ny, nz
 		p.traveled += seg
 		if p.traveled >= projectileMaxRange {
 			return true
@@ -252,24 +279,29 @@ func (g *Game) advanceProjectile(p *Projectile, dt float64) bool {
 // the point (x, y, z) has entered — id's missile-vs-thing overlap from
 // PIT_CheckThing: an axis-aligned box test on radius (plus the shot's own
 // ~4u), and a vertical overlap against [thing feet, thing head] with the
-// missile's own 8u height. g.playerMobj is never in g.mobjs, so a player
-// shot can't detonate on the shooter.
+// missile's own 8u height. g.playerMobj is deliberately excluded (not just
+// "never in g.mobjs" — mobjGrid does include it) so a player shot can't
+// detonate on the shooter. Candidates come from mobjGrid (mobjgrid.go)
+// instead of a linear scan of every mobj in the level; every candidate
+// still gets the exact same precise checks below.
 func (g *Game) projectileHitMobj(x, y, z float64) *Mobj {
 	const projHeight = 8.0
-	for _, mo := range g.mobjs {
-		if mo == nil || mo.removed || mo.Flags&MF_SHOOTABLE == 0 || mo.Health <= 0 {
-			continue
+	var hit *Mobj
+	g.forEachMobjNear(x, y, projectileRadius, func(mo *Mobj) bool {
+		if mo == nil || mo == g.playerMobj || mo.removed || mo.Flags&MF_SHOOTABLE == 0 || mo.Health <= 0 {
+			return true
 		}
 		block := mo.Radius + projectileRadius
 		if math.Abs(x-mo.X) >= block || math.Abs(y-mo.Y) >= block {
-			continue
+			return true
 		}
 		if z+projHeight < mo.Z || z > mo.Z+mo.Height {
-			continue // passing over its head or under its feet
+			return true // passing over its head or under its feet
 		}
-		return mo
-	}
-	return nil
+		hit = mo
+		return false
+	})
+	return hit
 }
 
 // explosionFrame reports the explosion frame letter active at p's current

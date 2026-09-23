@@ -528,10 +528,11 @@ const weaponRaiseSpeed = ticsPerSecond / 16.0
 //
 // All three motions share bobPhase (see updateWeapon), just at different
 // multiples of it, which is what turns three independent sine waves into
-// one coherent arc instead of three unrelated wobbles:
-//   - X (weaponBobX):     sin(phase)          — side to side.
-//   - Y (weaponBobY):     abs(sin(2*phase))   — up, twice a cycle, never down.
-//   - scale (weaponBobScale): cos(2*phase)    — closest at dead centre
+// one coherent arc instead of three unrelated wobbles — weaponBob's three
+// return values:
+//   - x:     sin(phase)          — side to side.
+//   - y:     abs(sin(2*phase))   — up, twice a cycle, never down.
+//   - scale: cos(2*phase)        — closest at dead centre
 //     (moving fastest sideways), farthest at each side's extreme (paused
 //     an instant before swinging back) — so the RETURN half of every swing
 //     reads as the gun coming back toward the camera as it re-centres, the
@@ -554,14 +555,25 @@ func (g *Game) moveSpeedFrac() float64 {
 	return f
 }
 
-// weaponBob computes all three per-frame weapon-bob values together,
-// sharing the one moveSpeedFrac() call and the one sin/cos of 2*bobPhase
-// (math.Sincos) that weaponBobX/Y/Scale used to each independently redo —
-// they're always read back-to-back for the same frame (see game.go's
-// renderFrame), so three passes over the same handful of trig calls was
-// pure waste. weaponBobX/Y/Scale remain as the named per-axis accessors
-// (kept for their own doc comments and so existing single-value callers/
-// tests don't need to change) but now just read one field of this.
+// weaponBob computes the three per-frame weapon-bob values (game.go's
+// renderFrame reads all three together): x is the horizontal sway offset
+// (HUD pixels, raster/weapon.go's 320x200 space) — a sine wave whose
+// amplitude scales with moveSpeedFrac, so the gun sits dead still at rest
+// and sways with increasing width up to weaponBobMaxX at a run; y is the
+// vertical bob offset (positive = risen above rest — see raster.DrawWeapon)
+// — abs(sin(2*phase)) so it rises and settles twice per horizontal sway
+// cycle (once per footfall) and never dips below the weapon's resting
+// position; scale is the toward/away-from-camera size multiplier (1 =
+// normal, raster.DrawWeapon's bobScale) — cos(2*phase) so the gun is
+// biggest (closest) every time the sway passes back through centre and
+// smallest (farthest) at each side's extreme, the "half circular" arc
+// rather than a flat left-right slide. The sway's own phase (see
+// updateWeapon) is advanced by moveSpeedFrac too, so the cycle itself
+// speeds up right along with amplitude — standing still freezes the phase
+// as well as zeroing it, rather than a silent sine wave ticking away at
+// full speed underneath a 0-width sway. Shares the one moveSpeedFrac() call
+// and one sin/cos of 2*bobPhase (math.Sincos) across all three rather than
+// three independent passes over the same handful of trig calls.
 func (g *Game) weaponBob() (x, y, scale float64) {
 	frac := g.moveSpeedFrac()
 	sin2, cos2 := math.Sincos(2 * g.Weapon.bobPhase)
@@ -570,32 +582,6 @@ func (g *Game) weaponBob() (x, y, scale float64) {
 	scale = 1 + weaponBobDepth*frac*cos2
 	return x, y, scale
 }
-
-// weaponBobX is the current horizontal sway offset (HUD pixels,
-// raster/weapon.go's 320x200 space): a sine wave whose amplitude scales
-// with moveSpeedFrac, so the gun sits dead still at rest and sways with
-// increasing width up to weaponBobMaxX at a run. The sway's own phase (see
-// updateWeapon) is advanced by that same fraction, so the cycle itself
-// speeds up right along with it — standing still freezes the phase as well
-// as zeroing the amplitude, rather than a silent sine wave ticking away at
-// full speed underneath a 0-width sway.
-func (g *Game) weaponBobX() float64 { x, _, _ := g.weaponBob(); return x }
-
-// weaponBobY is the current vertical bob offset (same HUD pixel space,
-// positive = risen above rest — see raster.DrawWeapon): abs(sin(2*phase))
-// so it rises and settles twice per horizontal sway cycle (once per
-// footfall) and never dips below the weapon's resting position, scaled by
-// the same moveSpeedFrac as weaponBobX.
-func (g *Game) weaponBobY() float64 { _, y, _ := g.weaponBob(); return y }
-
-// weaponBobScale is the current toward/away-from-camera size multiplier
-// (1 = normal, raster.DrawWeapon's bobScale): cos(2*phase) so the gun is
-// biggest (closest) every time the sway passes back through centre and
-// smallest (farthest) at each side's extreme, tracing the "half circular"
-// arc described above rather than a flat left-right slide. Scaled by
-// moveSpeedFrac like the other two, so it's exactly 1 (no size change) at
-// rest.
-func (g *Game) weaponBobScale() float64 { _, _, s := g.weaponBob(); return s }
 
 type weaponPhase int
 
@@ -618,7 +604,7 @@ type WeaponState struct {
 	idleSoundTimer  float64 // seconds until the IdleSound is re-triggered (see updateWeapon)
 
 	// bobPhase is a free-running angle (radians) driving the weapon's side-
-	// to-side sway while walking — see weaponBobX. Advances at a constant
+	// to-side sway while walking — see weaponBob. Advances at a constant
 	// rate regardless of speed (only the sway's AMPLITUDE depends on how
 	// fast the player is moving); kept wrapped to [0, 2*pi) so it never
 	// grows unbounded over a long play session.

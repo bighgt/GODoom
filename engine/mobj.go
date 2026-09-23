@@ -448,7 +448,9 @@ func (g *Game) missilePathBlocked(mo *Mobj, x, y, z float64) bool {
 // missileThingHit returns the first shootable thing whose body (x,y,z)
 // enters. skipKin drops the launcher (mo.Target) and same-species
 // infighting immunity (id's MF_MISSILE rules); a charging skull passes
-// false so it hits anything including its own target.
+// false so it hits anything including its own target. Candidates
+// (including the player, who mobjGrid does bucket) come from mobjGrid
+// (mobjgrid.go) instead of a linear scan of every mobj in the level.
 func (g *Game) missileThingHit(mo *Mobj, x, y, z float64, skipKin bool) *Mobj {
 	test := func(other *Mobj) *Mobj {
 		if other == nil || other == mo || other.removed ||
@@ -472,15 +474,15 @@ func (g *Game) missileThingHit(mo *Mobj, x, y, z float64, skipKin bool) *Mobj {
 		}
 		return other
 	}
-	if h := test(g.playerMobj); h != nil {
-		return h
-	}
-	for _, other := range g.mobjs {
+	var hit *Mobj
+	g.forEachMobjNear(x, y, mo.Radius, func(other *Mobj) bool {
 		if h := test(other); h != nil {
-			return h
+			hit = h
+			return false
 		}
-	}
-	return nil
+		return true
+	})
+	return hit
 }
 
 // runTic advances the whole map-object simulation by one 35Hz tic and then
@@ -488,6 +490,9 @@ func (g *Game) missileThingHit(mo *Mobj, x, y, z float64, skipKin bool) *Mobj {
 func (g *Game) runTic() {
 	g.levelTime++
 	g.snapshotSectorHeights() // "start of tic" heights for hardware render interpolation
+	if g.exitDelay > 0 {
+		g.exitDelay--
+	}
 
 	// Mirror the player's per-frame camera state onto its map object so AI
 	// (targeting, sight, chase) sees an up-to-date position this tic.
@@ -515,6 +520,15 @@ func (g *Game) runTic() {
 	if g.heretic {
 		g.tickTimeBombs()
 	}
+
+	// Re-bucket the mobj-vs-mobj spatial index (mobjgrid.go) from this
+	// tic's starting positions — including the player's, just synced above
+	// — before anything moves. pCheckPosition (called from mobjTick below,
+	// via A_Chase -> pMove -> pTryMove) and every updateProjectiles call
+	// between now and the next runTic (projectileHitMobj/missileThingHit)
+	// read it; see mobjgrid.go's own doc comment on why a full rebuild here
+	// instead of incremental per-move maintenance.
+	g.rebuildMobjGrid()
 
 	for _, mo := range g.mobjs {
 		g.mobjTick(mo)
@@ -565,14 +579,27 @@ func (g *Game) worldGeomChanged() bool {
 // projectile for the hardware-geometry path: a voxel-model instance where
 // the loaded pack has one for a thing's sprite frame, a camera-facing
 // billboard otherwise (and always for projectiles). The GPU equivalent of
-// drawMobjs + the projectile blit loop. Things clearly behind the view
-// plane are dropped cheaply; the GPU depth test sorts the rest. Reuses
-// g.hwSprites / g.hwVoxels backing arrays.
+// drawMobjs + the projectile blit loop. Things outside the camera's (widened)
+// FOV cone are dropped cheaply before any sprite-frame/voxel-model
+// resolution runs; the GPU depth test sorts the rest. Reuses g.hwSprites /
+// g.hwVoxels backing arrays.
 func (g *Game) collectWorldObjects() ([]worldgeo.Sprite, []worldgeo.VoxelInstance) {
 	sprites := g.hwSprites[:0]
 	voxels := g.hwVoxels[:0]
 	cx, cy := g.Camera.X, g.Camera.Y
-	fdx, fdy := math.Cos(g.Camera.Angle), math.Sin(g.Camera.Angle)
+	fov := g.Camera.FOVDeg
+	if fov <= 0 {
+		fov = 90
+	}
+	// viewCam feeds worldgeo.LightVisible's same generous cone test
+	// UpdateVisibility uses to cull geometry cells and DrawWorld uses to
+	// cull lights — reused here for things/projectiles rather than
+	// inventing a third culling test. mobjSightRadius covers the largest
+	// sprite/monster footprint (matches the old behind-plane check's own
+	// 160u margin), wide enough that nothing actually on screen is at risk
+	// of being cut.
+	const mobjSightRadius = 160.0
+	viewCam := worldgeo.Camera{X: cx, Y: cy, Angle: g.Camera.Angle, FOVDeg: fov}
 	frac := g.renderLerp()
 	vscale := g.VoxelScale
 	if vscale <= 0 {
@@ -583,8 +610,8 @@ func (g *Game) collectWorldObjects() ([]worldgeo.Sprite, []worldgeo.VoxelInstanc
 		if mo.State == S_NULL {
 			continue
 		}
-		if (mo.X-cx)*fdx+(mo.Y-cy)*fdy < -160 {
-			continue // behind the view plane (160u margin covers the largest radius)
+		if !worldgeo.LightVisible(viewCam, mo.X, mo.Y, mobjSightRadius) {
+			continue // outside the (widened) view cone
 		}
 		if g.explosionParticles && mo.Type == MT_BARREL && mo.State >= S_BEXP1 && mo.State <= S_BEXP5 {
 			// The native particle burst (spawned once, in aExplode) replaces
@@ -630,6 +657,9 @@ func (g *Game) collectWorldObjects() ([]worldgeo.Sprite, []worldgeo.VoxelInstanc
 		})
 	}
 	for _, p := range g.projectiles {
+		if !worldgeo.LightVisible(viewCam, p.X, p.Y, mobjSightRadius) {
+			continue // outside the (widened) view cone — this loop had no cull at all before
+		}
 		if p.exploding && g.explosionParticles {
 			// The native particle burst (spawnExplosionParticles) replaces
 			// the vanilla explosion-frame sprite entirely when the feature

@@ -17,11 +17,14 @@ func TestEmbeddedSPIRV(t *testing.T) {
 		"world.vert":            worldVertSPV,
 		"world.frag":            worldFragSPV,
 		"worldblit.frag":        worldBlitFragSPV,
+		"worldresolve.frag":     worldResolveFragSPV,
 		"waterrefract.frag":     waterRefractFragSPV,
 		"worldambient.frag":     worldAmbientFragSPV,
 		"worldambientblur.frag": worldAmbientBlurFragSPV,
 		"depthonly.vert":        depthOnlyVertSPV,
 		"depth.frag":            depthFragSPV,
+		"shadow.vert":           shadowVertSPV,
+		"shadow.frag":           shadowFragSPV,
 	}
 	for name, b := range blobs {
 		if len(b) == 0 {

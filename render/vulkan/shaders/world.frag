@@ -21,6 +21,14 @@ layout(location = 0) out vec4 outColor;
 layout(set = 0, binding = 0) uniform sampler2D uTex;
 layout(set = 0, binding = 1) uniform sampler2D uBright;
 
+// Real cube shadow maps (config realShadows) for up to 2 leading dynamic
+// lights — see render/vulkan/worldshadow.go's own doc comment. Always
+// bound (a 1x1 dummy when realShadows is off or a slot is unused this
+// frame — see worldCreateDescriptors); W.spotCosInner.z gates whether
+// they're actually sampled below.
+layout(set = 1, binding = 0) uniform samplerCube uShadowCube0;
+layout(set = 1, binding = 1) uniform samplerCube uShadowCube1;
+
 const int MAX_LIGHTS = 64; // keep == vulkan.worldMaxLights and render.MaxLights
 const int SHADOW_MAX = 24; // keep == vulkan.shadowCasterMax and engine.hwGroundShadowCap
 
@@ -40,7 +48,9 @@ layout(set = 1, binding = 2) uniform World {
     vec4 spotColor;      // rgb colour * intensity, a = intensity (>0 = on)
     // x = cos(inner half-angle); y = cartoon-shading band count (config
     // cartoonShading — fade() posterizes to this many steps when > 0, 0 =
-    // off); zw unused.
+    // off); z = how many of lightPos[0]/[1] have a real shadow map this
+    // frame (0/1/2 — config realShadows), w = that shadow map's shared far
+    // plane (world units).
     vec4 spotCosInner;
     vec4 lightPos[MAX_LIGHTS];      // xyz = world pos, w = 1 / radius^2
     vec4 lightColor[MAX_LIGHTS];    // rgb = colour * intensity
@@ -287,6 +297,26 @@ vec3 bumpedNormal(vec3 N) {
     return normalize(cotangentFrame(N, vWorldPos, vUV) * tsn);
 }
 
+// anyLightNear is a cheap (no texture fetch, no normalize) pre-check for
+// whether ANY of this frame's dynamic point lights actually reach
+// vWorldPos, using the exact same 1-(d/R)^2 test dynamicDiffuse's own loop
+// uses to skip an out-of-range light. bumpedNormal() above costs 4 extra
+// texture samples; gating it on this means a wall/flat far from every
+// light (the common case through most of a room lit by one distant torch)
+// pays for those samples only when a light is actually close enough to
+// visibly matter, instead of on every fragment merely because at least one
+// light exists somewhere in view — W.nLights.x counts what
+// cullLightsToView left in the camera's view cone, not what's near THIS
+// fragment.
+bool anyLightNear(vec3 P) {
+    int n = min(int(W.nLights.x), MAX_LIGHTS);
+    for (int i = 0; i < n; ++i) {
+        vec3 d = W.lightPos[i].xyz - P;
+        if (dot(d, d) * W.lightPos[i].w < 1.0) return true;
+    }
+    return false;
+}
+
 // groundShadow darkens a floor pixel under a grounded thing — a soft round
 // blob, faded by horizontal distance and by how far the pixel's floor sits
 // from the caster's own (so it doesn't bleed onto a step above/below).
@@ -306,6 +336,23 @@ float groundShadow() {
         s *= 1.0 - 0.5 * blob;
     }
     return s;
+}
+
+// shadowCubeSample compares the real linear distance from lightPos to P
+// against the closest surface the shadow map saw in that direction
+// (written by shadow.frag as distance/farPlane — see its own doc comment),
+// returning a dimmed factor when something closer occludes P. bias is a
+// flat-plus-proportional slop (not a rasteriser depth bias — the shadow
+// pass overwrites gl_FragDepth itself, so a fixed-function bias would be
+// silently discarded) against acne from the map's own finite resolution;
+// 0.35 rather than 0.0 so a real shadow reads as a dimming, not a hole —
+// matching dynamicDiffuse's own 0.25 ambient-floor wraparound feel.
+float shadowCubeSample(samplerCube sc, vec3 P, vec3 lightPos, float farPlane) {
+    vec3 toFrag = P - lightPos;
+    float dist = length(toFrag);
+    float closest = texture(sc, toFrag).r * farPlane;
+    float bias = max(0.05 * dist, 4.0);
+    return (dist - bias > closest) ? 0.35 : 1.0;
 }
 
 vec3 dynamicDiffuse(vec3 N, float specMask) {
@@ -341,7 +388,10 @@ vec3 dynamicDiffuse(vec3 N, float specMask) {
             float nh = max(dot(N, normalize(Ld + V)), 0.0);
             spec = pow(nh, SPEC_POWER) * SPEC_STRENGTH * specMask;
         }
-        sum += W.lightColor[i].rgb * (atten * (0.25 + 0.75 * lambert + spec));
+        float sh = 1.0;
+        if (i == 0 && W.spotCosInner.z >= 1.0) sh = shadowCubeSample(uShadowCube0, vWorldPos, W.lightPos[0].xyz, W.spotCosInner.w);
+        else if (i == 1 && W.spotCosInner.z >= 2.0) sh = shadowCubeSample(uShadowCube1, vWorldPos, W.lightPos[1].xyz, W.spotCosInner.w);
+        sum += W.lightColor[i].rgb * (atten * (0.25 + 0.75 * lambert + spec) * sh);
     }
 
     // --- flashlight spot: same falloff/lambert shape as a point light,
@@ -384,43 +434,115 @@ void main() {
     }
 
     if (vKind == KIND_TELEPORT) {
-        // Teleporter pad: a fully procedural blue/white mirror — no
-        // sampling of uTex (the real GATE1-4 texture) at all, so the old
-        // art is completely replaced rather than tinted/warped like the
-        // liquid floors are. Every term below is either purely time-based
-        // (no spatial dependence — shimmer), radially symmetric about a
-        // tile centre (core), or built from PER-CELL random phase/speed
-        // (twinkle) — deliberately never a sine of a raw linear combination
-        // of world X/Y, which is exactly what reads as a moving "line" or
-        // band sweeping across the pad (a shared phase gradient IS a
-        // wavefront): two earlier cuts of this both had that bug. A bright
-        // pulsing core sits at the centre of each flat tile (fract(vUV) —
-        // GATE tiles at the standard 64-unit flat size, so a single-sector
-        // pad's own centre lands here) for the "light shining up from the
-        // middle" — combined with the real rising glitter particles
-        // (engine/teleportambience.go) for the upward motion a flat floor
-        // plane can't itself show.
+        // Teleporter pad: a fully procedural blue/white cut-diamond
+        // surface — no sampling of uTex (the real GATE1-4 texture) at all,
+        // so the old art is completely replaced rather than tinted/warped
+        // like the liquid floors are. Three earlier cuts of this each
+        // fixed a "blocky" bug (a sine of a raw linear world-X/Y
+        // combination reads as a moving line; a per-64-unit-tile radial
+        // glow resets hard at every tile seam) before landing on the
+        // jittered-point (Voronoi) technique both the facets and the
+        // sparkle below now share — it has no grid/tile edge at any scale.
+        //
+        // Facets: the pad is partitioned into irregular cells (a jittered
+        // point per cell, nearest-point-wins — real Voronoi, not a plain
+        // grid), each standing in for one flat face of a cut gem with its
+        // own randomly tilted fake normal. A facet's own highlight is only
+        // bright when the view ray happens to line up with THAT facet's
+        // own tilt, so as the camera moves different facets flash in turn
+        // instead of one uniform sheen — a two-tier pow(dot(N,V)) (broad
+        // soft flash plus a much tighter hard glint riding the same
+        // normal) so a lit facet shows both a sheen and a pinprick sparkle
+        // at once, a thin bright cut-line where neighbouring facets meet
+        // (from the Voronoi cell's own edge distance), a per-facet flat
+        // brightness variance so it reads as faceted even between flashes,
+        // and a per-facet "fire" tint drifting across a narrow icy-blue /
+        // violet / cyan spectrum so neighbouring flashes don't all read as
+        // the exact same colour — real cut gems disperse light into
+        // exactly this kind of shifting colour, not a flat white glint.
+        // Sparkle then layers finer, faster-twinkling points on top, and a
+        // Fresnel rim brightens the whole surface at grazing view angles
+        // (the real floor normal, not a facet's fake one) the same way the
+        // mirror reflection below does. That reflection (alpha 0, same tag
+        // water uses) still runs on top of all of this, plus the real
+        // rising glitter particles (engine/teleportambience.go) for the
+        // upward motion a flat floor plane can't itself show.
         float t = W.nLights.y;
-        vec2 local = fract(vUV) - 0.5;
-        float r = length(local) * 1.4142136; // 0 at tile centre, ~1 at a corner
+        vec3 V = normalize(CAM_POS - vWorldPos);
 
-        // Ambient shimmer: a slow global brightness breathe, no spatial
-        // term at all, so there's no gradient across the surface to read
-        // as a line.
         float shimmer = mix(0.9, 1.1, 0.5 + 0.5 * sin(t * 1.1));
-        // Central bright pulsing core — radially symmetric.
-        float core = pow(clamp(1.0 - r, 0.0, 1.0), 3.0) * (0.85 + 0.15 * sin(t * 2.0));
-        // Twinkle: small cells across the pad, each with its own
-        // teleportHash-derived phase/speed, so sparkles pop independently
-        // instead of riding one shared wavefront.
-        vec2 cell = floor(vWorldPos.xy * 0.35);
-        float ph = teleportHash(cell) * 6.2831853;
-        float spd = 2.0 + 3.0 * teleportHash(cell + 17.0);
-        float twinkle = pow(max(sin(t * spd + ph), 0.0), 14.0);
 
-        vec3 deep = vec3(0.04, 0.09, 0.22);  // dark blue mirror base
-        vec3 bright = vec3(0.75, 0.9, 1.0);  // centre light / twinkle colour
-        vec3 col = deep * shimmer + bright * core * 2.2 + bright * twinkle * 0.9;
+        // Nearest-point Voronoi over a 3x3 neighbourhood — bestCellID
+        // identifies which facet this pixel belongs to; bestDist/secondDist
+        // (nearest/second-nearest point distance) locate the cell's own
+        // edge, for the thin bright cut-lines below.
+        vec2 fUV = vWorldPos.xy / 7.0;
+        vec2 fBase = floor(fUV);
+        vec2 fLocal = fract(fUV);
+        float bestDist = 8.0, secondDist = 8.0;
+        vec2 bestCellID = fBase;
+        for (int oy = -1; oy <= 1; oy++) {
+            for (int ox = -1; ox <= 1; ox++) {
+                vec2 cellID = fBase + vec2(float(ox), float(oy));
+                vec2 pointPos = vec2(float(ox), float(oy)) + vec2(teleportHash(cellID), teleportHash(cellID + 91.0));
+                float dd = distance(fLocal, pointPos);
+                if (dd < bestDist) {
+                    secondDist = bestDist;
+                    bestDist = dd;
+                    bestCellID = cellID;
+                } else if (dd < secondDist) {
+                    secondDist = dd;
+                }
+            }
+        }
+        vec2 tilt = (vec2(teleportHash(bestCellID + 3.0), teleportHash(bestCellID + 7.0)) - 0.5) * 1.6;
+        vec3 facetN = normalize(vec3(tilt, 1.0));
+        float ndv = max(dot(facetN, V), 0.0);
+        // Two-tier highlight: a broad soft flash plus a much tighter hard
+        // glint riding the same facet normal — real cut gems show both a
+        // wide sheen and pinprick-sharp sparkle points at once, not just
+        // one size of highlight.
+        float facetSpec = pow(ndv, 40.0) * 0.6 + pow(ndv, 220.0) * 1.6;
+        float facetShade = 0.8 + 0.35 * teleportHash(bestCellID + 13.0);
+        // Cut-line: a thin bright seam where facets meet (secondDist and
+        // bestDist converge), like the visible edges between a diamond's
+        // faces.
+        float facetEdge = 1.0 - smoothstep(0.0, 0.10, secondDist - bestDist);
+        // Fire: each facet's highlight leans toward a different point on a
+        // narrow icy-blue -> violet -> cyan spectrum (never far off the
+        // established blue/white theme) — a diamond's dispersion "fire",
+        // where neighbouring facets flash different tints instead of one
+        // flat colour.
+        float hue = teleportHash(bestCellID + 23.0);
+        vec3 fireA = vec3(0.60, 0.85, 1.00);
+        vec3 fireB = vec3(0.75, 0.60, 1.00);
+        vec3 fireC = vec3(0.55, 1.00, 0.95);
+        vec3 facetColor = mix(mix(fireA, fireB, clamp(hue * 2.0, 0.0, 1.0)), fireC, clamp(hue * 2.0 - 1.0, 0.0, 1.0));
+        // Rim: the real (not fake-tilted) floor normal brightens at
+        // grazing view angles, same Fresnel shape the mirror reflection
+        // below already uses — a gem-like edge glow independent of any one
+        // facet's own flash.
+        float rim = pow(1.0 - clamp(dot(vNormal, V), 0.0, 1.0), 5.0);
+
+        // Fine sparkle: a second, smaller-scale jittered-point field,
+        // twinkling faster than any one facet flash lasts.
+        vec2 gv = vWorldPos.xy / 3.0;
+        vec2 gid = floor(gv);
+        vec2 gf = fract(gv) - 0.5;
+        vec2 jitter = vec2(teleportHash(gid + 41.0), teleportHash(gid + 59.0)) - 0.5;
+        float d = length(gf - jitter * 0.7);
+        float pt = pow(clamp(1.0 - d * 2.2, 0.0, 1.0), 3.0);
+        float ph = teleportHash(gid + 3.0) * 6.2831853;
+        float spd = 1.5 + 3.0 * teleportHash(gid + 9.0);
+        float sparkle = pt * max(sin(t * spd + ph), 0.0);
+
+        vec3 deep = vec3(0.04, 0.09, 0.22); // dark blue mirror base
+        vec3 bright = vec3(0.75, 0.9, 1.0); // sparkle / edge / rim colour
+        vec3 col = deep * shimmer * facetShade
+                 + facetColor * facetSpec * 2.2
+                 + bright * facetEdge * 0.5
+                 + bright * sparkle * 1.2
+                 + bright * rim * 0.4;
 
         float lit = max(fade(true), 0.5); // always reads as its own light source, even in a dark room
         // Alpha 0 tags this pixel the same way water does, so
@@ -587,7 +709,7 @@ void main() {
     // unreliable). specMask scales the glint: bright / metal texels shinier.
     vec3 N = normalize(vNormal);
     float specMask = 0.15;
-    if (W.nLights.x > 0.5 && (vKind == KIND_WALL || vKind == KIND_FLAT)) {
+    if (W.nLights.x > 0.5 && (vKind == KIND_WALL || vKind == KIND_FLAT) && anyLightNear(vWorldPos)) {
         N = bumpedNormal(N);
         specMask = 0.20 + 0.80 * dot(tex.rgb, vec3(0.299, 0.587, 0.114));
     }

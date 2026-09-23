@@ -49,6 +49,37 @@ func TestCellVisibleForwardVsBehind(t *testing.T) {
 	}
 }
 
+func TestLightVisibleCameraInsideRadius(t *testing.T) {
+	cam := Camera{X: 50, Y: 50, Angle: 0, FOVDeg: 90}
+	if !LightVisible(cam, 0, 0, 200) {
+		t.Error("camera standing inside the light's radius should always be visible")
+	}
+}
+
+func TestLightVisibleForwardVsBehind(t *testing.T) {
+	// Camera at the origin looking down +X (Angle 0).
+	cam := Camera{X: 0, Y: 0, Angle: 0, FOVDeg: 90}
+
+	// A light straight ahead, well within reach of the view cone, must read visible.
+	if !LightVisible(cam, 500, 0, 200) {
+		t.Error("a light directly ahead of the camera should be visible")
+	}
+
+	// A light directly behind the camera, far enough that its radius can't
+	// reach around into the FOV+margin cone, must not.
+	if LightVisible(cam, -600, 0, 100) {
+		t.Error("a light directly behind the camera, out of reach, should not be visible")
+	}
+
+	// A light behind the camera but with a radius large enough to spill into
+	// the view cone must still read visible — this is exactly why the test
+	// is a proper angular-span-vs-cone check (matching cellVisible), not a
+	// same-side-of-the-camera check.
+	if !LightVisible(cam, -50, 0, 200) {
+		t.Error("a light just behind the camera whose radius reaches into view should be visible")
+	}
+}
+
 // TestUpdateVisibilityUsesDrawBoundsNotNominalCell reproduces the bug a
 // wide outdoor subsector triggers (see cellOf's doc): its geometry is
 // bucketed under one grid cell by its centroid, but a subsector wider than

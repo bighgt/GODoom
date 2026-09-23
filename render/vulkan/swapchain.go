@@ -101,10 +101,32 @@ func (r *Renderer) choosePresentMode() vk.PresentMode {
 	modes := make([]vk.PresentMode, count)
 	vk.GetPhysicalDeviceSurfacePresentModes(r.physicalDevice, r.surface, &count, modes)
 
-	for _, m := range modes {
-		if m == vk.PresentModeMailbox {
-			return m
+	// IMMEDIATE is the actual "vsync off" mode — present the instant a
+	// frame is ready, tearing and all, no wait for vblank. This used to
+	// prefer MAILBOX instead: MAILBOX also never blocks the CPU/GPU on
+	// vblank (it swaps the queued image right up until the next vblank
+	// rather than stalling for one), but it still only ever presents
+	// AT vblank, so the display never tears — some drivers' control panels
+	// (reported with AMD's "wait for vertical refresh: off, unless
+	// application specifies") only honour an application's own vsync-off
+	// request for IMMEDIATE, since MAILBOX looks the same as a vsync'd
+	// present from the display's point of view. Forcing "off" in the
+	// driver panel overrides the app's choice entirely, which is why that
+	// worked around it. Fall back to MAILBOX, then FIFO, if IMMEDIATE
+	// isn't in the surface's supported list (both are optional).
+	has := func(want vk.PresentMode) bool {
+		for _, m := range modes {
+			if m == want {
+				return true
+			}
 		}
+		return false
+	}
+	if has(vk.PresentModeImmediate) {
+		return vk.PresentModeImmediate
+	}
+	if has(vk.PresentModeMailbox) {
+		return vk.PresentModeMailbox
 	}
 	return vk.PresentModeFifo
 }

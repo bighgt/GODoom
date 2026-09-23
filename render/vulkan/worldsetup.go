@@ -468,14 +468,24 @@ func (r *Renderer) worldCreateDescriptorLayouts() error {
 	if wr.dsl0, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0), samplerBinding(1)}); err != nil {
 		return err
 	}
-	// binding 2 is a deliberate gap: bindings 0/1 used to be the two dead
-	// vanilla-LUT samplers (see worldCreateDummyTex's comment) — leaving the
-	// UBO at its existing binding number means voxel.frag (which shares this
-	// exact layout, bound at its own set 0) needed no renumbering either.
-	if wr.dsl1, err = mk([]vk.DescriptorSetLayoutBinding{uboBinding}); err != nil {
+	// Bindings 0/1 used to be the two dead vanilla-LUT samplers (see
+	// worldCreateDummyTex's comment) — now reused for uShadowCube0/1 (world
+	// UBO stays at its existing binding 2, so voxel.frag, which shares this
+	// exact layout bound at its own set 0 and never declares either
+	// sampler, needed no renumbering). Always present (not gated on
+	// wr.realShadows): every allocated set1 gets a real cube view when
+	// realShadows is on, or wr.dummyShadowCube's view otherwise — see
+	// worldCreateDescriptors — so the binding is always legal even though
+	// world.frag only ever actually samples it when the UBO's shadow count
+	// says to.
+	if wr.dsl1, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0), samplerBinding(1), uboBinding}); err != nil {
 		return err
 	}
-	// present blit: uScene (HDR), uBloom (HDR half-res), uOverlay, uDepth (world pass D32), world UBO
+	// present blit: uScene (HDR — only .a read now), uBloom (unused by
+	// worldblit.frag since worldresolve.frag took over the tonemap; kept
+	// allocated/written below rather than reshaping this pool's arithmetic
+	// — see worldCreateDescriptors' own "GOTCHA that bit twice" note),
+	// uOverlay, uDepth (world pass D32), world UBO
 	if wr.dslBlit, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0), samplerBinding(1), samplerBinding(2), samplerBinding(3), uboBindingBlit}); err != nil {
 		return err
 	}
@@ -506,10 +516,10 @@ func (r *Renderer) worldCreateDescriptors() error {
 		MaxSets:       uint32(2*maxFramesInFlight + waterCaptureSets), // set1 + setBlit (+ setWaterCapture) per slot
 		PoolSizeCount: 2,
 		PPoolSizes: []vk.DescriptorPoolSize{
-			// per slot: set1 = 0 samplers (its 2 LUT samplers were removed as
-			// dead code), setBlit = 4 samplers (scene, bloom, overlay,
+			// per slot: set1 = 2 samplers (uShadowCube0/1 — real or dummy,
+			// always bound), setBlit = 4 samplers (scene, bloom, overlay,
 			// depth), setWaterCapture = 2 samplers when built; +2 slack.
-			{Type: vk.DescriptorTypeCombinedImageSampler, DescriptorCount: uint32(4*maxFramesInFlight + 2 + waterCaptureSamplers)},
+			{Type: vk.DescriptorTypeCombinedImageSampler, DescriptorCount: uint32(6*maxFramesInFlight + 2 + waterCaptureSamplers)},
 			// per slot: set1 + setBlit each bind the world UBO; +1 slack.
 			{Type: vk.DescriptorTypeUniformBuffer, DescriptorCount: uint32(2*maxFramesInFlight + 1)},
 		},
@@ -581,7 +591,15 @@ func (r *Renderer) worldCreateDescriptors() error {
 				imgW(sl.setWaterCapture, 1, wr.depthSampler, sl.preWaterDepth.view),
 			)
 		}
+		// uShadowCube0/1: this slot's real cube (when realShadows built it)
+		// or the always-present 1x1 dummy — either way, a legal binding.
+		shadow0, shadow1 := wr.dummyShadowCube.cubeView, wr.dummyShadowCube.cubeView
+		if wr.realShadows {
+			shadow0, shadow1 = sl.shadowCube[0].cubeView, sl.shadowCube[1].cubeView
+		}
 		writes = append(writes,
+			imgW(sl.set1, 0, wr.depthSampler, shadow0),
+			imgW(sl.set1, 1, wr.depthSampler, shadow1),
 			vk.WriteDescriptorSet{
 				SType:           vk.StructureTypeWriteDescriptorSet,
 				DstSet:          sl.set1,
@@ -629,16 +647,23 @@ func (r *Renderer) worldCreatePipelines() error {
 	blInfo := vk.PipelineLayoutCreateInfo{
 		SType:          vk.StructureTypePipelineLayoutCreateInfo,
 		SetLayoutCount: 2,
-		PSetLayouts:    []vk.DescriptorSetLayout{wr.dslBlit, wr.ambient.dslSample},
+		// Set 1 used to be worldambient.go's own ambient-term sample set;
+		// now worldresolve.go's resolved-image sample set (see its own doc
+		// comment) — the ambient term itself moved one hop further back,
+		// into worldresolve.frag's own combine, so worldblit.frag no longer
+		// samples it directly at all.
+		PSetLayouts: []vk.DescriptorSetLayout{wr.dslBlit, wr.resolve.dslSample},
 		// worldblit.frag PC (6 vec4 = 96B, well under the 128B
 		// maxPushConstantsSize floor): p0 exposure,bloomStrength,waterClock,
 		// near; p1 sinA,cosA,focal,far; p2 camX,camY,camZ,horizonY; p3
-		// w,h,ssrStrength,godrayStrength; p4 sharpenStrength,ditherStrength,
-		// unused,unused; p5 screenTint.rgb,amount. The dyn-light shadow
-		// march, SSAO, and god rays' own sun direction all moved to
-		// worldambient.go's own pass (sampled here via set 1 instead) — this
-		// used to stay at the old 8-vec4/128B shape with those slots left
-		// vestigial rather than repacked.
+		// w,h,ssrStrength,godrayStrength (p3.zw now worldresolve.frag's own —
+		// worldblit.frag itself only reads p3.xy); p4 sharpenStrength,
+		// ditherStrength,unused,unused; p5 screenTint.rgb,amount. The
+		// dyn-light shadow march, SSAO, and god rays' own sun direction
+		// moved to worldambient.go's own pass; SSR and the ambient
+		// combine/tonemap moved to worldresolve.go's — this used to stay at
+		// the old 8-vec4/128B shape with those slots left vestigial rather
+		// than repacked.
 		PushConstantRangeCount: 1,
 		PPushConstantRanges:    []vk.PushConstantRange{{StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit), Offset: 0, Size: 96}},
 	}

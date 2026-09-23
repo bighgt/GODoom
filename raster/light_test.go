@@ -104,29 +104,6 @@ func TestScaleLightMatchesPrBoom(t *testing.T) {
 	}
 }
 
-func TestZLightMatchesPrBoom(t *testing.T) {
-	// flatFactor: light level -> zlight row -> 0..1, matching drawFlatSpan.
-	flatFactor := func(light int16, depth float64) float64 {
-		return float64(lightRow(light)[distIdx(depth)]) / 256
-	}
-	// z index = depth/16; scale = (655360/(z+1))>>12; row = clamp(startmap - scale/2, 0, 31).
-	// light 160 -> lightnum 10 -> startmap 20.
-	for _, tc := range []struct {
-		depth   float64
-		wantRow int
-	}{
-		{16 * 4, 20 - ((655360/5)>>12)/2},   // z=4  scale=32 -> 20-16
-		{16 * 20, 20 - ((655360/21)>>12)/2}, // z=20 scale=7  -> 20-3
-		{16 * 200, 20},                      // z clamps to 127, scale=1 -> 20-0
-	} {
-		want := float64(colormapMul(tc.wantRow)) / 256
-		if got := flatFactor(160, tc.depth); got != want {
-			t.Errorf("flatFactor(160,%.0f)=%.4f, want row %d = %.4f",
-				tc.depth, got, tc.wantRow, want)
-		}
-	}
-}
-
 // Fake contrast direction: renderSeg subtracts fakeContrast from an E-W
 // wall's raw light and adds it to an N-S wall's, which after >>4 is
 // r_segs.c's lightnum-- / lightnum++ — N-S brighter, E-W dimmer.
@@ -185,53 +162,12 @@ func TestShadeHalvesAndKeepsAlpha(t *testing.T) {
 	}
 }
 
-// spriteShade must read the exact same scalelight table the walls do, so a
-// monster or item shades identically to the wall it stands against at the
-// same sector light and depth (id's R_ProjectSprite:
-// spritelights = scalelight[lightlevel>>LIGHTSEGSHIFT], no fake contrast).
-func TestSpriteShadeMatchesWalls(t *testing.T) {
-	for _, light := range []int16{16, 96, 160, 224, 255} {
-		for _, depth := range []float64{8, 64, 300, 2000} {
-			if got, want := spriteShade(light, depth, false), shadeMul(light, depth); got != want {
-				t.Errorf("spriteShade(%d,%.0f)=%d, want shadeMul=%d", light, depth, got, want)
-			}
-		}
-	}
-}
-
-func TestSpriteShadeFullBrightBypasses(t *testing.T) {
-	// A dark, distant fullbright sprite (a lit powerup, a projectile) is not
-	// dimmed at all.
-	if got := spriteShade(0, 4000, true); got != 256 {
-		t.Errorf("spriteShade(fullBright)=%d, want 256", got)
-	}
-}
-
-func TestSpriteShadeMonotonic(t *testing.T) {
-	// Darker sector -> darker sprite, at a fixed distance.
-	prev := uint32(0)
-	for l := int16(0); l <= 255; l += 15 {
-		m := spriteShade(l, 300, false)
-		if l > 0 && m < prev {
-			t.Fatalf("spriteShade not monotonic in light: %d then %d", prev, m)
-		}
-		prev = m
-	}
-	// Further away -> never brighter, at a fixed sector light.
-	prev = 300
-	for d := 1.0; d <= 4000; d += 40 {
-		m := spriteShade(160, d, false)
-		if m > prev {
-			t.Fatalf("spriteShade brightened with distance at depth %.0f: %d > %d", d, m, prev)
-		}
-		prev = m
-	}
-}
-
 // pspriteShade is the bright ("point blank") end of a sector's scalelight —
 // id shades the held weapon with spritelights[MAXLIGHTSCALE-1] — so it's
 // never darker than a world sprite of the same sector light at any positive
-// depth, tracks the room's brightness, and a muzzle-flash frame bypasses it.
+// depth (shadeMul at that depth — a world sprite reads the identical
+// scalelight table pspriteShade does, per id's R_ProjectSprite), tracks the
+// room's brightness, and a muzzle-flash frame bypasses it.
 func TestPspriteShade(t *testing.T) {
 	if got := pspriteShade(120, true); got != 256 {
 		t.Errorf("pspriteShade(fullBright)=%d, want 256", got)
@@ -240,44 +176,15 @@ func TestPspriteShade(t *testing.T) {
 		t.Error("pspriteShade did not brighten with a brighter sector")
 	}
 	for _, d := range []float64{1, 50, 300, 3000} {
-		if pspriteShade(128, false) < spriteShade(128, d, false) {
+		if pspriteShade(128, false) < shadeMul(128, d) {
 			t.Errorf("pspriteShade dimmer than a world sprite at depth %.0f", d)
 		}
 	}
 }
 
-// BuildLightLUT + the exported column helpers must reproduce the exact
-// values the software path's shadeMul / lightRow+distIdx return, so a
-// hardware renderer that uploads the LUT and indexes it the same way shades
-// identically.
-func TestLightLUTMatchesSoftwarePath(t *testing.T) {
-	lut := BuildLightLUT()
-	if lut.Levels != lightLevels || lut.ScaleCols != maxLightScale || lut.ZCols != maxLightZ {
-		t.Fatalf("LUT dims %+v", lut)
-	}
-	if len(lut.Scale) != lut.Levels*lut.ScaleCols || len(lut.Z) != lut.Levels*lut.ZCols {
-		t.Fatalf("LUT slice sizes wrong: scale=%d z=%d", len(lut.Scale), len(lut.Z))
-	}
-
-	for _, sl := range []int16{0, 15, 31, 80, 128, 160, 200, 255} {
-		row := lightnumOf(sl)
-		if row < 0 || row >= lut.Levels {
-			t.Fatalf("lightnumOf(%d) = %d", sl, row)
-		}
-		zrow := lightRow(sl)
-		for _, depth := range []float64{0, 1, 8, 32, 64, 200, 640, 4000, -5} {
-			// Wall / sprite path.
-			sc := scaleLightCol(depth)
-			if got, want := lut.Scale[row*lut.ScaleCols+sc], uint16(shadeMul(sl, depth)); got != want {
-				t.Errorf("scale sl=%d depth=%.0f: LUT %d != shadeMul %d", sl, depth, got, want)
-			}
-			// Flat path.
-			zc := distIdx(depth)
-			if got, want := lut.Z[row*lut.ZCols+zc], zrow[distIdx(depth)]; got != want {
-				t.Errorf("z sl=%d depth=%.0f: LUT %d != zlight %d", sl, depth, got, want)
-			}
-		}
-	}
+// LightScaleRef/LightScaleValue are the hardware renderer's own read-back of
+// this package's wall-shading reference/state.
+func TestLightScaleExports(t *testing.T) {
 	if LightScaleRef != wallScaleRef || LightScaleValue() != lightScale {
 		t.Error("exported LightScaleRef / LightScaleValue don't match the package values")
 	}

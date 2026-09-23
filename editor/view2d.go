@@ -1,8 +1,10 @@
 package editor
 
 import (
+	"fmt"
 	"image/color"
 	"math"
+	"time"
 
 	"twopointfive/bsp"
 	"twopointfive/imkit"
@@ -48,6 +50,13 @@ type view2d struct {
 	// draw tool: grid-snapped world points placed so far
 	draft []wad.Vertex
 
+	// draggingVert is the vertex index currently being dragged in
+	// modeVerts, or -1 when nothing is being dragged — see handleVertexDrag.
+	draggingVert int
+	// draggingThing is handleVertexDrag's counterpart for modeThings — see
+	// handleThingDrag.
+	draggingThing int
+
 	// onPick is called when the user selects an element — the app moves the
 	// 3D camera to (x, y, floorZ).
 	onPick func(x, y, floorZ float64)
@@ -60,6 +69,8 @@ func (v *view2d) init(d *Doc) {
 	v.tool = toolSelect
 	v.framed = false // draw() frames on the first frame, once rect is known
 	v.draft = v.draft[:0]
+	v.draggingVert = -1
+	v.draggingThing = -1
 }
 
 // frameMap centres and (once the pane rect is known) zooms so the whole map
@@ -109,7 +120,7 @@ func (v *view2d) snap(d *Doc, wx, wy float64) (int, int) {
 	return int(math.Round(wx/g) * g), int(math.Round(wy/g) * g)
 }
 
-func (v *view2d) draw(ui *imkit.UI, area imkit.Rect, d *Doc, bank *Bank, pnl *panelState) {
+func (v *view2d) draw(ui *imkit.UI, area imkit.Rect, d *Doc, bank *Bank, pnl *panelState, camX, camY, camAngle float64) {
 	v.rect = area
 	if !v.framed {
 		v.frameMap(d)
@@ -121,11 +132,12 @@ func (v *view2d) draw(ui *imkit.UI, area imkit.Rect, d *Doc, bank *Bank, pnl *pa
 
 	over := ui.MouseIn(area)
 	v.handleNav(ui, area, over)
-	v.handleKeys(ui)
+	v.handleKeys(ui, d)
 
 	v.drawGrid(c, area)
 	v.drawGeometry(c, d)
 	v.drawThings(c, d)
+	v.drawCameraMarker(c, camX, camY, camAngle)
 	v.drawDropHover(ui, d, bank, over)
 	if v.tool == toolDraw {
 		v.drawDraftAndPlace(ui, d, bank, pnl, over)
@@ -134,6 +146,16 @@ func (v *view2d) draw(ui *imkit.UI, area imkit.Rect, d *Doc, bank *Bank, pnl *pa
 	}
 	v.handleDrop(ui, d, bank, pnl)
 	v.drawToolbar(ui, area)
+	v.drawHintBar(ui, area)
+}
+
+// drawHintBar shows the current mode/grid plus a key-binding summary along
+// the bottom edge — the 2D pane's counterpart to view3d's own status line,
+// which this used to have no equivalent of at all.
+func (v *view2d) drawHintBar(ui *imkit.UI, area imkit.Rect) {
+	hint := fmt.Sprintf("Mode: %s (1-4)   G draw   [ ] grid: %d   Del delete   drag vertex/thing to move   MMB pan   wheel zoom",
+		v.mode, v.grid)
+	ui.C.Text(area.X+6, area.Y+area.H-10, hint, imkit.Theme.TextDim)
 }
 
 // ---- navigation --------------------------------------------------------
@@ -160,7 +182,7 @@ func (v *view2d) handleNav(ui *imkit.UI, area imkit.Rect, over bool) {
 	}
 }
 
-func (v *view2d) handleKeys(ui *imkit.UI) {
+func (v *view2d) handleKeys(ui *imkit.UI, d *Doc) {
 	if ui.In.Edge(imkit.Key1) {
 		v.mode = modeVerts
 	}
@@ -189,11 +211,20 @@ func (v *view2d) handleKeys(ui *imkit.UI) {
 	if ui.In.Edge(imkit.KeyEscape) {
 		v.draft = v.draft[:0]
 	}
+	if ui.In.Edge(imkit.KeyDelete) {
+		d.DeleteSelection()
+	}
 }
 
 // ---- selection -------------------------------------------------------
 
 func (v *view2d) handleSelect(ui *imkit.UI, d *Doc) {
+	if v.mode == modeVerts && v.handleVertexDrag(ui, d) {
+		return
+	}
+	if v.mode == modeThings && v.handleThingDrag(ui, d) {
+		return
+	}
 	if !ui.In.LeftClicked || int(ui.In.MouseY) < v.rect.Y+34 {
 		return // no click, or the click is on the toolbar strip
 	}
@@ -219,6 +250,62 @@ func (v *view2d) handleSelect(ui *imkit.UI, d *Doc) {
 			v.onPick(x, y, z)
 		}
 	}
+}
+
+// handleVertexDrag drags the vertex under the cursor for as long as the
+// left button stays down, snapping to the grid (or a nearby vertex) the
+// same way the draw tool's own placement does. Returns true if it consumed
+// this frame's input (either starting/continuing a drag, or ending one),
+// so handleSelect's own click-to-select doesn't also fire on the same
+// click.
+func (v *view2d) handleVertexDrag(ui *imkit.UI, d *Doc) bool {
+	if v.draggingVert >= 0 {
+		if ui.In.LeftDown {
+			wx, wy := v.s2w(ui.In.MouseX, ui.In.MouseY)
+			sx, sy := v.snap(d, wx, wy)
+			d.MoveVertex(v.draggingVert, int16(sx), int16(sy))
+			return true
+		}
+		v.draggingVert = -1
+		return true
+	}
+	if !ui.In.LeftClicked || int(ui.In.MouseY) < v.rect.Y+34 {
+		return false
+	}
+	wx, wy := v.s2w(ui.In.MouseX, ui.In.MouseY)
+	idx := v.nearestVert(d, wx, wy, 8)
+	if idx < 0 {
+		return false
+	}
+	v.draggingVert = idx
+	d.Sel.selectOne(modeVerts, idx)
+	return true
+}
+
+// handleThingDrag is handleVertexDrag's counterpart for a placed Thing —
+// same grid-snapped drag-while-held shape, moving it via Doc.MoveThing.
+func (v *view2d) handleThingDrag(ui *imkit.UI, d *Doc) bool {
+	if v.draggingThing >= 0 {
+		if ui.In.LeftDown {
+			wx, wy := v.s2w(ui.In.MouseX, ui.In.MouseY)
+			sx, sy := v.snap(d, wx, wy)
+			d.MoveThing(v.draggingThing, int16(sx), int16(sy))
+			return true
+		}
+		v.draggingThing = -1
+		return true
+	}
+	if !ui.In.LeftClicked || int(ui.In.MouseY) < v.rect.Y+34 {
+		return false
+	}
+	wx, wy := v.s2w(ui.In.MouseX, ui.In.MouseY)
+	idx := v.nearestThing(d, wx, wy, 12)
+	if idx < 0 {
+		return false
+	}
+	v.draggingThing = idx
+	d.Sel.selectOne(modeThings, idx)
+	return true
 }
 
 func (v *view2d) nearestVert(d *Doc, wx, wy float64, pxTol float64) int {
@@ -309,7 +396,7 @@ func (v *view2d) handleDrop(ui *imkit.UI, d *Doc, bank *Bank, pnl *panelState) {
 	case texPayload:
 		if p.flat {
 			if si := bsp.PointSectorIndex(d.tree, d.RenderLevel(), float32(wx), float32(wy)); si >= 0 {
-				d.SetSectorFlat(si, p.name, false)
+				d.SetSectorFlat(si, p.name, p.ceil)
 				d.Sel.selectOne(modeSectors, si)
 			}
 		} else if li := v.nearestLine(d, wx, wy, 12); li >= 0 {
@@ -449,6 +536,7 @@ var (
 	colDraw     = color.RGBA{0xf0, 0xd0, 0x50, 0xff}
 	colGrid     = color.RGBA{0x2b, 0x2b, 0x36, 0xff}
 	colAxis     = color.RGBA{0x50, 0x50, 0x60, 0xff}
+	colCamera   = color.RGBA{0xff, 0x20, 0xc0, 0xff} // bright pink — see drawCameraMarker
 )
 
 func (v *view2d) drawGrid(c *imkit.Canvas, area imkit.Rect) {
@@ -553,23 +641,50 @@ func (v *view2d) drawThings(c *imkit.Canvas, d *Doc) {
 	}
 }
 
+// drawCameraMarker draws a bright pink blinking dot at the 3D view's
+// current camera position, with a short facing tick — so it's always
+// obvious where you are (and which way you're looking) in the level while
+// flying around the 3D view, the same idea as a level editor's own
+// "camera thing" marker. Blinks via a plain wall-clock toggle (visible for
+// 300ms, hidden for 300ms) — purely cosmetic, so there's no need to plumb
+// a shared level-time clock through just for this.
+func (v *view2d) drawCameraMarker(c *imkit.Canvas, camX, camY, camAngle float64) {
+	if time.Now().UnixMilli()/300%2 != 0 {
+		return
+	}
+	x, y := v.w2s(camX, camY)
+	const sz = 10
+	c.FillRect(imkit.Rect{X: x - sz/2, Y: y - sz/2, W: sz, H: sz}, colCamera)
+	c.StrokeRect(imkit.Rect{X: x - sz/2, Y: y - sz/2, W: sz, H: sz}, color.RGBA{0, 0, 0, 255}, 1)
+	c.Line(x, y, x+int(16*math.Cos(camAngle)), y-int(16*math.Sin(camAngle)), colCamera)
+}
+
 func (v *view2d) drawToolbar(ui *imkit.UI, area imkit.Rect) {
 	x := area.X + 6
 	for _, md := range []struct {
-		g string
-		m editMode
-	}{{"V", modeVerts}, {"L", modeLines}, {"S", modeSectors}, {"T", modeThings}} {
-		if ui.IconButton(imkit.Rect{X: x, Y: area.Y + 6, W: 26, H: 22}, md.g, v.mode == md.m && v.tool == toolSelect) {
+		g, hint string
+		m       editMode
+	}{
+		{"V", "Vertex mode: select and drag vertices", modeVerts},
+		{"L", "Linedef mode: select walls, assign textures/flags", modeLines},
+		{"S", "Sector mode: select floors/ceilings, assign flats/heights", modeSectors},
+		{"T", "Thing mode: place, move, and delete monsters/items/decorations", modeThings},
+	} {
+		btn := imkit.Rect{X: x, Y: area.Y + 6, W: 26, H: 22}
+		if ui.IconButton(btn, md.g, v.mode == md.m && v.tool == toolSelect) {
 			v.mode, v.tool = md.m, toolSelect
 		}
+		ui.Tooltip(btn, md.hint)
 		x += 28
 	}
 	x += 10
-	if ui.IconButton(imkit.Rect{X: x, Y: area.Y + 6, W: 40, H: 22}, "DRAW", v.tool == toolDraw) {
+	drawBtn := imkit.Rect{X: x, Y: area.Y + 6, W: 40, H: 22}
+	if ui.IconButton(drawBtn, "DRAW", v.tool == toolDraw) {
 		if v.tool == toolDraw {
 			v.tool, v.draft = toolSelect, v.draft[:0]
 		} else {
 			v.tool = toolDraw
 		}
 	}
+	ui.Tooltip(drawBtn, "Draw a new room: click to place corners, click back near the first point to close it")
 }

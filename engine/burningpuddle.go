@@ -4,6 +4,7 @@ import (
 	"math"
 
 	"twopointfive/assets"
+	"twopointfive/render"
 	"twopointfive/render/worldgeo"
 )
 
@@ -49,6 +50,19 @@ type burningPuddle struct {
 	// spawn (see collectGroundSplats) so its floor decal doesn't visibly
 	// spin as it burns down — only its size/alpha should change over time.
 	decalRot float64
+	// seed is this splatter's own flickerWobble phase (maplights.go) for
+	// puddleLight — drawn independently per splatter so several burning
+	// side by side flicker out of sync with each other instead of pulsing
+	// in unison, which would read as one synchronized light rather than
+	// several independent restless flames.
+	seed int
+	// cluster is how many of this barrel's OTHER splatters landed within
+	// puddleClusterRadius of this one, capped at puddleClusterMax — fixed
+	// once at spawn (see spawnBurningPuddle). A tightly packed group of
+	// splatters gradually reads as one bigger combined flame instead of a
+	// handful of separate small ones, and burns out faster than an
+	// isolated splatter would — see puddleClusterFactor.
+	cluster int
 }
 
 // burningPuddleIgnitionDelayMin/Max: how long spilled liquid sits before it
@@ -92,6 +106,24 @@ const (
 	burningSplatterThrowRadius = 90.0
 )
 
+// puddleClusterRadius/Max: how close two of one barrel's splatters have to
+// land to count as clustered, and the cap on how many neighbors contribute
+// — a splash that happens to throw a dozen splatters into the same tight
+// corner shouldn't scale forever, just noticeably more than a couple.
+// puddleClusterBurnSpeedup shortens a clustered splatter's own duration
+// (see spawnBurningPuddle) — several small fires fused together burn
+// through their combined fuel faster than any one of them would alone.
+// puddleClusterSizeBonus/RampSeconds are puddleClusterFactor's own size/
+// light growth curve — see its doc comment for why this ramps in over
+// time rather than applying instantly.
+const (
+	puddleClusterRadius      = 34.0
+	puddleClusterMax         = 8
+	puddleClusterBurnSpeedup = 0.12
+	puddleClusterSizeBonus   = 0.18
+	puddleClusterRampSeconds = 1.4
+)
+
 // spawnBurningPuddle scatters a barrel's spilled liquid across the floor
 // around the blast as several separate splatters, each landing at its own
 // random distance/direction and burning independently (its own random
@@ -110,20 +142,69 @@ const (
 // governing every other particle effect in the game.
 func (g *Game) spawnBurningPuddle(x, y, z float64) {
 	n := burningSplatterMin + pRandom()%(burningSplatterMax-burningSplatterMin+1)
-	for i := 0; i < n; i++ {
+	// Landing spots are picked first, all of them, before any burningPuddle
+	// is created — clustering (see puddleClusterRadius) needs every other
+	// splatter's final position to count nearby neighbors, which isn't
+	// available yet mid-loop if puddles were appended one at a time.
+	type spot struct{ x, y, z, amount float64 }
+	spots := make([]spot, n)
+	for i := range spots {
 		ang := pRandomF01() * 2 * math.Pi
 		dist := math.Sqrt(pRandomF01()) * burningSplatterThrowRadius
 		sx, sy := x+math.Cos(ang)*dist, y+math.Sin(ang)*dist
 		sz, _ := g.sectorFloorCeil(sx, sy) // each splatter sits on its OWN floor height, not the blast's
-		amount := pRandomF01()
-		duration := burningPuddleMinDuration + amount*(burningPuddleMaxDuration-burningPuddleMinDuration)
+		spots[i] = spot{sx, sy, sz, pRandomF01()}
+	}
+	for i := range spots {
+		cluster := 0
+		for j := range spots {
+			if i == j {
+				continue
+			}
+			dx, dy := spots[i].x-spots[j].x, spots[i].y-spots[j].y
+			if dx*dx+dy*dy <= puddleClusterRadius*puddleClusterRadius {
+				cluster++
+			}
+		}
+		if cluster > puddleClusterMax {
+			cluster = puddleClusterMax
+		}
+		amount := spots[i].amount
+		// Clustered splatters burn faster together than any one of them
+		// would alone — see puddleClusterBurnSpeedup's own doc comment.
+		duration := (burningPuddleMinDuration + amount*(burningPuddleMaxDuration-burningPuddleMinDuration)) /
+			(1 + puddleClusterBurnSpeedup*float64(cluster))
 		g.burningPuddles = append(g.burningPuddles, &burningPuddle{
-			x: sx, y: sy, z: sz,
+			x: spots[i].x, y: spots[i].y, z: spots[i].z,
 			amount: amount, duration: duration, remaining: duration,
 			ignitionDelay: randRange(burningPuddleIgnitionDelayMin, burningPuddleIgnitionDelayMax),
 			decalRot:      pRandomF01() * 2 * math.Pi,
+			seed:          pRandom(),
+			cluster:       cluster,
 		})
 	}
+}
+
+// puddleClusterFactor is the size/light growth multiplier a clustered
+// splatter has grown into at this moment — 1 (no change) for an isolated
+// splatter (cluster == 0), ramping from 1 up to
+// 1+puddleClusterSizeBonus*cluster over puddleClusterRampSeconds of actual
+// burning (not real time — ignitionDelay doesn't count). Ramped rather
+// than applied instantly so a tight group of splatters visibly grows
+// together into one bigger flame over its first second or so, rather than
+// snapping to full size the instant it ignites.
+func puddleClusterFactor(p *burningPuddle) float64 {
+	if p.cluster == 0 {
+		return 1
+	}
+	elapsed := p.duration - p.remaining
+	ramp := elapsed / puddleClusterRampSeconds
+	if ramp > 1 {
+		ramp = 1
+	} else if ramp < 0 {
+		ramp = 0
+	}
+	return 1 + puddleClusterSizeBonus*float64(p.cluster)*ramp
 }
 
 // updateBurningPuddles waits out every live puddle's ignitionDelay, then
@@ -193,11 +274,20 @@ func (g *Game) updatePuddleEmission(p *burningPuddle, dt float64) {
 	fade := puddleFade(p)
 	slow := 1 + (puddleDyingIntervalMul-1)*(1-fade)
 	if frames := loadFireFrames(); len(frames) > 0 {
-		interval := (puddleFlameIntervalMax - p.amount*(puddleFlameIntervalMax-puddleFlameIntervalMin)) * slow
+		// Divided by puddleClusterFactor: a clustered group of splatters
+		// spawns flame licks faster as it grows into one bigger combined
+		// fire (see puddleClusterFactor), reading as denser/thicker rather
+		// than just each individual lick growing larger.
+		interval := (puddleFlameIntervalMax - p.amount*(puddleFlameIntervalMax-puddleFlameIntervalMin)) * slow / puddleClusterFactor(p)
 		drainSpawnTimer(&p.flameTimer, dt, interval, func() { g.spawnPuddleFlame(p, frames, fade) })
 	}
 	if frames := loadToxicSmokeFrames(); len(frames) > 0 {
-		interval := (puddleSmokeIntervalMax - p.amount*(puddleSmokeIntervalMax-puddleSmokeIntervalMin)) * slow
+		// *puddleSmokeClusterSize: each firing now spawns a whole cluster
+		// (see spawnPuddleSmoke) instead of one particle, so the interval
+		// between firings widens by the same factor — puffs arrive in
+		// small clumps rather than trickling in one at a time, but the
+		// overall particle budget/rate is unchanged.
+		interval := (puddleSmokeIntervalMax - p.amount*(puddleSmokeIntervalMax-puddleSmokeIntervalMin)) * slow * puddleSmokeClusterSize
 		drainSpawnTimer(&p.smokeTimer, dt, interval, func() { g.spawnPuddleSmoke(p, frames, fade) })
 	}
 }
@@ -231,13 +321,31 @@ func puddleSamplePoint(p *burningPuddle, radiusScale float64) (x, y float64) {
 // texture shape already reaches upward on its own (a tall, tapering
 // silhouette anchored at the base, not a centred blob), so the particle
 // itself doesn't need to travel far to read as "rising."
+//
+// puddleFlameSwaySpeedMax/puddleFlameFrameRateJitter/puddleFlameLightJitter
+// are what actually make the result read as fire rather than a column of
+// identical billboards rising in lockstep: real flame licks don't travel
+// straight up, they lean and flicker independently of their neighbors.
+// Each lick gets its own small random horizontal drift direction/speed
+// (sway), its own animation speed within a range (jitter, so overlapping
+// licks don't pulse in sync), and its own brightness offset (also jitter)
+// so the flicker has real per-lick variation, not one uniform pulse.
 const (
-	puddleFlameLifeMin = 0.35
-	puddleFlameLifeMax = 0.6
-	puddleFlameSizeMin = 2.2
-	puddleFlameSizeMax = 3.8
-	puddleFlameRise    = 14.0
-	puddleFlameGravity = -18.0
+	puddleFlameLifeMin      = 0.35
+	puddleFlameLifeMax      = 0.6
+	puddleFlameSizeMin      = 2.2
+	puddleFlameSizeMax      = 3.8
+	puddleFlameRise         = 14.0
+	puddleFlameGravity      = -18.0
+	puddleFlameSwaySpeedMax = 18.0
+	// puddleFlameFrameRateJitterMin/Max and puddleFlameLightJitterMin/Max
+	// are deliberately wide (each lick's animation speed varies up to
+	// ±45%, brightness up to ±35%) — a real open flame's flicker is
+	// noticeably erratic, not a gentle shimmer.
+	puddleFlameFrameRateJitterMin = 0.6
+	puddleFlameFrameRateJitterMax = 1.5
+	puddleFlameLightJitterMin     = 0.65
+	puddleFlameLightJitterMax     = 1.35
 )
 
 func (g *Game) spawnPuddleFlame(p *burningPuddle, frames []*assets.RGBA, fade float64) {
@@ -247,15 +355,22 @@ func (g *Game) spawnPuddleFlame(p *burningPuddle, frames []*assets.RGBA, fade fl
 	// original, now-shrunk extent.
 	x, y := puddleSamplePoint(p, 0.4+0.6*fade)
 	sizeFade := 0.5 + 0.5*fade
+	// clusterMul grows a tightly packed group of splatters into one bigger
+	// combined flame over time — see puddleClusterFactor's own doc comment.
+	clusterMul := puddleClusterFactor(p)
+	swayAng := pRandomF01() * 2 * math.Pi
+	swaySpeed := pRandomF01() * puddleFlameSwaySpeedMax
 	fp := &Particle{
 		X: x, Y: y, Z: p.z,
+		DX:            math.Cos(swayAng) * swaySpeed,
+		DY:            math.Sin(swayAng) * swaySpeed,
 		DZ:            puddleFlameRise * (0.5 + 0.5*pRandomF01()),
 		life:          randRange(puddleFlameLifeMin, puddleFlameLifeMax),
-		sizeMul:       randRange(puddleFlameSizeMin, puddleFlameSizeMax) * sizeFade,
+		sizeMul:       randRange(puddleFlameSizeMin, puddleFlameSizeMax) * sizeFade * clusterMul,
 		framePhase:    pRandom(),
-		frameRate:     fireFrameRate,
+		frameRate:     fireFrameRate * randRange(puddleFlameFrameRateJitterMin, puddleFlameFrameRateJitterMax),
 		gravity:       puddleFlameGravity,
-		light:         fireLight,
+		light:         fireLight * randRange(puddleFlameLightJitterMin, puddleFlameLightJitterMax),
 		translucent:   true,
 		alpha0:        fireAlpha0,
 		hold:          fireHoldFrac,
@@ -327,6 +442,21 @@ const (
 	// would otherwise make freshly-spawned puffs take noticeably longer to
 	// reach full size than they used to.
 	puddleSmokeGrowFrac = 0.12
+	// puddleSmokeClusterSize/Jitter/ZJitter: each spawn event throws this
+	// many particles instead of one, each offset by its own small random
+	// (x, y, z) jitter around the same anchor point — a single billboard
+	// always reads as a flat 2D card no matter how it's positioned (that's
+	// just what one camera-facing quad looks like), but several overlapping
+	// ones sitting at genuinely different depths parallax against each
+	// other as the camera moves and blend together into something that
+	// reads as an actual volume of smoke rather than one obviously flat
+	// sprite. The spawn interval (see updatePuddleEmission) is scaled up by
+	// this same cluster size so the overall particle budget/rate is
+	// unchanged — puffs arrive in small clumps instead of trickling in one
+	// at a time, not more often overall.
+	puddleSmokeClusterSize    = 3
+	puddleSmokeClusterJitter  = 7.0
+	puddleSmokeClusterZJitter = 10.0
 )
 
 func (g *Game) spawnPuddleSmoke(p *burningPuddle, frames []*assets.RGBA, fade float64) {
@@ -342,25 +472,35 @@ func (g *Game) spawnPuddleSmoke(p *burningPuddle, frames []*assets.RGBA, fade fl
 		x, y = puddleSamplePoint(p, 0.6)
 		baseZ = p.z
 	}
-	dx, dy := yawSpeedXYAt(pRandomF01()*2*math.Pi, 4)
 	sizeFade := 0.5 + 0.5*fade
-	g.particles = append(g.particles, &Particle{
-		X: x, Y: y, Z: baseZ + puddleSmokeSpawnLift,
-		DX: dx, DY: dy,
-		DZ:            puddleSmokeRise * (0.5 + 0.5*pRandomF01()),
-		life:          randRange(puddleSmokeLifeMin, puddleSmokeLifeMax),
-		sizeMul:       randRange(puddleSmokeSizeMin, puddleSmokeSizeMax) * sizeFade,
-		framePhase:    pRandom(),
-		frameRate:     smokeFrameRate,
-		gravity:       puddleSmokeGravity,
-		light:         puddleSmokeLight,
-		translucent:   true,
-		alpha0:        puddleSmokeAlpha0,
-		hold:          puddleSmokeHold,
-		growFrac:      puddleSmokeGrowFrac,
-		clearBrighten: puddleSmokeBrighten,
-		frames:        frames,
-	})
+	// A cluster of jittered particles, not one — see
+	// puddleSmokeClusterSize's own doc comment for why: several billboards
+	// at slightly different (x, y, z) offsets read as an actual volume of
+	// smoke, where a single one always reads as a flat card.
+	for i := 0; i < puddleSmokeClusterSize; i++ {
+		jang := pRandomF01() * 2 * math.Pi
+		jr := pRandomF01() * puddleSmokeClusterJitter
+		jx, jy := math.Cos(jang)*jr, math.Sin(jang)*jr
+		jz := (pRandomF01() - 0.5) * puddleSmokeClusterZJitter
+		dx, dy := yawSpeedXYAt(pRandomF01()*2*math.Pi, 4)
+		g.particles = append(g.particles, &Particle{
+			X: x + jx, Y: y + jy, Z: baseZ + puddleSmokeSpawnLift + jz,
+			DX: dx, DY: dy,
+			DZ:            puddleSmokeRise * (0.5 + 0.5*pRandomF01()),
+			life:          randRange(puddleSmokeLifeMin, puddleSmokeLifeMax),
+			sizeMul:       randRange(puddleSmokeSizeMin, puddleSmokeSizeMax) * sizeFade,
+			framePhase:    pRandom(),
+			frameRate:     smokeFrameRate,
+			gravity:       puddleSmokeGravity,
+			light:         puddleSmokeLight,
+			translucent:   true,
+			alpha0:        puddleSmokeAlpha0,
+			hold:          puddleSmokeHold,
+			growFrac:      puddleSmokeGrowFrac,
+			clearBrighten: puddleSmokeBrighten,
+			frames:        frames,
+		})
+	}
 }
 
 // Ground puddle decal: a flat, sickly-green liquid pool the fire visibly
@@ -400,4 +540,69 @@ func (g *Game) collectGroundSplats() []worldgeo.GroundSplat {
 	}
 	g.hwGroundSplats = out
 	return out
+}
+
+// puddleLightR/G/B: a warm orange flame glow, the same warm palette
+// lava's own static light uses (liquidlights.go) since this is the same
+// kind of hot open fire. puddleLightBaseIntensity/BaseRadius are the
+// values at amount=1 (a big spill); puddleLight scales both down for a
+// thinner splatter and fades them out entirely as the puddle burns down
+// (puddleFade), so the light goes out together with the flame it's
+// attached to rather than lingering after the flame is visibly gone.
+// puddleLightHeight lifts it above the floor to roughly where the flame
+// licks themselves reach, not down at ground level.
+const (
+	puddleLightR             = 1.0
+	puddleLightG             = 0.45
+	puddleLightB             = 0.12
+	puddleLightBaseIntensity = 0.9
+	puddleLightBaseRadius    = 110.0
+	puddleLightHeight        = 20.0
+	// puddleLightCullDist skips computing a splatter's light at all once
+	// it's too far from the camera to plausibly matter — a single barrel
+	// can leave up to burningSplatterMax (36) of these burning at once, so
+	// this keeps a big multi-barrel level from scoring dozens of
+	// far-away, functionally invisible lights every frame.
+	puddleLightCullDist = 900.0
+	// puddleLightFlickerBoost exaggerates flickerWobble's own swing just
+	// for this light — the shared helper's stock 0.80..1.06 range (tuned
+	// for a steady torch/lava glow) reads as too gentle for an open,
+	// restless barrel fire; doubling the swing around the same centre
+	// makes it noticeably more erratic without touching flickerWobble
+	// itself (which every other flame/lava light in the game still uses
+	// unboosted).
+	puddleLightFlickerBoost = 2.0
+)
+
+// puddleLight returns the flickering point light one burning puddle casts,
+// or ok=false while it's still waiting to ignite or has burned down too
+// far to matter. Reuses maplights.go's own flickerWobble — the same
+// restless per-tic wobble a torch or lava's static light gets — so a
+// barrel fire's glow looks like it belongs to the same family of flame
+// light already established elsewhere in the engine, just for a dynamic
+// (spawned at runtime, not baked into g.staticLights) emitter instead of a
+// map-fixed one, with its own extra flicker boost (puddleLightFlickerBoost)
+// and cluster growth (puddleClusterFactor) layered on top. p.seed keeps
+// several puddles burning near each other flickering independently rather
+// than in unison.
+func (g *Game) puddleLight(p *burningPuddle) (render.Light, bool) {
+	if p.ignitionDelay > 0 {
+		return render.Light{}, false
+	}
+	fade := puddleFade(p)
+	if fade <= 0.05 {
+		return render.Light{}, false
+	}
+	w := flickerWobble(p.seed, g.levelTime)
+	w = 0.93 + (w-0.93)*puddleLightFlickerBoost
+	cluster := float32(puddleClusterFactor(p))
+	inten := puddleLightBaseIntensity * float32(0.4+0.6*p.amount) * float32(fade) * w * cluster
+	radius := puddleLightBaseRadius * float32(0.5+0.5*p.amount) * float32(0.7+0.3*fade) * (0.95 + 0.05*w) * cluster
+	if inten <= 0.02 || radius <= 1 {
+		return render.Light{}, false
+	}
+	return render.Light{
+		X: float32(p.x), Y: float32(p.y), Z: float32(p.z) + puddleLightHeight,
+		Radius: radius, R: puddleLightR, G: puddleLightG, B: puddleLightB, Intensity: inten,
+	}, true
 }

@@ -44,6 +44,11 @@ type view3d struct {
 	// sprites is reused across frames (thingSprites resets it with [:0])
 	// to avoid reallocating a Things billboard list every frame.
 	sprites []worldgeo.Sprite
+
+	// draggingThing is the Things index currently being dragged, or -1 —
+	// view2d's handleThingDrag has the same shape, just projected onto the
+	// floor plane by a screen-ray instead of the 2D view's own s2w.
+	draggingThing int
 }
 
 // glide eases the camera from a start pose to a target pose over dur
@@ -57,6 +62,7 @@ type glide struct {
 func (v *view3d) init(bank *Bank) {
 	v.bank = bank
 	v.cam = raster.Camera{Z: 48, FOVDeg: 90}
+	v.draggingThing = -1
 }
 
 // reset forces the camera to re-place itself on the next draw (map switch).
@@ -132,6 +138,13 @@ func (v *view3d) draw(ui *imkit.UI, area imkit.Rect, d *Doc, dt float64) {
 
 	if v.builder == nil || v.builtFor != d.tree {
 		v.builder = worldgeo.New(d.RenderLevel(), d.tree, v.bank.Tex)
+		// Room-over-room links (Doc.AddExtraFloor) aren't part of the BSP
+		// tree itself, so they need their own install here — this only
+		// runs when the builder is freshly (re)constructed anyway (after
+		// any edit that called markDirty, extra-floor changes included),
+		// matching SetExtraFloors' own doc comment on when it's meant to
+		// be called (it invalidates the cached mesh, so not every frame).
+		v.builder.SetExtraFloors(d.extraFloorMap())
 		v.builtFor = d.tree
 	}
 	v.geom = v.builder.Build(float32(v.cam.X), float32(v.cam.Y))
@@ -155,12 +168,15 @@ func (v *view3d) draw(ui *imkit.UI, area imkit.Rect, d *Doc, dt float64) {
 		v.drawDropHover(ui, area, d)
 		v.handleDrop(ui, area, d)
 	}
+	if focused && ui.In.Edge(imkit.KeyDelete) {
+		d.DeleteSelection()
+	}
 
 	cx, cy := area.X+area.W/2, area.Y+area.H/2
 	c.Line(cx-5, cy, cx+5, cy, imkit.Theme.Accent)
 	c.Line(cx, cy-5, cx, cy+5, imkit.Theme.Accent)
 	c.Text(area.X+6, area.Y+area.H-10,
-		"RMB-drag look   WASD move   Q/E down/up   Shift fast   LMB/drag-texture select wall", imkit.Theme.TextDim)
+		"RMB-drag look   WASD move   Q/E down/up   Shift fast   LMB select/drag wall or thing   Del delete", imkit.Theme.TextDim)
 }
 
 // ---- wall picking (ray cast from the camera through the mouse pixel) ------
@@ -276,15 +292,109 @@ func (v *view3d) pickLine(d *Doc, mx, my float64, fw, h int) (int, bool) {
 	return best, best >= 0
 }
 
-// handleClickSelect lets a plain left click in the 3D pane select the wall
-// under the cursor, the same way view2d's line mode does.
+// handleClickSelect lets a plain left click in the 3D pane pick up a Thing
+// (and start dragging it — see handleThingDrag) or, failing that, select
+// the wall under the cursor the way view2d's line mode does. Things are
+// tried first: they're small, discrete points rendered on top of the
+// geometry, so a tight on-screen radius around the cursor should win over
+// a wall that happens to be behind them.
 func (v *view3d) handleClickSelect(ui *imkit.UI, area imkit.Rect, d *Doc, focused bool) {
+	if v.handleThingDrag(ui, focused, d) {
+		return
+	}
 	if !focused || !ui.In.LeftClicked {
 		return
 	}
 	if li, ok := v.pickLine(d, ui.In.MouseX, ui.In.MouseY, ui.C.W, ui.C.H); ok {
 		d.Sel.selectOne(modeLines, li)
 	}
+}
+
+// thingPickRadiusPx/thingPickHeight: pickThing's on-screen hit radius
+// around a Thing's projected position, and how far above its floor height
+// to project from — roughly chest height, so aiming at the visible middle
+// of its billboard sprite hits rather than needing to click its feet.
+const (
+	thingPickRadiusPx = 14.0
+	thingPickHeight   = 32.0
+)
+
+// pickThing returns the Thing whose projected screen position is nearest
+// the cursor, among those within thingPickRadiusPx — the 3D analogue of
+// view2d's nearestThing. When more than one Thing's icon overlaps on
+// screen, the one nearer the camera in world space wins.
+func (v *view3d) pickThing(d *Doc, mx, my float64, fw, h int) (int, bool) {
+	const radius2 = thingPickRadiusPx * thingPickRadiusPx
+	best, bestDepth := -1, math.MaxFloat64
+	for i, t := range d.Level.Things {
+		x, y := float64(t.X), float64(t.Y)
+		z := d.floorAt(x, y) + thingPickHeight
+		sx, sy, ok := v.project(x, y, z, fw, h)
+		if !ok {
+			continue
+		}
+		ddx, ddy := float64(sx)-mx, float64(sy)-my
+		if ddx*ddx+ddy*ddy > radius2 {
+			continue
+		}
+		if depth := math.Hypot(x-v.cam.X, y-v.cam.Y); depth < bestDepth {
+			best, bestDepth = i, depth
+		}
+	}
+	return best, best >= 0
+}
+
+// handleThingDrag mirrors view2d's handleVertexDrag/handleThingDrag: picks
+// up the Thing under the cursor on a fresh click and slides it along the
+// horizontal plane at its own floor height for as long as the left button
+// stays down, ending the drag on release. Returns true if it consumed this
+// frame's click/drag, so handleClickSelect's own wall-pick doesn't also
+// fire on the same click.
+func (v *view3d) handleThingDrag(ui *imkit.UI, focused bool, d *Doc) bool {
+	if v.draggingThing >= 0 {
+		if ui.In.LeftDown {
+			v.dragThingTo(ui, d)
+			return true
+		}
+		v.draggingThing = -1
+		return true
+	}
+	if !focused || !ui.In.LeftClicked {
+		return false
+	}
+	idx, ok := v.pickThing(d, ui.In.MouseX, ui.In.MouseY, ui.C.W, ui.C.H)
+	if !ok {
+		return false
+	}
+	v.draggingThing = idx
+	d.Sel.selectOne(modeThings, idx)
+	return true
+}
+
+// dragThingTo moves the currently-dragged Thing to wherever the camera-
+// through-cursor ray crosses the horizontal plane at its own floor height.
+// A no-op this frame if that ray is behind the camera or too close to
+// parallel with the floor to give a stable intersection (looking near the
+// horizon) — the drag just holds position until the ray is usable again.
+func (v *view3d) dragThingTo(ui *imkit.UI, d *Doc) {
+	idx := v.draggingThing
+	if idx < 0 || idx >= len(d.Level.Things) {
+		v.draggingThing = -1
+		return
+	}
+	t := d.Level.Things[idx]
+	planeZ := d.floorAt(float64(t.X), float64(t.Y))
+	dx, dy, dz := v.rayDir(ui.In.MouseX, ui.In.MouseY, ui.C.W, ui.C.H)
+	if math.Abs(dz) < 1e-6 {
+		return
+	}
+	tParam := (planeZ - v.cam.Z) / dz
+	if tParam <= 0 {
+		return
+	}
+	wx := v.cam.X + tParam*dx
+	wy := v.cam.Y + tParam*dy
+	d.MoveThing(idx, int16(math.Round(wx)), int16(math.Round(wy)))
 }
 
 // drawDropHover outlines the wall a texture drag would land on if dropped

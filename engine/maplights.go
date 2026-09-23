@@ -161,7 +161,13 @@ func (g *Game) buildStaticLights() {
 	// Liquid glow: lava lights the room orange, nukage/slime casts a sickly
 	// green. One or more emitters per liquid sector, sized to the sector
 	// (liquidlights.go).
-	g.appendLiquidLights(seed)
+	seed = g.appendLiquidLights(seed)
+
+	// Teleporter pad glow: a faint white/blue light for every pad, same
+	// treatment as the liquid glow above (engine/teleportambience.go) —
+	// vanilla's GATE flat throws no light of its own, so without this the
+	// pad's shimmering surface wouldn't light the room around it.
+	seed = g.appendTeleportLights(seed)
 
 	// Ambient liquid particles (steam/mist/bubbles) — a one-time sector
 	// scan just like the liquid lights above (liquidambience.go).

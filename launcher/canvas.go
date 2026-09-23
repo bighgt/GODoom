@@ -57,17 +57,6 @@ func NewCanvas(w, h int) *Canvas {
 	return &Canvas{Img: image.NewRGBA(image.Rect(0, 0, w, h)), W: w, H: h, clip: Rect{0, 0, w, h}}
 }
 
-// Resize reallocates the buffer if w x h differs from the current size —
-// the launcher window is fixed-size (window.NewFixed) so in practice this
-// only ever runs once, at construction, but keeping it cheap-to-call means
-// run.go doesn't need a special first-frame path.
-func (c *Canvas) Resize(w, h int) {
-	if w == c.W && h == c.H {
-		return
-	}
-	*c = *NewCanvas(w, h)
-}
-
 // Clip narrows all further drawing to r intersected with the current clip —
 // used for the scrollable settings panel so a row scrolled half off the top
 // doesn't paint over the fixed header above it. Returns the previous clip,

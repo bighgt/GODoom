@@ -83,6 +83,31 @@ func TestActivateExitLine(t *testing.T) {
 	}
 }
 
+// TestSwitchExitIsDelayedButWalkoverIsNot pins startExit's own split: a
+// genuine switch press (special 11, trUse) gets the "door" delay so it
+// doesn't vanish to the intermission screen the instant it's pressed, but
+// a walkover exit (special 52, trCross) — which already required the
+// player to physically cross a line — still takes effect immediately.
+func TestSwitchExitIsDelayedButWalkoverIsNot(t *testing.T) {
+	g := specGame([]wad.Sector{{}}, []wad.Linedef{{SpecialType: 11}})
+	g.activateLine(0, nil, trUse)
+	if g.exitLevel != 1 {
+		t.Fatalf("switch exit: exitLevel = %d, want 1", g.exitLevel)
+	}
+	if g.exitDelay != switchExitDoorTics {
+		t.Errorf("switch exit: exitDelay = %d, want %d", g.exitDelay, switchExitDoorTics)
+	}
+
+	g2 := specGame([]wad.Sector{{}}, []wad.Linedef{{SpecialType: 52}})
+	g2.activateLine(0, nil, trCross)
+	if g2.exitLevel != 1 {
+		t.Fatalf("walkover exit: exitLevel = %d, want 1", g2.exitLevel)
+	}
+	if g2.exitDelay != 0 {
+		t.Errorf("walkover exit: exitDelay = %d, want 0 (instant)", g2.exitDelay)
+	}
+}
+
 func TestNonRepeatableSpecialClearsItself(t *testing.T) {
 	g := specGame([]wad.Sector{{Tag: 1}, {Tag: 1, CeilingHeight: 100}},
 		[]wad.Linedef{{SpecialType: 2, SectorTag: 1}}) // W1 door open stay

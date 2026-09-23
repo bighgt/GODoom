@@ -193,6 +193,69 @@ func VoxelModelMatrix(inst VoxelInstance) [16]float32 {
 	}.colMajor()
 }
 
+// cubeFaceDirs/cubeFaceUpHints are the six axis-aligned look directions a
+// point-light cube shadow map renders (layer i looks along cubeFaceDirs[i]),
+// in the exact order graphics hardware assigns cubemap faces to array
+// layers (+X,-X,+Y,-Y,+Z,-Z) — texture(samplerCube, dir)'s face selection is
+// just "which axis of dir has the largest magnitude", so rendering layer i
+// with a camera facing cubeFaceDirs[i] is what makes sampling with the raw
+// world-space (fragment - light) vector land on the right face later, no
+// extra bookkeeping needed. Doom's world is Z-up (see Camera's own doc
+// comment), so the up-hint for the two Z-facing directions can't be world Z
+// itself (parallel = degenerate); it uses world Y instead, same as world X
+// is used as the horizontal directions' up-hint would be tempting but Z
+// (world "up") is what actually keeps those four bases feeling upright.
+var cubeFaceDirs = [6][3]float64{
+	{1, 0, 0}, {-1, 0, 0},
+	{0, 1, 0}, {0, -1, 0},
+	{0, 0, 1}, {0, 0, -1},
+}
+
+var cubeFaceUpHints = [6][3]float64{
+	{0, 0, 1}, {0, 0, 1},
+	{0, 0, 1}, {0, 0, 1},
+	{0, 1, 0}, {0, 1, 0},
+}
+
+func cross3(a, b [3]float64) [3]float64 {
+	return [3]float64{a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]}
+}
+
+func normalize3(v [3]float64) [3]float64 {
+	l := math.Sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2])
+	return [3]float64{v[0] / l, v[1] / l, v[2] / l}
+}
+
+// CubeFaceViewProj returns the column-major view-projection matrix for
+// rendering cube shadow-map face (0..5, see cubeFaceDirs) from lightPos: a
+// symmetric 90-degree-FOV perspective (exact cube-face coverage, aspect
+// 1:1) looking along that face's fixed world-space direction, near/far
+// clip planes near/far (far should comfortably cover the light's own
+// radius — beyond it the light's attenuation is already zero, so nothing
+// past that distance needs to occlude anything). Same Vulkan clip-space
+// convention as ViewProj (y down, z in [0,1]).
+func CubeFaceViewProj(lightPos [3]float64, face int, near, far float64) [16]float32 {
+	fwd := cubeFaceDirs[face]
+	right := normalize3(cross3(fwd, cubeFaceUpHints[face]))
+	up := cross3(right, fwd)
+	dot := func(a [3]float64) float64 { return a[0]*lightPos[0] + a[1]*lightPos[1] + a[2]*lightPos[2] }
+	v := mat4{
+		right[0], right[1], right[2], -dot(right),
+		up[0], up[1], up[2], -dot(up),
+		fwd[0], fwd[1], fwd[2], -dot(fwd),
+		0, 0, 0, 1,
+	}
+	// 90 degree FOV, aspect 1:1: focal = 1/tan(45 deg) = 1, w = h = 2.
+	zc := far / (far - near)
+	p := mat4{
+		1, 0, 0, 0,
+		0, -1, 0, 0,
+		0, 0, zc, -near * far / (far - near),
+		0, 0, 1, 0,
+	}
+	return p.mul(v).colMajor()
+}
+
 // Mat4Mul multiplies two column-major (GLSL) 4x4 matrices: result = a*b.
 // The backend uses it to fold a per-voxel model matrix into the frame's one
 // view-projection instead of rebuilding the projection per instance.

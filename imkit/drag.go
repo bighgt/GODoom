@@ -61,9 +61,6 @@ func (ui *UI) DropTarget(r Rect) (any, bool) {
 	return p, true
 }
 
-// CancelDrag aborts any in-flight drag (e.g. on Escape).
-func (ui *UI) CancelDrag() { ui.drag = nil }
-
 func (ui *UI) drawDragGhost() {
 	d := ui.drag
 	if d == nil || d.armed {

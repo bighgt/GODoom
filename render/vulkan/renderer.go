@@ -19,16 +19,31 @@ import (
 	"twopointfive/window"
 )
 
-// maxFramesInFlight is 2: the CPU builds and uploads frame N+1 while the
-// GPU is still copying/blitting/presenting frame N, instead of the whole
-// pipeline running strictly one frame at a time. Making that safe needs
-// one host-visible staging buffer per in-flight slot (see
+// maxFramesInFlight is 3: the CPU can build and upload up to 2 frames ahead
+// of whichever one the GPU is still copying/blitting/presenting, instead of
+// the whole pipeline running strictly one frame at a time. Making that safe
+// needs one host-visible staging buffer per in-flight slot (see
 // createStagingBuffer) so the CPU's memcpy for the next frame never lands
 // on a buffer the GPU is still reading; the frame texture stays single,
 // with the record-time barrier ordering the next copy after the previous
 // blit's sampling (see recordCommandBuffer). imageAvailable/inFlight are
 // per-slot; renderFinished is per swapchain image (see createSyncObjects).
-const maxFramesInFlight = 2
+//
+// Was 2 (double-buffered) until 2026-09: with vsync off and no FPS cap,
+// GPU utilization sat around 75-78% instead of ~100% — the classic signature
+// of the GPU periodically running dry waiting for the CPU to hand it the
+// next command buffer, rather than the GPU itself being the limiting
+// resource. 2 in-flight frames gives the CPU only one frame of slack to
+// absorb any per-frame timing variance (game logic, command-buffer
+// recording, driver/API call overhead) before the GPU catches up and stalls
+// on the next WaitForFences; a third slot gives it two frames of slack
+// instead — the standard fix for this exact symptom. Every array/pool sized
+// off this constant already uses it symbolically (see the grep any future
+// change here should re-run), with the one exception that genuinely needed
+// its own fix: worldSlot's overlay dirty-range tracking assumed exactly one
+// "other" slot could have written in between two visits to the same slot —
+// see worldResources.prevOverlayRanges in world.go.
+const maxFramesInFlight = 3
 
 // Renderer is the Vulkan backend. It satisfies render.Renderer.
 type Renderer struct {

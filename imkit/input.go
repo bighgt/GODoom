@@ -116,10 +116,9 @@ func (in *Input) Pressed(k Key) bool { return k > KeyNone && k < keyCount && in.
 // Edge reports only a fresh press of k this frame (for one-shot shortcuts).
 func (in *Input) Edge(k Key) bool { return k > KeyNone && k < keyCount && in.edge[k] }
 
-// Ctrl / Shift / Alt are convenience modifier reads.
+// Ctrl / Shift are convenience modifier reads.
 func (in *Input) Ctrl() bool  { return in.down[KeyCtrl] }
 func (in *Input) Shift() bool { return in.down[KeyShift] }
-func (in *Input) Alt() bool   { return in.down[KeyAlt] }
 
 const (
 	keyRepeatDelay = 0.40

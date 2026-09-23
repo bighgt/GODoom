@@ -487,7 +487,15 @@ type Game struct {
 	lastAnimHash    uint64
 	lastAnimHashSet bool
 	// exitLevel: 0 none, 1 normal exit, 2 secret exit — checked by Run.
-	exitLevel    int
+	exitLevel int
+	// exitDelay counts down (tics) before a pending exitLevel actually
+	// takes effect — see startExit in spec.go. A switch-triggered exit
+	// gets a real delay (so it reads as "a door somewhere just opened,"
+	// not an instant snap to the intermission screen); a walkover exit
+	// already requires the player to physically cross a line to trigger
+	// it at all, so it keeps taking effect immediately. 0 means no delay
+	// is pending — stepSimulation only acts on exitLevel once this reaches 0.
+	exitDelay    int
 	secretCount  int
 	totalSecrets int
 	// OnLevelChange, if set, is called with the new map name after a level
@@ -544,6 +552,16 @@ type Game struct {
 	// (every tryMove call probes up to three candidate positions, and
 	// every in-flight projectile probes one more, every single frame).
 	blockGrid *collisionGrid
+
+	// mobjGridCells/mobjGridMaxR are the mobj-vs-mobj counterpart to
+	// blockGrid: unlike Level.Linedefs (static geometry, indexed once),
+	// mobjs move every tic, so this is rebuilt from scratch at the start
+	// of every runTic instead — see rebuildMobjGrid/forEachMobjNear
+	// (mobjgrid.go). Reuses blockGrid's own cell geometry (cellX/cellY),
+	// sized cols*rows, cleared and re-bucketed in place each tic rather
+	// than reallocated.
+	mobjGridCells [][]*Mobj
+	mobjGridMaxR  float64
 
 	// sectorLines[s] / sectorNeighbors[s] are the linedef and adjacent-
 	// sector adjacency tables the p_spec.c surrounding-sector queries use
@@ -639,6 +657,33 @@ func NewGame(win *window.Window, renderer render.Renderer, ras *raster.Renderer,
 	// reshape it — otherwise a Heretic session would leak its weapons into
 	// the next Doom one through the launcher loop.
 	resetWeaponTables()
+
+	// PLSF (the plasma rifle's muzzle flash) has a locally-supplied generic
+	// hi-res sprite override (assets/textures/sprites/, indexed by
+	// indexHiresSprites — the same system that upscales THING/pickup
+	// sprites seen in the 3D world) whose hotspot is scaled from the
+	// VANILLA WAD patch's own offset. DrawWeapon (raster/weapon.go)
+	// positions the flash relative to the GUN by assuming both share one
+	// common origin point — true for two vanilla sprites (id authored them
+	// that way), but not when the gun itself is drawn from a separate,
+	// independently-authored HD weapon-viewmodel pack (assets/weapons/,
+	// loaded via a completely different code path with its own offset
+	// convention — see weaponOverrideRGBA's doc comment) that has no
+	// matching flash replacement of its own: the two origins disagree, and
+	// the disagreement gets magnified by the generic override's own ~4x
+	// upscale, throwing the flash far from the gun (reported: it rendered
+	// on the left edge of the screen instead of over the weapon). Dropping
+	// this specific override makes PLSF resolve straight from the vanilla
+	// WAD patch instead — self-consistent with a vanilla gun, and a much
+	// smaller (native-resolution) coordinate space even against an HD gun,
+	// so any residual cross-pack mismatch stays visually small instead of
+	// being thrown across the screen. Unconditional (not gated on which
+	// game/pack is active): correct either way, per the reasoning above.
+	if g.Raster != nil {
+		if tx := g.Raster.Textures(); tx != nil {
+			tx.DropHiresOverrides("PLSFA0", "PLSFB0", "PLSFC0", "PLSFD0")
+		}
+	}
 
 	g.heretic = isHereticWAD(w)
 	if g.heretic {
@@ -795,7 +840,7 @@ func (g *Game) stepSimulation(dt float32) {
 		g.loadMap(g.pendingWarp)
 		g.pendingWarp = ""
 		g.ticAccum = 0
-	} else if g.exitLevel != 0 {
+	} else if g.exitLevel != 0 && g.exitDelay <= 0 {
 		g.loadNextMap()
 		g.ticAccum = 0
 	}
@@ -960,7 +1005,8 @@ func (g *Game) renderFrame() error {
 	visD, totD, visV, totV := g.WorldBuilder.UpdateVisibility(wc)
 	g.dbgBuildMS = emaMS(g.dbgBuildMS, time.Since(buildStart))
 	drawStart := time.Now()
-	err := g.Renderer.DrawWorld(geom, wc, g.Raster.Width, g.Raster.Height, g.Raster.Overlay(), lights)
+	ovY0, ovY1 := g.Raster.OverlayDirty()
+	err := g.Renderer.DrawWorld(geom, wc, g.Raster.Width, g.Raster.Height, g.Raster.Overlay(), ovY0, ovY1, lights)
 	g.dbgDrawMS = emaMS(g.dbgDrawMS, time.Since(drawStart))
 	if g.dbgHWFrames < 5400 {
 		g.dbgHWFrames++

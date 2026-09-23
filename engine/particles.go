@@ -39,6 +39,57 @@ type Particle struct {
 	growFrac      float64 // translucent only: fraction of life to reach full (smokeGrowEnd) size; 0 = derive from hold instead (see collectAllParticleSprites)
 	clearBrighten float64 // translucent only: light multiplier reached by the end of clearing — >1 lightens (soot thinning to gray), <1 dims (hot gas cooling as it disperses), 1 leaves color unchanged
 	frames        []*assets.RGBA
+	// orbitSpeed, when nonzero, makes updateParticles override this
+	// particle's X/Y every tic to travel in a circle of orbitRadius around
+	// (orbitCenterX, orbitCenterY) — starting at angle orbitPhase0, turning
+	// at orbitSpeed radians/sec — instead of integrating DX/DY as straight-
+	// line drift. DZ/gravity still apply normally, so combined with a
+	// rising DZ this reads as a particle spiralling upward. Zero (the zero
+	// value, what every other spawn site in this package leaves it at)
+	// means "use DX/DY normally" — see engine/teleportambience.go's rising
+	// glitter for the one consumer of this today.
+	orbitCenterX, orbitCenterY, orbitRadius, orbitPhase0, orbitSpeed float64
+	// bounceFloor, when true, makes updateParticles reflect DZ (scaled by
+	// particleBounceDamping) instead of letting a particle sink through the
+	// sector floor beneath its own CURRENT (X, Y) — off by default (every
+	// spawn site but the BFG's own spark layer leaves this false, so
+	// ordinary particles keep flying through geometry unobstructed exactly
+	// as before). Resolved live each tic, not cached from the burst's
+	// origin: sparks fly far enough (particleSpeedMax alone is 500u/sec)
+	// to cross into a sector with a different floor height than where the
+	// explosion happened — extremely common in Doom maps (steps, raised
+	// platforms, the next room over) — so a single cached height either
+	// leaves them bouncing in mid-air over a lower floor or sinking through
+	// a raised one. See ExplosionScale.SparkBounceFloor and
+	// spawnBFGExtraSparks.
+	bounceFloor bool
+	// bounces, when bounceFloor is set, caps how many more times this
+	// particle is allowed to bounce before it just settles at the floor
+	// (DZ pinned to 0) instead of reflecting again. Negative means
+	// unlimited — keep reflecting (damped by particleBounceDamping each
+	// time) until it naturally settles or its life runs out, the original
+	// behavior. spawnBurst always sets this explicitly (-1 unless the
+	// cause set ExplosionScale.SparkBounceMin/Max — currently only the
+	// rocket launcher's own spark layer does), so every OTHER &Particle{}
+	// literal in this package (nothing outside spawnBurst constructs a
+	// bouncing one) is fine leaving this at its zero value: 0 would
+	// otherwise read as "already out of bounces" and settle on first
+	// contact, not "unlimited" — the field is written so nothing has to
+	// know that to stay correct.
+	bounces int
+	// pulseHz/pulseAmp/pulsePhase, when pulseHz > 0, make this particle's
+	// rendered SIZE breathe rhythmically — collectAllParticleSprites
+	// multiplies its size by 1+pulseAmp*sin(age*pulseHz*2π+pulsePhase) —
+	// instead of holding steady. Size, not light: a fullBright additive
+	// particle (KindSpriteFull) is shaded as tex.rgb*1.35 in the shader
+	// with no read of this struct's own light field at all (see
+	// worldgeo.AddParticleSprites/world.frag's KIND_SPRITE_FULL case), so
+	// modulating light would be invisible for exactly the particles (the
+	// teleporter's disco glitter, see engine/teleportambience.go) this was
+	// built for — a visibly swelling/shrinking mote reads as "pulsing
+	// light" just as well and actually shows up. Zero pulseHz (every spawn
+	// site but the teleport glitter) means no pulse, unchanged.
+	pulseHz, pulseAmp, pulsePhase float64
 	// pooled marks a Particle allocated via newPooledParticle rather than a
 	// plain &Particle{} literal — updateParticles returns it to
 	// particlePool once it expires instead of leaving it for the GC. false
@@ -72,6 +123,26 @@ func newPooledParticle(init Particle) *Particle {
 	return p
 }
 
+// explosionBurstMax caps how many particles any ONE spawnBurst call (one
+// layer — sparks, chunks, or fire — of one explosion) can actually spawn,
+// no matter how large Count/SparkCount/FireCount combine to compute n.
+// Concrete incident this guards against: explosionRocket's SparkCount:10
+// stacks with its own Count:10 — spawnBurst's own comment explains why
+// that compounding (SparkCount on top of Count) is deliberate — to
+// explosionParticleCount*10*10 = 320,000 sparks from ONE rocket hit, which
+// is what actually took a real session from 450 FPS to ~20 FPS the instant
+// a rocket exploded on screen: hundreds of thousands of additive billboards
+// (unlike the translucent layer, nothing caps these — see
+// maxTransparentParticles below) all alive at once, each paying its own
+// share of updateParticles/collectAllParticleSprites every frame for its
+// ~0.5s life. Applied at spawn time (not just before the GPU submit,
+// unlike maxTransparentParticles' own cap) so it also saves that per-frame
+// CPU update cost, not only the draw cost. 2000 is generous — comparable
+// to or larger than explosionBFG's own ~3200-spark burst before its own
+// separate +3000 flat bonus (bfgExtraSparkCount), and BFG isn't the
+// complaint here — while still nowhere near catastrophic.
+const explosionBurstMax = 2000
+
 const (
 	explosionParticleCount = 3200
 	particleLifeMin        = 0.45
@@ -80,9 +151,14 @@ const (
 	particleSpeedMax       = 500.0
 	particleGravity        = 400.0 // units/sec^2
 	particleDrag           = 0.9   // 1/sec velocity decay (air resistance) — see updateParticles
-	particleFrameRate      = 24.0  // frames/sec through the 4-frame spark loop
-	particleSizeMin        = 0.125 // extra multiplier on top of particleTexelsPerUnit's
-	particleSizeMax        = 0.25  // native size
+	// particleBounceDamping is the fraction of vertical speed a
+	// bounceFloor particle keeps after reflecting off the floor — see
+	// Particle.bounceFloor. <1 so each bounce loses energy and the particle
+	// settles rather than bouncing forever at the same height.
+	particleBounceDamping = 0.45
+	particleFrameRate     = 24.0  // frames/sec through the 4-frame spark loop
+	particleSizeMin       = 0.125 // extra multiplier on top of particleTexelsPerUnit's
+	particleSizeMax       = 0.25  // native size
 	// particleFadeStart is the fraction of a particle's life at which it
 	// starts shrinking toward particleFadeFloor — since KIND_SPRITE_FULL is a
 	// hard alpha-cutout, not real blending (see world.frag), there's no true
@@ -223,37 +299,186 @@ type ExplosionScale struct {
 	FireLife   float64 // extra multiplier on the fire layer's own life range
 	FireSize   float64 // the fire layer's complete size multiplier — NOT compounded with Size (see the fire spawnBurst call), so this alone says how a type's fireball compares to another's
 	FireSpread bool    // fire launches at a shallow angle and fans out across the floor (fireSpreadPitchMin/Max) instead of shooting upward like debris — burning fuel spilled from a ruptured barrel, not a warhead's airburst
+	// SparkIsotropic, when true, launches the spark layer in a full sphere
+	// (straight down to straight up) instead of the default upward-only
+	// cone (0.2..0.8 of straight up — see spawnBurst's own comment), so
+	// the blast throws shrapnel outward in every direction at once, evenly
+	// centred on the impact point, rather than reading as a mostly-upward
+	// fountain. false (every other cause) keeps the original upward cone,
+	// unchanged.
+	SparkIsotropic bool
+	// SparkBounceFloor, when true, makes the spark layer's own particles
+	// bounce off the floor (Particle.bounceFloor) instead of flying through
+	// it — the BFG's own signature: its sparks visibly skitter/bounce
+	// across the floor instead of clipping through it. false (every other
+	// cause) leaves sparks unobstructed, exactly as before.
+	SparkBounceFloor bool
+	// SparkLifeMin/SparkLifeMax, when SparkLifeMax > 0, replace the shared
+	// particleLifeMin/particleLifeMax outright for the spark layer only —
+	// the BFG's own sparks need to live long enough to actually fall,
+	// bounce a few times (SparkBounceFloor), and settle, which the shared
+	// short spark life (well under a second, tuned for a quick ballistic
+	// burst) never gives them time to do. Zero (the zero value, what every
+	// other cause leaves this at) means "use the shared range unchanged."
+	SparkLifeMin, SparkLifeMax float64
+	// SparkBounceMin/SparkBounceMax, when SparkBounceMax > 0 (and
+	// SparkBounceFloor is also set), gives each spark its own random
+	// Particle.bounces budget in [SparkBounceMin, SparkBounceMax] instead
+	// of bouncing indefinitely — the rocket launcher's own debris settles
+	// after a handful of bounces rather than skittering around forever.
+	// 0 (every other cause, including the BFG/plasma sparks that pioneered
+	// SparkBounceFloor) means unlimited, unchanged.
+	SparkBounceMin, SparkBounceMax int
+	// SparkMaxCount, when > 0, overrides explosionBurstMax as the spark
+	// layer's own spawn cap for this cause — see explosionBurstMax's own
+	// doc comment on why that shared safety cap exists, and burstParams.
+	// maxCount for how a call opts out of it. 0 (every cause but the
+	// rocket launcher) means "use the shared cap," unchanged.
+	SparkMaxCount int
+	// ChunkBounceFloor is SparkBounceFloor's counterpart for the chunk
+	// debris layer — false (every cause but the plasma rifle) leaves
+	// chunks unobstructed, exactly as before.
+	ChunkBounceFloor bool
+	// NoChunks skips the chunk debris layer entirely for this cause — the
+	// BFG's own chunk art, scaled up by its own 10x Size and then
+	// green-tinted, read as big shapeless blobs falling out of the blast
+	// rather than debris, so its explosion is sparks only. false (every
+	// other cause) spawns chunks exactly as before.
+	NoChunks bool
+	// SparkFrames/ChunkFrames/FireFrames, when set, load this cause's own
+	// recolored debris art instead of the shared loadSparkFrames/
+	// loadChunkFrames/loadFireFrames — e.g. the BFG's green tint (see
+	// loadBFGSparkFrames et al.), so its whole blast reads as one color
+	// instead of fighting its own green explosion animation with generic
+	// yellow/orange debris. nil (every other cause) means "use the shared
+	// art," unchanged. Functions rather than plain slices so nothing is
+	// loaded/tinted until an explosion of that cause actually happens.
+	SparkFrames, ChunkFrames, FireFrames func() []*assets.RGBA
+	// SparkColorVariants, when set, makes each spark particle of this
+	// cause independently pick a random one of several pre-tinted frame
+	// sets instead of every spark in the burst sharing SparkFrames' one
+	// fixed tint — e.g. the plasma rifle's sparks scattered across white to
+	// deep blue (loadPlasmaSparkColorVariants), or the rocket launcher's
+	// across red/orange/yellow/white (loadRocketSparkColorVariants),
+	// instead of one flat tint repeated on every spark. nil (every other
+	// cause) means "no per-particle variation," unchanged.
+	SparkColorVariants func() [][]*assets.RGBA
 }
 
 // explosionDefault covers monster fireballs — unchanged from the original
-// tuning. explosionRocket is the rocket launcher's boosted burst: 4x as
-// much fire as everything else gets, and 10x as many sparks on top of the
-// spark layer's own Count scaling — a rocket's blast is all shrapnel.
-// explosionBarrel is bigger again (2x the rocket's own size), and fans its
+// tuning. explosionRocket is the rocket launcher's boosted burst: 10x as
+// many sparks on top of the spark layer's own Count scaling (further
+// tuned by SparkMaxCount/SparkColorVariants/SparkBounceMin/Max/
+// SparkIsotropic — see the struct literal below and their own field doc
+// comments for what each does and why) — a rocket's blast is all
+// shrapnel, sprayed outward from the impact point in every direction at
+// once (SparkIsotropic) and nothing else: no chunk debris (NoChunks — the
+// tumbling debris layer reads as generic grey blobs visibly raining down
+// out of the blast and landing, not as shrapnel — the same complaint
+// explosionBFG's own NoChunks already exists to avoid, see its doc
+// comment below) and no lingering fire layer either (no FireCount — a
+// real explosion radiates outward and is over, it doesn't hang around
+// afterward as a rising fireball). explosionBarrel is bigger again (2x
+// the rocket's own size), and fans its
 // fire out low across the floor (FireSpread) rather than shooting upward,
 // since it's igniting spilled fuel, not just burning in place — see
 // engine/burningpuddle.go for the fire (and smoke) that keeps burning
-// there afterward. explosionEnergy (plasma) is the same size as default —
-// an energy blast has nothing to burn, just a flash and sparks.
-// explosionBFG is energy's much bigger sibling: 10x wider, with 4x as much
-// fire lasting twice as long — the BFG is a massive weapon and reads like
-// one. When a rocket lands the killing hit on a barrel, the two no longer
-// stack independently — see rocketBarrelExplosionBoost in projectiles.go —
-// the barrel's own burst is boosted instead, so it's one bigger explosion,
-// not two overlapping ones.
+// there afterward. explosionEnergy (plasma) is the same size as default,
+// but at half the particle count (Count: 0.5), with its own spark layer
+// halved yet again on top of that (SparkCount: 0.5 — a plasma bolt is a
+// small, frequent shot, not a one-off blast, so its burst — sparks
+// especially, the layer that dominates the particle count — is toned down
+// from the shared baseline). Its SparkFrames/ChunkFrames/FireFrames are
+// all re-tinted blue/white hot
+// (tintFramesHot — the same "white-blue-hot" tint the rocket exhaust jet
+// already uses, see loadRocketFlameFrames) instead of the generic
+// yellow/orange every other explosion's debris and fire use, matching its
+// own cyan-blue plasma bolt (lights.go's PLSE case) rather than fighting
+// it. SparkColorVariants (loadPlasmaSparkColorVariants) then layers actual
+// per-spark colour variety on top of that shared tint: each spark
+// independently picks a random shade between white-hot and deep blue, so
+// a burst reads as a scatter of differently-coloured sparks rather than
+// one flat tint repeated on every one of them.
+// SparkBounceFloor/ChunkBounceFloor+SparkLifeMin/Max make its sparks
+// and chunks bounce a few times along the floor before fading, the same
+// reasoning as explosionBFG's own below.
+// explosionBFG is energy's much bigger sibling: 10x wider — the BFG is a
+// massive weapon and reads like one. When a rocket lands the killing hit
+// on a barrel, the two no longer stack independently — see
+// rocketBarrelExplosionBoost in projectiles.go — the barrel's own burst is
+// boosted instead, so it's one bigger explosion, not two overlapping ones.
+// On top of this, its own explosion additionally throws bfgExtraSparkCount
+// more sparks outward — see spawnBFGExtraSparks, called right alongside
+// spawnExplosionParticles in updateProjectiles. No FireCount and NoChunks:
+// both its lingering fire licks and its chunk debris read as big,
+// shapeless green blobs at this size once tinted, rather than looking like
+// fire or debris, so the BFG's blast is sparks only, sprayed out in every
+// direction. SparkFrames is re-tinted green (see loadBFGSparkFrames) so
+// every spark matches its own green BFE1/BFE2 explosion animation and
+// green dynamic light (lights.go's BFE1 case) instead of fighting it with
+// the generic yellow/orange every other explosion's sparks use.
+// SparkBounceFloor+SparkLifeMin/Max make its sparks bounce a few times
+// along the floor before fading, instead of the shared short spark life
+// (well under a second) that never gave them time to fall and land even
+// once — see Particle.bounceFloor.
 var (
 	explosionDefault = ExplosionScale{Size: 1, Count: 1, FireCount: 1, FireLife: 1, FireSize: 1}
-	explosionRocket  = ExplosionScale{Size: 1.8, Count: 10, SparkCount: 10, FireCount: 8, FireLife: 1, FireSize: 3}
-	explosionBarrel  = ExplosionScale{Size: 3.4, Count: 10, FireCount: 4.4, FireLife: 1, FireSize: 6, FireSpread: true}
-	explosionEnergy  = ExplosionScale{Size: 1, Count: 1, FireCount: 1, FireLife: 1, FireSize: 1}
-	explosionBFG     = ExplosionScale{Size: 10, Count: 1, FireCount: 4, FireLife: 2, FireSize: 10}
+	explosionRocket  = ExplosionScale{
+		// Size doubled (1.8 -> 3.6): with NoChunks on (and no fire layer at
+		// all — see below), Size only reaches the spark layer now, so this
+		// alone is "sparks twice as large."
+		Size: 3.6, Count: 10, NoChunks: true,
+		// No FireCount (0, the zero value — see spawnBurst's own n *=
+		// scale.Count: a 0 FireCount computes 0 fire particles regardless
+		// of Count, the same "just omit it" shape explosionBFG's own doc
+		// comment below already uses): no lingering flame-lick fireball at
+		// all, blast is sparks only — a real explosion radiates outward
+		// from the impact point and is over; it doesn't hang around as a
+		// rising fireball afterward. FireLife/FireSize dropped too, since
+		// there's no fire layer left for them to tune.
+		// SparkMaxCount: 6000 sparks per rocket hit — well past
+		// explosionBurstMax's shared 2000 safety cap (see its own doc
+		// comment on the incident that added it), but SparkCount:10 stacked
+		// with Count:10 already computes 320,000 before any cap, so this
+		// override just moves where THIS cause's own ceiling sits rather
+		// than fighting the shared one. SparkIsotropic: shrapnel sprays out
+		// in every direction from the impact point, not mostly upward —
+		// see ExplosionScale.SparkIsotropic's own doc comment.
+		SparkCount: 10, SparkMaxCount: 6000, SparkIsotropic: true,
+		// A glowing red/orange/yellow/white scatter (loadRocketSparkColorVariants)
+		// instead of the generic yellow/orange every spark shared before,
+		// and each one twice normal size (see Size above) and bouncing 1-5
+		// times (SparkBounceMin/Max) before settling — SparkLifeMin/Max
+		// borrows the BFG/plasma sparks' own longer life (bfgSparkLifeMin/
+		// Max) since the shared short default (well under a second) never
+		// gave a spark time to reach the floor even once, let alone bounce
+		// repeatedly.
+		SparkColorVariants: loadRocketSparkColorVariants,
+		SparkBounceFloor:   true, SparkBounceMin: 1, SparkBounceMax: 5,
+		SparkLifeMin: bfgSparkLifeMin, SparkLifeMax: bfgSparkLifeMax,
+	}
+	explosionBarrel = ExplosionScale{Size: 3.4, Count: 10, FireCount: 4.4, FireLife: 1, FireSize: 6, FireSpread: true}
+	explosionEnergy = ExplosionScale{
+		Size: 1, Count: 0.5, SparkCount: 0.5, FireCount: 1, FireLife: 1, FireSize: 1,
+		SparkFrames: loadPlasmaSparkFrames, ChunkFrames: loadPlasmaChunkFrames, FireFrames: loadPlasmaFireFrames,
+		SparkColorVariants: loadPlasmaSparkColorVariants,
+		SparkBounceFloor:   true, ChunkBounceFloor: true,
+		SparkLifeMin: plasmaSparkLifeMin, SparkLifeMax: plasmaSparkLifeMax,
+	}
+	explosionBFG = ExplosionScale{
+		Size: 10, Count: 1,
+		SparkFrames:      loadBFGSparkFrames,
+		SparkBounceFloor: true,
+		SparkLifeMin:     bfgSparkLifeMin, SparkLifeMax: bfgSparkLifeMax,
+		NoChunks: true,
+	}
 )
 
 // scaledExplosion returns scale with its "how big / how much" dials — Size,
 // Count, FireSize, FireCount — multiplied by mult, leaving its qualitative
-// dials (FireSpread) untouched: a boosted explosion (see aExplode's use of
-// Mobj.explosionBoost) should look like more of the same fire, not a
-// differently timed one.
+// dials (FireSpread, SparkIsotropic, ...) untouched: a boosted explosion (see
+// aExplode's use of Mobj.explosionBoost) should look like more of the same
+// fire, not a differently timed or shaped one.
 func scaledExplosion(scale ExplosionScale, mult float64) ExplosionScale {
 	scale.Size *= mult
 	scale.Count *= mult
@@ -278,8 +503,17 @@ func (g *Game) spawnExplosionParticles(x, y, z float64, scale ExplosionScale) {
 		return
 	}
 	sparks := loadSparkFrames()
+	if scale.SparkFrames != nil {
+		sparks = scale.SparkFrames()
+	}
 	chunks := loadChunkFrames()
+	if scale.ChunkFrames != nil {
+		chunks = scale.ChunkFrames()
+	}
 	fire := loadFireFrames()
+	if scale.FireFrames != nil {
+		fire = scale.FireFrames()
+	}
 	if len(sparks) == 0 && len(chunks) == 0 && len(fire) == 0 {
 		return
 	}
@@ -290,15 +524,31 @@ func (g *Game) spawnExplosionParticles(x, y, z float64, scale ExplosionScale) {
 			return
 		}
 		n = int(float64(n) * scale.Count)
+		burstMax := explosionBurstMax
+		if bp.maxCount > 0 {
+			burstMax = bp.maxCount
+		}
+		if n > burstMax {
+			n = burstMax
+		}
 		sizeMin, sizeMax := bp.sizeMin*scale.Size, bp.sizeMax*scale.Size
 		for i := 0; i < n; i++ {
 			var dx, dy, dz float64
-			if bp.lowAngle {
+			switch {
+			case bp.lowAngle:
 				// Shallow, near-horizontal launch (fireSpreadPitchMin/Max), sped
 				// up by fireSpreadSpeedMul — burning fuel fanning out across the
 				// floor rather than shooting upward like debris.
 				dx, dy, dz = coneVelocity(fireSpreadPitchMin, fireSpreadPitchMax, bp.speedMin*fireSpreadSpeedMul, bp.speedMax*fireSpreadSpeedMul)
-			} else {
+			case bp.isotropic:
+				// Full sphere (-1..1 of straight up, i.e. straight down to
+				// straight up) instead of the default upward-only cone — a
+				// real blast throws shrapnel outward in every direction at
+				// once, not mostly upward, so this layer's spawn shouldn't
+				// have a blind spot below the horizon at all. See
+				// ExplosionScale.SparkIsotropic.
+				dx, dy, dz = coneVelocity(-1, 1, bp.speedMin, bp.speedMax)
+			default:
 				// Biased upward (0.2..0.8 of straight up) so the burst reads as
 				// flying debris, not a flat horizontal ring.
 				dx, dy, dz = coneVelocity(0.2, 0.8, bp.speedMin, bp.speedMax)
@@ -308,6 +558,24 @@ func (g *Game) spawnExplosionParticles(x, y, z float64, scale ExplosionScale) {
 				spawnZ += bp.zOffset + pRandomF01()*bp.zJitter
 			} else {
 				spawnZ += bp.zOffset
+			}
+			// colorVariants, when this cause set one (ExplosionScale.
+			// SparkColorVariants), gives this ONE particle its own
+			// independently-random tint instead of every particle in the
+			// burst sharing bp.frames — a single cheap index pick, not a
+			// re-tint (that stays a fixed, cached set of pre-built variants;
+			// see loadPlasmaSparkColorVariants).
+			frames := bp.frames
+			if n := len(bp.colorVariants); n > 0 {
+				frames = bp.colorVariants[pRandom()%n]
+			}
+			// bounces: -1 (unlimited) unless this cause gave the spark
+			// layer its own random budget (ExplosionScale.SparkBounceMin/
+			// Max) — see Particle.bounces' own doc comment on why the
+			// zero value can't mean "unlimited" here.
+			bounces := -1
+			if bp.bounceMax > 0 {
+				bounces = bp.bounceMin + pRandom()%(bp.bounceMax-bp.bounceMin+1)
 			}
 			g.particles = append(g.particles, newPooledParticle(Particle{
 				X: x, Y: y, Z: spawnZ,
@@ -326,7 +594,9 @@ func (g *Game) spawnExplosionParticles(x, y, z float64, scale ExplosionScale) {
 				hold:          bp.hold,
 				growFrac:      bp.growFrac,
 				clearBrighten: bp.clearBrighten,
-				frames:        bp.frames,
+				bounceFloor:   bp.bounceFloor,
+				bounces:       bounces,
+				frames:        frames,
 			}))
 		}
 	}
@@ -339,18 +609,34 @@ func (g *Game) spawnExplosionParticles(x, y, z float64, scale ExplosionScale) {
 	if sparkCount <= 0 {
 		sparkCount = 1
 	}
+	sparkLifeMin, sparkLifeMax := particleLifeMin, particleLifeMax
+	if scale.SparkLifeMax > 0 {
+		sparkLifeMin, sparkLifeMax = scale.SparkLifeMin, scale.SparkLifeMax
+	}
+	var sparkColorVariants [][]*assets.RGBA
+	if scale.SparkColorVariants != nil {
+		sparkColorVariants = scale.SparkColorVariants()
+	}
 	spawnBurst(int(float64(explosionParticleCount)*sparkCount), burstParams{
-		speedMin: particleSpeedMin, speedMax: particleSpeedMax, lifeMin: particleLifeMin, lifeMax: particleLifeMax,
+		speedMin: particleSpeedMin, speedMax: particleSpeedMax, lifeMin: sparkLifeMin, lifeMax: sparkLifeMax,
 		sizeMin: particleSizeMin, sizeMax: particleSizeMax, frameRate: particleFrameRate, gravity: particleGravity,
-		light: 1, fullBright: true, frames: sparks,
+		light: 1, fullBright: true, bounceFloor: scale.SparkBounceFloor, frames: sparks,
+		colorVariants: sparkColorVariants, isotropic: scale.SparkIsotropic,
+		bounceMin: scale.SparkBounceMin, bounceMax: scale.SparkBounceMax,
+		maxCount: scale.SparkMaxCount,
 	})
 	// Chunks: a handful of bigger, slower, longer-lived tumbling debris
 	// pieces mixed in so the burst isn't a uniform cloud of identical dots.
-	spawnBurst(explosionChunkCount, burstParams{
-		speedMin: chunkSpeedMin, speedMax: chunkSpeedMax, lifeMin: chunkLifeMin, lifeMax: chunkLifeMax,
-		sizeMin: chunkSizeMin, sizeMax: chunkSizeMax, frameRate: chunkFrameRate, gravity: particleGravity,
-		light: 1, fullBright: true, frames: chunks,
-	})
+	// Skipped entirely for a cause that sets NoChunks (see its own doc
+	// comment — the BFG's own chunk art read as shapeless blobs, not
+	// debris, at its size).
+	if !scale.NoChunks {
+		spawnBurst(explosionChunkCount, burstParams{
+			speedMin: chunkSpeedMin, speedMax: chunkSpeedMax, lifeMin: chunkLifeMin, lifeMax: chunkLifeMax,
+			sizeMin: chunkSizeMin, sizeMax: chunkSizeMax, frameRate: chunkFrameRate, gravity: particleGravity,
+			light: 1, fullBright: true, bounceFloor: scale.ChunkBounceFloor, frames: chunks,
+		})
+	}
 	// Fire: a few slow, buoyant flame licks that linger well after the
 	// sparks/chunks are gone. FireCount/FireLife are this layer's own extra
 	// multipliers (the BFG's massive, long-lingering flame), on top of the
@@ -370,6 +656,72 @@ func (g *Game) spawnExplosionParticles(x, y, z float64, scale ExplosionScale) {
 		light: fireLight, translucent: true, alpha0: fireAlpha0, hold: fireHoldFrac, clearBrighten: fireClearCool,
 		lowAngle: scale.FireSpread, frames: fire,
 	})
+}
+
+// bfgExtraSparkCount is a flat number of extra spark particles thrown
+// outward the instant a BFG ball explodes — on top of its own explosionBFG
+// burst (see spawnExplosionParticles) — giving the biggest weapon in the
+// game a dramatically bigger, more energetic-looking burst of debris
+// without touching the shared ExplosionScale dials every other explosion
+// type also uses.
+const bfgExtraSparkCount = 3000
+
+// bfgSparkLifeMin/Max: how long a BFG spark lives — long enough for even a
+// fairly steep launch angle to fall back down, bounce (Particle.
+// bounceFloor/particleBounceDamping) a few times as each bounce loses
+// energy, and fade out, instead of the shared particleLifeMin/Max (well
+// under a second, tuned for a quick ballistic spark burst) which would
+// expire most of them well before they ever reached the floor once. Used
+// by both explosionBFG's own SparkLifeMin/Max and spawnBFGExtraSparks.
+const (
+	bfgSparkLifeMin = 1.4
+	bfgSparkLifeMax = 2.4
+)
+
+// plasmaSparkLifeMin/Max is explosionEnergy's own SparkLifeMin/Max — same
+// reasoning and same values as bfgSparkLifeMin/Max above, just named for
+// its own cause since the two are tuned independently even though they
+// currently agree.
+const (
+	plasmaSparkLifeMin = 1.4
+	plasmaSparkLifeMax = 2.4
+)
+
+// spawnBFGExtraSparks throws bfgExtraSparkCount additional spark particles
+// outward from (x, y, z) — the BFG ball's own explosion point — using the
+// same upward-biased cone and physics as spawnExplosionParticles' own
+// spark layer, tinted the same BFG green as the rest of its burst (see
+// loadBFGSparkFrames) rather than the generic yellow/white every other
+// explosion's sparks use, and bouncing off the floor (Particle.bounceFloor)
+// the same way explosionBFG's own SparkBounceFloor sparks do. A no-op if
+// the feature is off or the spark art isn't loaded, same as every other
+// particle spawn in this file.
+func (g *Game) spawnBFGExtraSparks(x, y, z float64) {
+	if !g.explosionParticles {
+		return
+	}
+	sparks := loadBFGSparkFrames()
+	if len(sparks) == 0 {
+		return
+	}
+	for i := 0; i < bfgExtraSparkCount; i++ {
+		dx, dy, dz := coneVelocity(0.2, 0.8, particleSpeedMin, particleSpeedMax)
+		g.particles = append(g.particles, newPooledParticle(Particle{
+			X: x, Y: y, Z: z,
+			DX:          dx,
+			DY:          dy,
+			DZ:          dz,
+			life:        randRange(bfgSparkLifeMin, bfgSparkLifeMax),
+			sizeMul:     randRange(particleSizeMin, particleSizeMax),
+			framePhase:  pRandom(),
+			frameRate:   particleFrameRate,
+			gravity:     particleGravity,
+			light:       1,
+			fullBright:  true,
+			bounceFloor: true,
+			frames:      sparks,
+		}))
+	}
 }
 
 // updateRocketTrail spawns this frame's share of a flying rocket's two
@@ -456,13 +808,31 @@ type burstParams struct {
 	clearBrighten      float64
 	zOffset, zJitter   float64 // spawn height above the burst origin: zOffset..zOffset+zJitter
 	lowAngle           bool    // fireSpreadPitchMin/Max instead of the default upward bias — see ExplosionScale.FireSpread
+	isotropic          bool    // full-sphere launch instead of the default upward-only cone — see ExplosionScale.SparkIsotropic
+	bounceFloor        bool    // see Particle.bounceFloor / ExplosionScale.SparkBounceFloor
 	frames             []*assets.RGBA
+	// colorVariants, when non-empty, overrides frames per particle: each
+	// one spawned this call independently picks a random entry instead of
+	// every particle in the burst sharing frames — see
+	// ExplosionScale.SparkColorVariants.
+	colorVariants [][]*assets.RGBA
+	// bounceMin/bounceMax, when bounceMax > 0, gives each particle its own
+	// random Particle.bounces budget in [bounceMin, bounceMax] instead of
+	// unlimited bouncing — see ExplosionScale.SparkBounceMin/Max.
+	bounceMin, bounceMax int
+	// maxCount, when > 0, overrides explosionBurstMax as this call's own
+	// spawn cap — see explosionBurstMax's own doc comment. 0 (every call
+	// but the rocket launcher's own spark layer) means "use the shared
+	// cap," unchanged.
+	maxCount int
 }
 
-// updateParticles advances every live particle by dt seconds (straight-line
-// travel plus its own gravity — sparks/chunks fall, fire licks drift up)
-// and drops any that outlived their life. Cheap to call every frame even
-// with zero particles.
+// updateParticles advances every live particle by dt seconds — straight-line
+// travel plus its own gravity (sparks/chunks fall, fire licks drift up) for
+// an ordinary particle, or a clean circle around a fixed centre for one
+// with orbitSpeed set (see Particle.orbitSpeed's own doc comment) — and
+// drops any that outlived their life. Cheap to call every frame even with
+// zero particles.
 func (g *Game) updateParticles(dt float64) {
 	if len(g.particles) == 0 {
 		return
@@ -477,18 +847,44 @@ func (g *Game) updateParticles(dt float64) {
 			continue
 		}
 		p.DZ -= p.gravity * dt
-		// Air resistance: without this a spark stays at full horizontal speed
-		// for its whole life and the burst reads as a perfect ballistic
-		// spray; decaying it lets the swarm visibly "settle" instead.
-		drag := 1 - particleDrag*dt
-		if drag < 0 {
-			drag = 0
+		if p.orbitSpeed != 0 {
+			// Circular motion overrides DX/DY entirely — driven off p.age
+			// (not accumulated per-tic) so there's no drift, just a clean
+			// circle of orbitRadius around (orbitCenterX, orbitCenterY).
+			ang := p.orbitPhase0 + p.orbitSpeed*p.age
+			p.X = p.orbitCenterX + p.orbitRadius*math.Cos(ang)
+			p.Y = p.orbitCenterY + p.orbitRadius*math.Sin(ang)
+		} else {
+			// Air resistance: without this a spark stays at full horizontal
+			// speed for its whole life and the burst reads as a perfect
+			// ballistic spray; decaying it lets the swarm visibly "settle"
+			// instead.
+			drag := 1 - particleDrag*dt
+			if drag < 0 {
+				drag = 0
+			}
+			p.DX *= drag
+			p.DY *= drag
+			p.X += p.DX * dt
+			p.Y += p.DY * dt
 		}
-		p.DX *= drag
-		p.DY *= drag
-		p.X += p.DX * dt
-		p.Y += p.DY * dt
 		p.Z += p.DZ * dt
+		if p.bounceFloor {
+			if floor, _ := g.sectorFloorCeil(p.X, p.Y); p.Z < floor {
+				p.Z = floor
+				if p.bounces == 0 {
+					// Budget spent (see Particle.bounces' own doc comment on
+					// why 0 means exactly this, not "unlimited") — settle
+					// instead of reflecting again.
+					p.DZ = 0
+				} else {
+					p.DZ = -p.DZ * particleBounceDamping
+					if p.bounces > 0 {
+						p.bounces--
+					}
+				}
+			}
+		}
 		alive = append(alive, p)
 	}
 	g.particles = alive
@@ -530,13 +926,38 @@ const maxTransparentParticles = 350
 // particles grows to smokeGrowEnd within the first slice of the hold
 // window (not linearly across the whole life) so "big" and "opaque" line
 // up instead of the cloud only ever being one or the other.
+// particleSightRadius is the same generous view-cone margin
+// collectWorldObjects' mobjSightRadius gives things/projectiles, sized up a
+// bit further: a translucent smoke puff grows to sizeMul*smokeGrowEnd (2.6x)
+// and drifts as it ages, so it needs more slack than a fixed-size monster
+// sprite to avoid visibly popping in right at the screen edge. Cheap to be
+// generous here — this is a coarse cone test, not a hard clip, so a few
+// extra borderline particles surviving it costs nothing.
+const particleSightRadius = 300.0
+
 func (g *Game) collectAllParticleSprites() (additive, transparent []worldgeo.Sprite) {
 	additive = g.hwParticleSprites[:0]
 	transparent = g.hwTransparentParticleSprites[:0]
 	transparentFull := false
+	// viewCam mirrors collectWorldObjects' own: g.particles can run into the
+	// tens of thousands after a big explosion's spark burst (see this
+	// function's own doc comment), and every one of them used to become a
+	// worldgeo.Sprite — triangulated, packed, and submitted to the GPU —
+	// regardless of whether it was anywhere near the camera's view. Dropping
+	// the off-screen ones here, before any of that work happens, is the same
+	// win cullLightsToView/collectWorldObjects already bank for lights and
+	// things.
+	fov := g.Camera.FOVDeg
+	if fov <= 0 {
+		fov = 90
+	}
+	viewCam := worldgeo.Camera{X: g.Camera.X, Y: g.Camera.Y, Angle: g.Camera.Angle, FOVDeg: fov}
 	for _, p := range g.particles {
 		if len(p.frames) == 0 {
 			continue
+		}
+		if !worldgeo.LightVisible(viewCam, p.X, p.Y, particleSightRadius) {
+			continue // outside the (widened) view cone — still ages/expires normally, just isn't drawn this frame
 		}
 		idx := (int(p.age*p.frameRate) + p.framePhase) % len(p.frames)
 
@@ -545,6 +966,9 @@ func (g *Game) collectAllParticleSprites() (additive, transparent []worldgeo.Spr
 			if frac := p.age / p.life; frac > particleFadeStart {
 				t := (frac - particleFadeStart) / (1 - particleFadeStart) // 0..1 over the back half of life
 				size *= 1 - t*(1-particleFadeFloor)
+			}
+			if p.pulseHz > 0 {
+				size *= 1 + p.pulseAmp*math.Sin(p.age*p.pulseHz*2*math.Pi+p.pulsePhase)
 			}
 			additive = append(additive, worldgeo.Sprite{
 				X: float32(p.X), Y: float32(p.Y), Z: float32(p.Z),
@@ -738,26 +1162,29 @@ const smokeTexelsPerUnit = 10.5
 // *Loaded bools latch after the first attempt (successful or not) so a
 // missing pack isn't retried every explosion.
 var (
-	sparkFrames                 []*assets.RGBA
-	sparkFramesLoaded           bool
-	chunkFrames                 []*assets.RGBA
-	chunkFramesLoaded           bool
-	fireFrames                  []*assets.RGBA
-	fireFramesLoaded            bool
-	smokeFrames                 []*assets.RGBA
-	smokeFramesLoaded           bool
-	rocketFlameFrames           []*assets.RGBA
-	rocketFlameFramesLoaded     bool
-	steamFrames                 []*assets.RGBA
-	steamFramesLoaded           bool
-	mistFrames                  []*assets.RGBA
-	mistFramesLoaded            bool
-	bubbleFrames                []*assets.RGBA
-	bubbleFramesLoaded          bool
-	toxicSmokeFrames            []*assets.RGBA
-	toxicSmokeFramesLoaded      bool
-	teleportGlitterFrames       []*assets.RGBA
-	teleportGlitterFramesLoaded bool
+	sparkFrames             []*assets.RGBA
+	sparkFramesLoaded       bool
+	chunkFrames             []*assets.RGBA
+	chunkFramesLoaded       bool
+	fireFrames              []*assets.RGBA
+	fireFramesLoaded        bool
+	smokeFrames             []*assets.RGBA
+	smokeFramesLoaded       bool
+	rocketFlameFrames       []*assets.RGBA
+	rocketFlameFramesLoaded bool
+	steamFrames             []*assets.RGBA
+	steamFramesLoaded       bool
+	mistFrames              []*assets.RGBA
+	mistFramesLoaded        bool
+	bubbleFrames            []*assets.RGBA
+	bubbleFramesLoaded      bool
+	toxicSmokeFrames        []*assets.RGBA
+	toxicSmokeFramesLoaded  bool
+	// teleportGlitterColorVariants[c] is colour c's own full set of
+	// teleportGlitterFrameCount length-variant frames — see
+	// loadTeleportGlitterColorVariants.
+	teleportGlitterColorVariants       [][]*assets.RGBA
+	teleportGlitterColorVariantsLoaded bool
 )
 
 func loadSparkFrames() []*assets.RGBA {
@@ -990,6 +1417,217 @@ func tintFramesHot(src []*assets.RGBA) []*assets.RGBA {
 	return tintFrames(src, [3]float32{0.85, 0.95, 1.1}, [3]float32{55, 100, 165})
 }
 
+// tintFramesBFGGreen returns new copies of src pushed toward the BFG's own
+// green instead of whatever hue the source art natively has — the same
+// green as its BFE1/BFE2 explosion animation and its dynamic light
+// (lights.go's BFE1 case: r=0.50, g=1.0, b=0.45) — see tintFrames. Red and
+// blue are both pulled well down while green is pushed to its ceiling, so
+// even a hot white/yellow source core reads as bright green instead of
+// leaving a pale or yellow-white centre behind.
+func tintFramesBFGGreen(src []*assets.RGBA) []*assets.RGBA {
+	return tintFrames(src, [3]float32{0.35, 1.0, 0.40}, [3]float32{10, 60, 10})
+}
+
+// tintKeyframe is one stop along a tintFramesGradient — the same [mul, add]
+// pair a single tintFrames call takes, just named so a gradient's keyframe
+// list reads as a sequence of colours rather than a wall of anonymous
+// [3]float32 pairs.
+type tintKeyframe [2][3]float32
+
+// tintFramesGradient returns steps re-tinted copies of src (see
+// tintFrames), their tint interpolated evenly along the given sequence of
+// keyframes — the first keyframe lands exactly on step 0, the last exactly
+// on step steps-1, and every keyframe in between is spaced evenly across
+// the run, with straight linear interpolation of mul/add between whichever
+// pair of keyframes a given step falls between. Used wherever a burst
+// wants each particle to independently land somewhere along a smooth
+// multi-colour progression (e.g. loadPlasmaSparkColorVariants' white-to-
+// blue, loadRocketSparkColorVariants' red-orange-yellow-white) instead of
+// every particle sharing one fixed tint. Needs at least 2 keyframes and a
+// positive steps; callers here only ever pass their own fixed constants,
+// so this is unchecked rather than returning an error.
+func tintFramesGradient(src []*assets.RGBA, steps int, keyframes ...tintKeyframe) [][]*assets.RGBA {
+	segs := len(keyframes) - 1
+	out := make([][]*assets.RGBA, steps)
+	for i := range out {
+		pos := float32(i) / float32(steps-1) * float32(segs)
+		seg := int(pos)
+		if seg >= segs {
+			seg = segs - 1
+		}
+		t := pos - float32(seg)
+		a, b := keyframes[seg], keyframes[seg+1]
+		var mul, add [3]float32
+		for c := 0; c < 3; c++ {
+			mul[c] = a[0][c] + (b[0][c]-a[0][c])*t
+			add[c] = a[1][c] + (b[1][c]-a[1][c])*t
+		}
+		out[i] = tintFrames(src, mul, add)
+	}
+	return out
+}
+
+// bfgSparkFrames caches loadBFGSparkFrames' tinted output the same way
+// sparkFrames caches the untinted original above.
+var (
+	bfgSparkFrames       []*assets.RGBA
+	bfgSparkFramesLoaded bool
+)
+
+// loadBFGSparkFrames returns the shared spark art re-tinted toward the
+// BFG's own green (tintFramesBFGGreen) — see explosionBFG's own doc
+// comment for why: its blast should add to its green explosion animation,
+// not fight it with generic yellow/orange debris. Lazily loaded and cached
+// like every other frame pack in this file, so nothing is loaded/tinted
+// until a BFG actually explodes. There is no loadBFGChunkFrames or
+// loadBFGFireFrames — explosionBFG has no chunk or fire layer at all (see
+// its own doc comment: at BFG size, tinted chunks/fire read as big
+// shapeless green blobs rather than debris or flame).
+func loadBFGSparkFrames() []*assets.RGBA {
+	if bfgSparkFramesLoaded {
+		return bfgSparkFrames
+	}
+	bfgSparkFramesLoaded = true
+	if base := loadSparkFrames(); len(base) > 0 {
+		bfgSparkFrames = tintFramesBFGGreen(base)
+	}
+	return bfgSparkFrames
+}
+
+// plasmaSparkFrames/ChunkFrames/FireFrames cache loadPlasmaSparkFrames et
+// al.'s tinted output the same way bfgSparkFrames caches its own above.
+var (
+	plasmaSparkFrames       []*assets.RGBA
+	plasmaSparkFramesLoaded bool
+	plasmaChunkFrames       []*assets.RGBA
+	plasmaChunkFramesLoaded bool
+	plasmaFireFrames        []*assets.RGBA
+	plasmaFireFramesLoaded  bool
+)
+
+// loadPlasmaSparkFrames/ChunkFrames/FireFrames return the shared
+// spark/chunk/fire art re-tinted white-blue-hot (tintFramesHot — the same
+// tint the rocket exhaust jet already uses, see loadRocketFlameFrames)
+// instead of the generic yellow/orange every other explosion's debris and
+// fire use — see explosionEnergy's own doc comment for why: the plasma
+// rifle's blast should match its own cyan-blue bolt (lights.go's PLSE
+// case), not fight it with yellow fire. Lazily loaded and cached like
+// every other frame pack in this file, so nothing is loaded/tinted until a
+// plasma bolt actually explodes.
+func loadPlasmaSparkFrames() []*assets.RGBA {
+	if plasmaSparkFramesLoaded {
+		return plasmaSparkFrames
+	}
+	plasmaSparkFramesLoaded = true
+	if base := loadSparkFrames(); len(base) > 0 {
+		plasmaSparkFrames = tintFramesHot(base)
+	}
+	return plasmaSparkFrames
+}
+
+// plasmaSparkColorSteps is how many distinct tints loadPlasmaSparkColorVariants
+// builds, evenly spanning white-hot (tintFramesHot's own tint) to a deep,
+// saturated blue — each plasma spark independently picks one at spawn time
+// (see spawnBurst's colorVariants handling), so a burst reads as a genuine
+// scatter of different-coloured sparks instead of one flat tint repeated
+// across every one of them. 8 is enough steps that the variety reads as
+// continuous rather than a few visibly-repeating buckets, without building
+// (and holding in memory) many more full copies of the spark art than that
+// actually buys visually.
+const plasmaSparkColorSteps = 8
+
+// plasmaSparkColorVariants caches loadPlasmaSparkColorVariants' output the
+// same way plasmaSparkFrames caches loadPlasmaSparkFrames' above.
+var (
+	plasmaSparkColorVariants       [][]*assets.RGBA
+	plasmaSparkColorVariantsLoaded bool
+)
+
+// loadPlasmaSparkColorVariants returns plasmaSparkColorSteps re-tinted
+// copies of the shared spark art (loadSparkFrames), their tints linearly
+// interpolated from tintFramesHot's own white-blue-hot mul/add (step 0) to
+// a deep saturated blue — red and green pushed hard toward black, blue
+// held high (step plasmaSparkColorSteps-1) — see tintFrames for the
+// mul/add shape. Each variant is tinted ONCE here and cached, not
+// per-particle: spawnBurst just indexes into this slice with a single
+// random pick per spark, so giving every spark its own colour costs one
+// int and one slice access at spawn time, not a re-tint. Lazily built like
+// every other frame pack in this file, so nothing is tinted until a plasma
+// bolt actually explodes.
+func loadPlasmaSparkColorVariants() [][]*assets.RGBA {
+	if plasmaSparkColorVariantsLoaded {
+		return plasmaSparkColorVariants
+	}
+	plasmaSparkColorVariantsLoaded = true
+	base := loadSparkFrames()
+	if len(base) == 0 {
+		return nil
+	}
+	plasmaSparkColorVariants = tintFramesGradient(base, plasmaSparkColorSteps, tintKeyframe{
+		{0.85, 0.95, 1.1}, {55, 100, 165}, // white-hot (tintFramesHot's own values)
+	}, tintKeyframe{
+		{0.15, 0.25, 1.0}, {0, 5, 200}, // deep, saturated blue
+	})
+	return plasmaSparkColorVariants
+}
+
+// rocketSparkColorSteps/rocketSparkColorVariants/Loaded are
+// plasmaSparkColorSteps/Variants/Loaded's counterpart for the rocket
+// launcher's own spark layer — see loadRocketSparkColorVariants.
+const rocketSparkColorSteps = 12
+
+var (
+	rocketSparkColorVariants       [][]*assets.RGBA
+	rocketSparkColorVariantsLoaded bool
+)
+
+// loadRocketSparkColorVariants returns rocketSparkColorSteps re-tinted
+// copies of the shared spark art, their tints stepped evenly through a
+// glowing-ember gradient — red, to orange, to yellow, to white — instead
+// of one flat tint, the same "each spark independently picks one at spawn
+// time" shape loadPlasmaSparkColorVariants already uses (see
+// tintFramesGradient). Lazily built and cached like every other frame pack
+// in this file, so nothing is tinted until a rocket actually explodes.
+func loadRocketSparkColorVariants() [][]*assets.RGBA {
+	if rocketSparkColorVariantsLoaded {
+		return rocketSparkColorVariants
+	}
+	rocketSparkColorVariantsLoaded = true
+	base := loadSparkFrames()
+	if len(base) == 0 {
+		return nil
+	}
+	rocketSparkColorVariants = tintFramesGradient(base, rocketSparkColorSteps,
+		tintKeyframe{{0.9, 0.15, 0.1}, {80, 0, 0}},      // glowing red
+		tintKeyframe{{0.95, 0.55, 0.1}, {60, 20, 0}},    // orange
+		tintKeyframe{{0.95, 0.85, 0.15}, {40, 40, 0}},   // yellow
+		tintKeyframe{{0.85, 0.95, 1.1}, {55, 100, 165}}, // glowing white (tintFramesHot's own values)
+	)
+	return rocketSparkColorVariants
+}
+
+func loadPlasmaChunkFrames() []*assets.RGBA {
+	if plasmaChunkFramesLoaded {
+		return plasmaChunkFrames
+	}
+	plasmaChunkFramesLoaded = true
+	if base := loadChunkFrames(); len(base) > 0 {
+		plasmaChunkFrames = tintFramesHot(base)
+	}
+	return plasmaChunkFrames
+}
+
+func loadPlasmaFireFrames() []*assets.RGBA {
+	if plasmaFireFramesLoaded {
+		return plasmaFireFrames
+	}
+	plasmaFireFramesLoaded = true
+	if base := loadFireFrames(); len(base) > 0 {
+		plasmaFireFrames = tintFramesHot(base)
+	}
+	return plasmaFireFrames
+}
+
 // smokeGlowFrameCount/Size: loadSmokeFrames returns procedurally-generated
 // soft cloud puffs, not the WAD's SMOK*.png sprite frames. Those are
 // Doom-era pixel-cutout art — a hard boolean silhouette with no soft
@@ -1135,57 +1773,105 @@ func loadBubbleFrames() []*assets.RGBA {
 	return bubbleFrames
 }
 
-// teleportGlitterFrameCount/Size/TexelsPerUnit: loadTeleportGlitterFrames
-// returns procedurally-generated soft glints (genTeleportGlitter) rather
-// than any WAD sprite art — same reasoning as fire/smoke's own switch to
-// procedural texture generation (see genFireGlow's doc comment): a
-// procedural radial gradient guarantees no hard-edged silhouette, which a
-// pixel-art sprite would expose the instant real/additive blending draws
-// it at particle scale. A handful of independently-generated frames (not
-// one frame reused) gives each mote a slightly different glint shape as it
-// animates, reading as a subtle twinkle rather than a perfectly uniform dot.
+// teleportGlitterFrameCount/Width/Min|MaxLenMul/TexelsPerUnit:
+// loadTeleportGlitterColorVariants returns procedurally-generated soft
+// comet-like streaks (genTeleportGlitter) rather than any WAD sprite art —
+// same reasoning as fire/smoke's own switch to procedural texture
+// generation (see genFireGlow's doc comment): a procedural gradient
+// guarantees no hard-edged silhouette, which a pixel-art sprite would
+// expose the instant real/additive blending draws it at particle scale.
+// Each of teleportGlitterColors' colours gets its own full spread of
+// lengths (short blip to long trailing streak); a teleport glitter
+// particle picks one colour AND is pinned to one length within it for its
+// whole life (see spawnTeleportMote's frameRate: 0) rather than animating
+// through either, so a burst of motes reads as a scatter of different
+// colours and streak lengths rather than a uniform dot.
 const (
-	teleportGlitterFrameCount    = 4
-	teleportGlitterGlyphSize     = 24
+	teleportGlitterFrameCount    = 6
+	teleportGlitterWidth         = 10
+	teleportGlitterMinLenMul     = 1.5
+	teleportGlitterMaxLenMul     = 6.0
 	teleportGlitterTexelsPerUnit = 12.0
 )
 
-func loadTeleportGlitterFrames() []*assets.RGBA {
-	if teleportGlitterFramesLoaded {
-		return teleportGlitterFrames
-	}
-	teleportGlitterFramesLoaded = true
-	teleportGlitterFrames = make([]*assets.RGBA, teleportGlitterFrameCount)
-	for i := range teleportGlitterFrames {
-		teleportGlitterFrames[i] = genTeleportGlitter(teleportGlitterGlyphSize)
-	}
-	return teleportGlitterFrames
+// teleportGlitterColors is the disco palette each glitter mote's tail
+// randomly picks from (see spawnTeleportMote) — a full spread around the
+// hue wheel rather than the single fixed blue this used to be, each pushed
+// toward a vivid, saturated tail so the burst reads as genuinely
+// multi-coloured, not a pastel wash. Order doesn't matter (picked by
+// random index, not sequentially).
+var teleportGlitterColors = [][3]float64{
+	{1.00, 0.15, 0.15}, // red
+	{1.00, 0.55, 0.10}, // orange
+	{1.00, 0.95, 0.20}, // yellow
+	{0.25, 1.00, 0.30}, // green
+	{0.20, 0.90, 1.00}, // cyan
+	{0.15, 0.45, 1.00}, // blue — the original's own tail colour
+	{0.60, 0.20, 1.00}, // purple
+	{1.00, 0.25, 0.75}, // magenta/pink
 }
 
-// genTeleportGlitter procedurally paints one small soft glint — a bright
-// white-hot core cooling to blue at the rim, entirely soft-edged (see this
-// function group's own doc comment above) — standing in for a teleporter
-// pad's rising light motes (engine/teleportambience.go).
-func genTeleportGlitter(size int) *assets.RGBA {
-	pix := make([]byte, size*size*4)
-	c := float64(size-1) / 2
-	for y := 0; y < size; y++ {
-		for x := 0; x < size; x++ {
-			dx, dy := float64(x)-c, float64(y)-c
-			d := math.Sqrt(dx*dx+dy*dy) / c
-			o := (y*size + x) * 4
+func loadTeleportGlitterColorVariants() [][]*assets.RGBA {
+	if teleportGlitterColorVariantsLoaded {
+		return teleportGlitterColorVariants
+	}
+	teleportGlitterColorVariantsLoaded = true
+	out := make([][]*assets.RGBA, len(teleportGlitterColors))
+	for c, col := range teleportGlitterColors {
+		frames := make([]*assets.RGBA, teleportGlitterFrameCount)
+		for i := range frames {
+			frac := float64(i) / float64(teleportGlitterFrameCount-1)
+			lenMul := teleportGlitterMinLenMul + (teleportGlitterMaxLenMul-teleportGlitterMinLenMul)*frac
+			h := int(float64(teleportGlitterWidth) * lenMul)
+			frames[i] = genTeleportGlitter(teleportGlitterWidth, h, col[0], col[1], col[2])
+		}
+		out[c] = frames
+	}
+	teleportGlitterColorVariants = out
+	return teleportGlitterColorVariants
+}
+
+// genTeleportGlitter procedurally paints one soft comet-like streak, w wide
+// and h tall: a bright white-hot head at row 0 cooling toward (tailR,
+// tailG, tailB) and fading to transparent down the tail (row h-1) —
+// entirely soft-edged (see this function group's own doc comment above).
+// tailR/G/B are 0..1; t eases toward the tail colour a little slower than
+// the raw row fraction v, so the head still reads as white-hot for a beat
+// before visibly taking on this mote's own colour, the same shape the
+// original fixed-blue version had, just generalised to any tail colour
+// instead of one hardcoded blue (see loadTeleportGlitterColorVariants for
+// the disco palette this now serves). OffsetY: 0 anchors the BRIGHT HEAD at
+// the particle's own Z (see worldgeo.Sprite's topZ/botZ math), so the tail
+// trails below/behind it as it rises — standing in for a teleporter pad's
+// rising light motes (engine/teleportambience.go).
+func genTeleportGlitter(w, h int, tailR, tailG, tailB float64) *assets.RGBA {
+	pix := make([]byte, w*h*4)
+	cx := float64(w-1) / 2
+	rx := cx * 0.95
+	for y := 0; y < h; y++ {
+		v := 0.0
+		if h > 1 {
+			v = float64(y) / float64(h-1) // 0 at the head, 1 at the tail's tip
+		}
+		rowRx := rx * (1 - 0.5*v)      // the streak narrows toward its tail
+		rowAlpha := math.Pow(1-v, 1.6) // and fades toward its tail
+		t := math.Pow(v, 0.8)
+		for x := 0; x < w; x++ {
+			d := math.Abs(float64(x)-cx) / math.Max(rowRx, 1e-3)
+			o := (y*w + x) * 4
 			if d >= 1 {
 				pix[o+3] = 0
 				continue
 			}
-			a := math.Pow(1-d, 2.4)
-			pix[o+0] = clampByte(float32(255 * math.Max(0, 1-1.6*d)))
-			pix[o+1] = clampByte(float32(255 * math.Max(0.55, 1-0.9*d)))
-			pix[o+2] = 255
+			edge := math.Pow(1-d, 2.0)
+			a := edge * rowAlpha
+			pix[o+0] = clampByte(float32(255 * (1 + (tailR-1)*t))) // white head -> tailR/G/B at the tip
+			pix[o+1] = clampByte(float32(255 * (1 + (tailG-1)*t)))
+			pix[o+2] = clampByte(float32(255 * (1 + (tailB-1)*t)))
 			pix[o+3] = clampByte(float32(a * 255))
 		}
 	}
-	return &assets.RGBA{Width: size, Height: size, Pix: pix, TexelsPerUnit: teleportGlitterTexelsPerUnit, OffsetX: size / 2, OffsetY: size / 2}
+	return &assets.RGBA{Width: w, Height: h, Pix: pix, TexelsPerUnit: teleportGlitterTexelsPerUnit, OffsetX: w / 2, OffsetY: 0}
 }
 
 func clampByte(v float32) byte {

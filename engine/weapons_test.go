@@ -11,24 +11,26 @@ import (
 func TestWeaponBobXScalesWithSpeedAndStaysBounded(t *testing.T) {
 	g := &Game{Weapon: WeaponState{bobPhase: math.Pi / 2}} // sin(phase) = 1, so amplitude reads directly
 
-	if bx := g.weaponBobX(); bx != 0 {
+	bobX := func() float64 { x, _, _ := g.weaponBob(); return x }
+
+	if bx := bobX(); bx != 0 {
 		t.Errorf("standing still: bobX = %.3f, want 0", bx)
 	}
 
 	g.VelX, g.VelY = moveTopSpeed/2, 0
-	half := g.weaponBobX()
+	half := bobX()
 	if half <= 0 || half >= weaponBobMaxX {
 		t.Errorf("half speed: bobX = %.3f, want strictly between 0 and %.3f", half, weaponBobMaxX)
 	}
 
 	g.VelX = moveTopSpeed
-	full := g.weaponBobX()
+	full := bobX()
 	if math.Abs(full-weaponBobMaxX) > 1e-9 {
 		t.Errorf("top speed: bobX = %.3f, want %.3f", full, weaponBobMaxX)
 	}
 
 	g.VelX = moveTopSpeed * 4 // well past top speed — must still clamp, not overshoot
-	if over := g.weaponBobX(); math.Abs(over-weaponBobMaxX) > 1e-9 {
+	if over := bobX(); math.Abs(over-weaponBobMaxX) > 1e-9 {
 		t.Errorf("past top speed: bobX = %.3f, want clamped to %.3f", over, weaponBobMaxX)
 	}
 }
@@ -75,7 +77,9 @@ func TestWeaponBobPhaseSpeedTracksMovement(t *testing.T) {
 // (a quarter horizontal sway is a half vertical cycle — its peak).
 func TestWeaponBobYRisesTwicePerSwayCycleAndNeverDips(t *testing.T) {
 	g := &Game{Weapon: WeaponState{bobPhase: 0}}
-	if by := g.weaponBobY(); by != 0 {
+	bobY := func() float64 { _, y, _ := g.weaponBob(); return y }
+
+	if by := bobY(); by != 0 {
 		t.Errorf("phase 0: bobY = %.3f, want 0", by)
 	}
 
@@ -83,7 +87,7 @@ func TestWeaponBobYRisesTwicePerSwayCycleAndNeverDips(t *testing.T) {
 
 	for _, phase := range []float64{0, math.Pi / 2, math.Pi, 3 * math.Pi / 2} {
 		g.Weapon.bobPhase = phase
-		if by := g.weaponBobY(); by < 0 {
+		if by := bobY(); by < 0 {
 			t.Errorf("phase %.2f: bobY = %.3f, want >= 0 (never dips below rest)", phase, by)
 		}
 	}
@@ -91,7 +95,7 @@ func TestWeaponBobYRisesTwicePerSwayCycleAndNeverDips(t *testing.T) {
 	// A quarter horizontal cycle (phase = pi/4) is where sin(2*phase) peaks
 	// at 1 — the vertical bob's first rise, at the top of its range.
 	g.Weapon.bobPhase = math.Pi / 4
-	if by := g.weaponBobY(); math.Abs(by-weaponBobMaxY) > 1e-9 {
+	if by := bobY(); math.Abs(by-weaponBobMaxY) > 1e-9 {
 		t.Errorf("phase pi/4 (moving at top speed): bobY = %.3f, want peak %.3f", by, weaponBobMaxY)
 	}
 }
@@ -103,20 +107,22 @@ func TestWeaponBobYRisesTwicePerSwayCycleAndNeverDips(t *testing.T) {
 // recedes, swinging back re-centres and grows close again.
 func TestWeaponBobScaleClosestAtCentreFarthestAtExtremes(t *testing.T) {
 	g := &Game{Weapon: WeaponState{bobPhase: 0}}
-	if s := g.weaponBobScale(); s != 1 {
+	bobScale := func() float64 { _, _, s := g.weaponBob(); return s }
+
+	if s := bobScale(); s != 1 {
 		t.Errorf("standing still: bobScale = %.4f, want 1 (no size change at rest)", s)
 	}
 
 	g.VelX, g.VelY = moveTopSpeed, 0
 
 	g.Weapon.bobPhase = 0
-	centre := g.weaponBobScale()
+	centre := bobScale()
 	if math.Abs(centre-(1+weaponBobDepth)) > 1e-9 {
 		t.Errorf("centre of sway: bobScale = %.4f, want peak %.4f (closest)", centre, 1+weaponBobDepth)
 	}
 
 	g.Weapon.bobPhase = math.Pi / 2
-	extreme := g.weaponBobScale()
+	extreme := bobScale()
 	if math.Abs(extreme-(1-weaponBobDepth)) > 1e-9 {
 		t.Errorf("side extreme: bobScale = %.4f, want trough %.4f (farthest)", extreme, 1-weaponBobDepth)
 	}

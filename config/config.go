@@ -223,6 +223,18 @@ type Config struct {
 	// than a per-frame shader branch, so it's opt-in rather than silently
 	// changing every map's render path by default.
 	WaterRefraction bool `json:"waterRefraction"`
+	// RealShadows turns on real shadow-map-based occlusion for a small
+	// budget of the most important dynamic lights (torches near a wall,
+	// muzzle flash, in-flight shots): each gets a cube depth map rendered
+	// from its own position, sampled during shading so static geometry
+	// genuinely blocks its light — unlike the always-on screen-space
+	// shadow term (worldambient.frag's dynShadow, unaffected by this
+	// toggle), which only sees whatever's already in the camera's own
+	// depth buffer. Default false: this is the first cube-map render pass
+	// in this codebase and the first new GPU work added purely for visual
+	// fidelity rather than a gameplay-visible feature, so it's opt-in
+	// rather than silently changing every map's render cost by default.
+	RealShadows bool `json:"realShadows"`
 	// SwitchWeapons swaps the two games' arsenals: a Doom WAD is then played
 	// with Heretic's weapons (Elven Wand, Ethereal Crossbow, Dragon Claw,
 	// Hellstaff, Phoenix Rod, Firemace) and a Heretic WAD with Doom's
@@ -400,6 +412,7 @@ func Default() Config {
 		ExplosionParticles:   true,
 		LiquidAmbience:       true,
 		WaterRefraction:      false,
+		RealShadows:          false,
 		SwitchWeapons:        false,
 		FogColor:             "",
 		FogDensity:           0,

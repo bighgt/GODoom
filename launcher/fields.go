@@ -175,6 +175,8 @@ var fields = []field{
 		boolAt: func(c *config.Config) *bool { return &c.LiquidAmbience }},
 	{id: "waterRefraction", label: "Water Refraction", hint: "Real depth-based refraction/murk for water. Only visibly differs from the default fake shading on maps with real geometry beneath a transparent water surface.", section: SectionRendering, kind: kindCheckbox,
 		boolAt: func(c *config.Config) *bool { return &c.WaterRefraction }},
+	{id: "realShadows", label: "Real Shadows", hint: "Real shadow-map occlusion for a few nearby dynamic lights (torches, muzzle flash, in-flight shots), on top of the always-on screen-space shadow term.", section: SectionRendering, kind: kindCheckbox,
+		boolAt: func(c *config.Config) *bool { return &c.RealShadows }},
 	{id: "fogColor", label: "Fog Colour (hex RRGGBB)", hint: "Distance-fog colour as hex RRGGBB, e.g. 202830.", section: SectionRendering, kind: kindTextField,
 		stringAt: func(c *config.Config) *string { return &c.FogColor }},
 	{id: "fogDensity", label: "Fog Density", hint: "Thickness of distance fog. 0 disables it.", section: SectionRendering, kind: kindSlider,

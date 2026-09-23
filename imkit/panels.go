@@ -1,7 +1,7 @@
 package imkit
 
-// Layout / container widgets: a draggable splitter, a tab strip, collapsible
-// sections, and a vertical scroll region.
+// Layout / container widgets: a draggable splitter, a tab strip, and a
+// vertical scroll region.
 
 // SplitState is the persistent position of one Splitter, owned by the app.
 type SplitState struct {
@@ -53,45 +53,6 @@ func (ui *UI) VSplit(id string, area Rect, s *SplitState, handle, minSide int) (
 	return
 }
 
-// HSplit is VSplit for a horizontal divider (top / bottom).
-func (ui *UI) HSplit(id string, area Rect, s *SplitState, handle, minSide int) (top, bottom Rect) {
-	if s.Pos <= 0 {
-		s.Pos = area.Y + area.H/2
-	}
-	lo, hi := area.Y+minSide, area.Y+area.H-minSide-handle
-	if s.Pos < lo {
-		s.Pos = lo
-	}
-	if s.Pos > hi {
-		s.Pos = hi
-	}
-	bar := Rect{area.X, s.Pos, area.W, handle}
-	if ui.hover(bar) && ui.In.LeftClicked {
-		s.dragging = true
-	}
-	if s.dragging {
-		if ui.In.LeftDown {
-			s.Pos = int(ui.In.MouseY) - handle/2
-		} else {
-			s.dragging = false
-		}
-	}
-	if s.Pos < lo {
-		s.Pos = lo
-	}
-	if s.Pos > hi {
-		s.Pos = hi
-	}
-	col := Theme.Border
-	if ui.hover(bar) || s.dragging {
-		col = Theme.Accent
-	}
-	ui.C.FillRect(Rect{area.X, s.Pos, area.W, handle}, col)
-	top = Rect{area.X, area.Y, area.W, s.Pos - area.Y}
-	bottom = Rect{area.X, s.Pos + handle, area.W, area.Y + area.H - s.Pos - handle}
-	return
-}
-
 // Tabs draws a horizontal tab strip filling the top tabH pixels of area and
 // returns the body rect below it. *active is the selected index, clamped.
 func (ui *UI) Tabs(area Rect, tabH int, labels []string, active *int) Rect {
@@ -126,27 +87,6 @@ func (ui *UI) Tabs(area Rect, tabH int, labels []string, active *int) Rect {
 		}
 	}
 	return Rect{area.X, area.Y + tabH, area.W, area.H - tabH}
-}
-
-// SectionHeader draws a collapsible header row and toggles *open on click.
-// Returns *open for convenience.
-func (ui *UI) SectionHeader(r Rect, title string, open *bool) bool {
-	hot := ui.hover(r)
-	bg := Theme.Panel
-	if hot {
-		bg = Theme.ControlHover
-	}
-	ui.C.FillRect(r, bg)
-	arrow := "▸" // right-pointing
-	if *open {
-		arrow = "▾" // down-pointing
-	}
-	ui.C.Text(r.X+6, r.Y+r.H/2, arrow, Theme.TextDim)
-	ui.C.Text(r.X+20, r.Y+r.H/2, title, Theme.Text)
-	if hot && ui.In.LeftClicked {
-		*open = !*open
-	}
-	return *open
 }
 
 // Scroll is a vertical scroll region. Pass the viewport rect and the full

@@ -131,6 +131,31 @@ func (r *Renderer) Textures() *assets.Textures { return r.textures }
 // not a copy.
 func (r *Renderer) Overlay() []byte { return r.overlay }
 
+// OverlayDirty returns the row range [y0, y1) of Overlay() that could have
+// changed since the PREVIOUS call to BeginOverlayFrame — the union of what
+// that call cleared (last frame's touched rows, now zeroed) and what this
+// frame's own Draw* calls touched. A GPU backend re-uploading Overlay() every
+// frame can use this to copy only the changed rows instead of the whole
+// plane. Empty (y0 >= y1) means nothing changed at all this frame — the
+// weapon/HUD/crosshair/status bar all drew exactly what was already there,
+// which in practice only happens when there's nothing on screen to draw.
+func (r *Renderer) OverlayDirty() (y0, y1 int) {
+	y0, y1 = r.ovY0, r.ovY1
+	if r.ovPrevY1 <= r.ovPrevY0 {
+		return y0, y1
+	}
+	if y1 <= y0 {
+		return r.ovPrevY0, r.ovPrevY1
+	}
+	if r.ovPrevY0 < y0 {
+		y0 = r.ovPrevY0
+	}
+	if r.ovPrevY1 > y1 {
+		y1 = r.ovPrevY1
+	}
+	return y0, y1
+}
+
 // markOverlay records that overlay rows [y0, y1) were written this frame,
 // so BeginOverlayFrame's next clear can be limited to the touched span.
 // Callers pass their destination pixel bounds; the span is clamped and only

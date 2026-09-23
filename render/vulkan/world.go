@@ -62,6 +62,12 @@ var depthOnlyVertSPV []byte
 //go:embed shaders/depth.frag.spv
 var depthFragSPV []byte
 
+//go:embed shaders/shadow.vert.spv
+var shadowVertSPV []byte
+
+//go:embed shaders/shadow.frag.spv
+var shadowFragSPV []byte
+
 // testLightEnabled forces a magenta light at the camera (uploadWorldFrame) —
 // a bisection aid for "dynamic lights don't show". Set TPF_TESTLIGHT=1.
 var testLightEnabled = os.Getenv("TPF_TESTLIGHT") != ""
@@ -131,8 +137,15 @@ type worldUBO struct {
 	// this is > 0; 0 = off, the smooth vanilla gradient) — repurposes what
 	// was a spare pad float alongside the flashlight's own vec4, rather
 	// than growing the UBO for one more scalar.
-	CartoonBands       float32
-	spotPad1, spotPad2 float32
+	CartoonBands float32
+	// ShadowCount/ShadowFar (config realShadows): how many of the leading
+	// lights in lightPos/lightColor (0, 1, or 2 — always index 0 then 1,
+	// same "leading lights" order collectLights already produces for the
+	// screen-space shadow term) have a real cube shadow map this frame —
+	// world.frag's uShadowCube0/uShadowCube1 — and the shared far plane
+	// (world units) those maps were rendered with. These were a spare pad
+	// pair alongside CartoonBands, same reasoning.
+	ShadowCount, ShadowFar float32
 }
 
 func (u worldUBO) floats() [worldUBOHead]float32 {
@@ -146,7 +159,7 @@ func (u worldUBO) floats() [worldUBOHead]float32 {
 		u.SpotX, u.SpotY, u.SpotZ, u.SpotInvR2,
 		u.SpotDX, u.SpotDY, u.SpotDZ, u.SpotCosOuter,
 		u.SpotR, u.SpotG, u.SpotB, u.SpotIntensity,
-		u.SpotCosInner, u.CartoonBands, u.spotPad1, u.spotPad2,
+		u.SpotCosInner, u.CartoonBands, u.ShadowCount, u.ShadowFar,
 	}
 }
 
@@ -169,6 +182,12 @@ type worldSlot struct {
 	ovStageMapped unsafe.Pointer
 	ovImg         litImage
 	ovLayout      vk.ImageLayout
+	// ovUploadY0/Y1 is the row range uploadWorldFrame actually wrote into
+	// ovStage this frame (see its own comment on why it's not simply
+	// overlayY0/Y1) — recordWorldCommandBuffer's overlay copy step reads
+	// this instead of re-deriving it, and skips the copy entirely when
+	// empty.
+	ovUploadY0, ovUploadY1 int
 
 	scene litImage // offscreen colour (world pass target, blit pass source)
 	depth litImage // D32 depth for the world pass
@@ -187,7 +206,12 @@ type worldSlot struct {
 	preWaterColorLayout vk.ImageLayout
 	preWaterDepthLayout vk.ImageLayout
 
-	set1            vk.DescriptorSet // world.frag set 1: World UBO
+	// shadowCube[0]/[1] are this slot's real cube shadow maps (config
+	// realShadows) for the frame's leading light(s) — see worldshadow.go.
+	// Zero value (unbuilt) when !wr.realShadows.
+	shadowCube [shadowLightSlots]shadowCubeTarget
+
+	set1            vk.DescriptorSet // world.frag set 1: World UBO, uShadowCube0/1
 	setBlit         vk.DescriptorSet // worldblit.frag: uScene, uOverlay
 	setWaterCapture vk.DescriptorSet // waterrefract.frag set 2: uPreWaterColor, uPreWaterDepth — only when wr.waterRefraction
 }
@@ -213,28 +237,42 @@ type worldResources struct {
 	// inside rpOpaque instead, exactly like every other opaque flat.
 	waterRefraction bool
 
+	// realShadows is a construction-time-only gate (config realShadows,
+	// threaded through NewWorld) — see worldshadow.go's own doc comment.
+	// When true, rpShadow/plShadow/pipeShadow and each slot's shadowCube[]
+	// are built and recordWorldCommandBuffer renders real cube shadow maps
+	// for up to shadowLightSlots leading lights each frame; when false,
+	// only the always-built 1x1 dummyShadowCube exists, so world.frag's two
+	// samplerCube bindings stay legal but are never actually sampled
+	// (W.spotCosInner.z, the shadow count, is always 0).
+	realShadows bool
+
 	rpOpaque vk.RenderPass // opaque static geometry (water excluded when waterRefraction), always built
 	rpWater  vk.RenderPass // water (real refraction) + sprites/voxels/particles — only built when waterRefraction
+	rpShadow vk.RenderPass // depth-only cube shadow-map face pass — only built when realShadows
 
 	texSampler   vk.Sampler // wall/flat: linear + mip + anisotropic, REPEAT
 	clampSampler vk.Sampler // LUT / scene / overlay: linear, clamp-to-edge
-	depthSampler vk.Sampler // world-pass depth for the blit's water SSR: nearest, clamp
+	depthSampler vk.Sampler // world-pass depth for the blit's water SSR, and shadow cube sampling: nearest, clamp
 
-	dummyTex litImage // 1x1 black — set-0 binding 1 for textures with no brightmap
+	dummyTex        litImage         // 1x1 black — set-0 binding 1 for textures with no brightmap
+	dummyShadowCube shadowCubeTarget // always-built 1x1 cube — set-1 bindings 0/1 fallback when unused
 
 	dsl0            vk.DescriptorSetLayout // set 0: per-texture sampler2D
-	dsl1            vk.DescriptorSetLayout // set 1: World UBO
+	dsl1            vk.DescriptorSetLayout // set 1: uShadowCube0/1, World UBO
 	dslBlit         vk.DescriptorSetLayout // present: uScene, uOverlay
 	dslWaterCapture vk.DescriptorSetLayout // waterrefract.frag set 2: uPreWaterColor, uPreWaterDepth — only when waterRefraction
 
 	plWorld           vk.PipelineLayout
 	plBlit            vk.PipelineLayout
 	plWorldLiquid     vk.PipelineLayout // [dsl0, dsl1, dslWaterCapture] — only when waterRefraction
+	plShadow          vk.PipelineLayout // push-constant only (viewProj + lightPos/far) — only when realShadows
 	pipeWorld         vk.Pipeline
 	pipeDepth         vk.Pipeline // opaque static depth pre-pass (reuses plWorld)
 	pipeParticleAdd   vk.Pipeline // additive, no depth-write particle billboards (reuses plWorld) — see worldCreatePipelines
 	pipeParticleTrans vk.Pipeline // real alpha-blended, no depth-write particle billboards (reuses plWorld) — see worldCreatePipelines
 	pipeWorldLiquid   vk.Pipeline // real depth/refraction water (waterrefract.frag) — only when waterRefraction
+	pipeShadow        vk.Pipeline // cube shadow-map face pass (shadow.vert/frag) — only when realShadows
 	pipeBlit          vk.Pipeline
 
 	framePool vk.DescriptorPool // set1 + setBlit, one pair per slot
@@ -253,6 +291,7 @@ type worldResources struct {
 
 	bloom   worldBloom   // HDR bright-pass + blur (worldbloom.go)
 	ambient worldAmbient // quarter-res shadow/AO/god-ray term (worldambient.go)
+	resolve worldResolve // full-res SSR+ambient+tonemap resolve (worldresolve.go)
 
 	// Static world geometry (all walls + flats) — one device-local vertex
 	// buffer, re-uploaded only when the builder bumps StaticVersion (a door
@@ -263,12 +302,24 @@ type worldResources struct {
 	staticVBOCap  int
 	staticVersion uint32
 
-	packBuf       []byte // reused dynamic Geometry.Pack scratch
-	staticPackBuf []byte // reused static-geometry pack scratch
+	packBuf       []byte         // reused dynamic Geometry.Pack scratch
+	staticPackBuf []byte         // reused static-geometry pack scratch
+	lightCullBuf  []render.Light // reused cullLightsToView scratch
 
 	dbgLightLog int // rate-limits the one-off dynamic-light diagnostic
 
 	lightScaleRef float32
+
+	// prevOverlayRanges is a ring buffer of the overlay dirty range
+	// (DrawWorld's overlayY0/Y1) from each of the last maxFramesInFlight-1
+	// calls — see uploadWorldFrame's own comment on why a slot's overlay
+	// upload needs the union of ALL of these with this call's own range,
+	// not just the single most recent call's. Sized maxFramesInFlight-1
+	// because that's exactly how many OTHER-slot writes land between two
+	// visits to the same slot (0 when maxFramesInFlight is 1 — no other
+	// slot ever writes in between, so nothing to union).
+	prevOverlayRanges [maxFramesInFlight - 1][2]int
+	prevOverlayNext   int // next prevOverlayRanges index to overwrite (round-robin)
 
 	// Hemisphere ambient tint, averaged from the level's sky bitmap once and
 	// cached (keyed by the bitmap pointer) — world.frag's shadowed-pixel fill
@@ -283,15 +334,19 @@ type worldResources struct {
 // waterRefraction gates the real depth/refraction water pipeline (config
 // waterRefraction — see worldResources.waterRefraction's own doc comment
 // for what building with this on vs. off actually changes); it's a
-// construction-time-only choice, not a per-frame toggle. Shares the vanilla
-// bring-up (instance … sync objects) and adds the world resources.
-func NewWorld(win *window.Window, srcW, srcH int, vsync, debug, waterRefraction bool) (*Renderer, error) {
+// construction-time-only choice, not a per-frame toggle. realShadows gates
+// real cube shadow maps for a small budget of the leading dynamic lights
+// (config realShadows — see worldResources.realShadows's own doc comment).
+// Shares the vanilla bring-up (instance … sync objects) and adds the world
+// resources.
+func NewWorld(win *window.Window, srcW, srcH int, vsync, debug, waterRefraction, realShadows bool) (*Renderer, error) {
 	r := &Renderer{win: win, vsync: vsync, debug: debug, hw: true}
 	r.srcWidth, r.srcHeight = srcW, srcH // letterboxViewport reads these
 
 	r.wr = &worldResources{
 		w: srcW, h: srcH,
 		waterRefraction: waterRefraction,
+		realShadows:     realShadows,
 		texCache:        make(map[*assets.RGBA]*worldTex),
 		voxCache:        make(map[*assets.VoxelModel]*voxelMesh),
 		lightScaleRef:   float32(raster.LightScaleRef),
@@ -311,15 +366,19 @@ func NewWorld(win *window.Window, srcW, srcH int, vsync, debug, waterRefraction 
 		r.createSyncObjects,
 		r.worldCreateSamplers,
 		r.worldCreateOpaqueRenderPass,
-		r.worldCreateWaterRenderPass, // no-ops when !waterRefraction
+		r.worldCreateWaterRenderPass,  // no-ops when !waterRefraction
+		r.worldCreateShadowRenderPass, // no-op when !realShadows
 		r.worldCreateOffscreen,
 		r.worldCreateBloom, // before descriptors — setBlit samples bloom mip 0
 		r.worldCreateDummyTex,
+		r.worldCreateShadowTargets, // dummy cube always; per-slot real cubes when realShadows — before descriptors (their views get bound)
 		r.worldCreateBuffers,
-		r.worldCreateAmbientPass, // needs sl.depth/sl.scene (offscreen) + sl.ubo (buffers); before worldCreatePipelines (needs wr.ambient.dslSample)
+		r.worldCreateAmbientPass, // needs sl.depth/sl.scene (offscreen) + sl.ubo (buffers); before worldCreateResolvePass (samples wr.ambient.imgBlur)
+		r.worldCreateResolvePass, // needs sl.scene/sl.depth, wr.bloom.mip[0], wr.ambient.imgBlur; before worldCreatePipelines (needs wr.resolve.dslSample)
 		r.worldCreateDescriptorLayouts,
 		r.worldCreateDescriptors,
 		r.worldCreatePipelines,
+		r.worldCreateShadowPipeline, // no-op when !realShadows
 		r.worldCreateVoxelPipeline,
 	}
 	for _, step := range steps {
@@ -336,7 +395,7 @@ func NewWorld(win *window.Window, srcW, srcH int, vsync, debug, waterRefraction 
 // (camera + fade params + dynamic point lights) and overlay, then record the
 // world pass + present blit and submit. Mirrors DrawFrame's
 // acquire/submit/present bookkeeping.
-func (r *Renderer) DrawWorld(g *worldgeo.Geometry, cam worldgeo.Camera, w, h int, overlay []byte, lights []render.Light) error {
+func (r *Renderer) DrawWorld(g *worldgeo.Geometry, cam worldgeo.Camera, w, h int, overlay []byte, overlayY0, overlayY1 int, lights []render.Light) error {
 	if !r.hw {
 		return fmt.Errorf("vulkan: DrawWorld called on a renderer that isn't the hardware-geometry backend")
 	}
@@ -371,11 +430,25 @@ func (r *Renderer) DrawWorld(g *worldgeo.Geometry, cam worldgeo.Camera, w, h int
 		}
 	}
 
+	// Drop lights that can't possibly light anything on screen before they
+	// cost a UBO slot or a dynamicDiffuse() loop iteration on every fragment
+	// this frame — collectLights only distance-culls to the camera, so a
+	// torch just out of view (behind the player, around a corner) still paid
+	// full per-pixel shading cost every frame without this. Same generous
+	// cone test UpdateVisibility already uses to cull whole geometry cells;
+	// cam.ShadowCasterN is clamped to match since it indexes lightPos[] by
+	// the SAME count worldambient.frag's dynShadow() trusts, and that count
+	// was computed engine-side against the unculled list.
+	lights = r.cullLightsToView(cam, lights)
+	if cam.ShadowCasterN > len(lights) {
+		cam.ShadowCasterN = len(lights)
+	}
+
 	frame := r.currentFrame
 	vk.WaitForFences(r.device, 1, []vk.Fence{r.inFlight[frame]}, vk.True, vk.MaxUint64)
 
 	sl := &wr.slots[frame]
-	if err := r.uploadWorldFrame(sl, g, cam, overlay, lights); err != nil {
+	if err := r.uploadWorldFrame(sl, g, cam, overlay, overlayY0, overlayY1, lights); err != nil {
 		return err
 	}
 
@@ -396,7 +469,7 @@ func (r *Renderer) DrawWorld(g *worldgeo.Geometry, cam worldgeo.Camera, w, h int
 
 	cmd := r.commandBuffers[imageIndex]
 	vk.ResetCommandBuffer(cmd, 0)
-	if err := r.recordWorldCommandBuffer(cmd, imageIndex, frame, g, cam); err != nil {
+	if err := r.recordWorldCommandBuffer(cmd, imageIndex, frame, g, cam, lights); err != nil {
 		return err
 	}
 
@@ -526,11 +599,31 @@ func (r *Renderer) hemisphereAmbient(sky *assets.RGBA) (rr, gg, bb, strength flo
 	return wr.skyAmb[0], wr.skyAmb[1], wr.skyAmb[2], 1.0
 }
 
+// cullLightsToView drops lights whose reach can't overlap anything on
+// screen from cam (worldgeo.LightVisible — the same cone test
+// UpdateVisibility uses for geometry cells), compacting the survivors into
+// a reused buffer so this costs no allocation on a warm frame. Order is
+// preserved: shadowBudget's "the leading survivors get a real shadow map"
+// and the ambient pass's "the leading survivors get a screen-space one"
+// both still pick the most relevant lights first, just among ones that can
+// actually matter this frame.
+func (r *Renderer) cullLightsToView(cam worldgeo.Camera, lights []render.Light) []render.Light {
+	wr := r.wr
+	out := wr.lightCullBuf[:0]
+	for _, l := range lights {
+		if worldgeo.LightVisible(cam, float64(l.X), float64(l.Y), float64(l.Radius)) {
+			out = append(out, l)
+		}
+	}
+	wr.lightCullBuf = out
+	return out
+}
+
 // uploadWorldFrame packs g into slot sl's (host-visible) vertex buffer,
 // growing it if the frame outgrew it, and fills the World UBO (camera + fade
 // params + dynamic lights) and overlay staging. Called after sl's in-flight
 // fence has been waited on.
-func (r *Renderer) uploadWorldFrame(sl *worldSlot, g *worldgeo.Geometry, cam worldgeo.Camera, overlay []byte, lights []render.Light) error {
+func (r *Renderer) uploadWorldFrame(sl *worldSlot, g *worldgeo.Geometry, cam worldgeo.Camera, overlay []byte, overlayY0, overlayY1 int, lights []render.Light) error {
 	wr := r.wr
 
 	wr.packBuf = g.Pack(wr.packBuf)
@@ -600,6 +693,9 @@ func (r *Renderer) uploadWorldFrame(sl *worldSlot, g *worldgeo.Geometry, cam wor
 	if cam.CartoonShading {
 		u.CartoonBands = cartoonLightBands
 	}
+	if shN, shFar := shadowBudget(wr, lights); shN > 0 {
+		u.ShadowCount, u.ShadowFar = float32(shN), shFar
+	}
 	if cam.SpotIntensity > 0 {
 		rad := cam.SpotRadius
 		if rad < 0.001 {
@@ -654,14 +750,62 @@ func (r *Renderer) uploadWorldFrame(sl *worldSlot, g *worldgeo.Geometry, cam wor
 	}
 	vk.Memcopy(sl.uboMapped, unsafe.Slice((*byte)(unsafe.Pointer(&ubo[0])), worldUBOFloats*4))
 
+	// Overlay: only re-copy the rows that actually changed. overlayY0/Y1 is
+	// this call's own dirty range (raster.Renderer.OverlayDirty), but sl's
+	// image is one of maxFramesInFlight alternating buffers — every OTHER
+	// slot was written at least once since sl's own image was last updated
+	// (maxFramesInFlight calls ago), so sl's own image is missing each of
+	// those calls' dirty rows, not just the single most recent call's.
+	// Union in every entry of wr.prevOverlayRanges (the last
+	// maxFramesInFlight-1 calls' ranges — see its own doc comment) so the
+	// rows copied here cover everything that's actually different from
+	// what sl's image currently holds. A slot used for the first time
+	// (still its initial Undefined layout) has no valid prior contents at
+	// all, so that case forces a full-plane copy regardless.
+	upY0, upY1 := overlayY0, overlayY1
+	for _, rng := range wr.prevOverlayRanges {
+		ry0, ry1 := rng[0], rng[1]
+		if ry1 <= ry0 {
+			continue
+		}
+		if upY1 <= upY0 {
+			upY0, upY1 = ry0, ry1
+			continue
+		}
+		if ry0 < upY0 {
+			upY0 = ry0
+		}
+		if ry1 > upY1 {
+			upY1 = ry1
+		}
+	}
+	if n := len(wr.prevOverlayRanges); n > 0 {
+		wr.prevOverlayRanges[wr.prevOverlayNext] = [2]int{overlayY0, overlayY1}
+		wr.prevOverlayNext = (wr.prevOverlayNext + 1) % n
+	}
+
 	dst := unsafe.Slice((*byte)(sl.ovStageMapped), wr.w*wr.h*4)
-	if len(overlay) == len(dst) {
-		copy(dst, overlay)
-	} else {
+	if len(overlay) != len(dst) {
 		for i := range dst {
 			dst[i] = 0
 		}
+		sl.ovUploadY0, sl.ovUploadY1 = 0, wr.h
+		return nil
 	}
+	if sl.ovLayout == vk.ImageLayoutUndefined {
+		upY0, upY1 = 0, wr.h
+	}
+	if upY0 < 0 {
+		upY0 = 0
+	}
+	if upY1 > wr.h {
+		upY1 = wr.h
+	}
+	if upY1 > upY0 {
+		rb := wr.w * 4
+		copy(dst[upY0*rb:upY1*rb], overlay[upY0*rb:upY1*rb])
+	}
+	sl.ovUploadY0, sl.ovUploadY1 = upY0, upY1
 	return nil
 }
 
@@ -816,33 +960,51 @@ func (r *Renderer) recordWaterCapture(cmd vk.CommandBuffer, sl *worldSlot) {
 		vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageEarlyFragmentTestsBit)|vk.PipelineStageFlags(vk.PipelineStageLateFragmentTestsBit))
 }
 
-func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uint32, frame int, g *worldgeo.Geometry, cam worldgeo.Camera) error {
+func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uint32, frame int, g *worldgeo.Geometry, cam worldgeo.Camera, lights []render.Light) error {
 	wr := r.wr
 	sl := &wr.slots[frame]
 	if res := vk.BeginCommandBuffer(cmd, &vk.CommandBufferBeginInfo{SType: vk.StructureTypeCommandBufferBeginInfo}); res != vk.Success {
 		return fmt.Errorf("vulkan: begin command buffer: %s", vk.Error(res))
 	}
 
-	// (1) overlay staging -> this slot's overlay image.
-	rng := vk.ImageSubresourceRange{AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit), LevelCount: 1, LayerCount: 1}
-	srcStage := vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit)
-	srcAccess := vk.AccessFlags(vk.AccessShaderReadBit)
-	if sl.ovLayout == vk.ImageLayoutUndefined {
-		srcStage = vk.PipelineStageFlags(vk.PipelineStageTopOfPipeBit)
-		srcAccess = 0
+	// (1) overlay staging -> this slot's overlay image — only the rows
+	// uploadWorldFrame actually copied into staging (sl.ovUploadY0/Y1),
+	// skipped entirely when nothing changed: the HUD/weapon overlay is
+	// mostly blank/unchanged most frames (see raster.Renderer.OverlayDirty),
+	// so re-copying and re-barriering the whole render-resolution plane
+	// every frame regardless was pure waste on all but the rows that
+	// actually moved.
+	if sl.ovUploadY1 > sl.ovUploadY0 {
+		rng := vk.ImageSubresourceRange{AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit), LevelCount: 1, LayerCount: 1}
+		srcStage := vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit)
+		srcAccess := vk.AccessFlags(vk.AccessShaderReadBit)
+		if sl.ovLayout == vk.ImageLayoutUndefined {
+			srcStage = vk.PipelineStageFlags(vk.PipelineStageTopOfPipeBit)
+			srcAccess = 0
+		}
+		barrier(cmd, sl.ovImg.image, rng, sl.ovLayout, vk.ImageLayoutTransferDstOptimal,
+			srcAccess, vk.AccessFlags(vk.AccessTransferWriteBit),
+			srcStage, vk.PipelineStageFlags(vk.PipelineStageTransferBit))
+		rows := uint32(sl.ovUploadY1 - sl.ovUploadY0)
+		cp := vk.BufferImageCopy{
+			BufferOffset:     vk.DeviceSize(sl.ovUploadY0 * wr.w * 4),
+			ImageSubresource: vk.ImageSubresourceLayers{AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit), LayerCount: 1},
+			ImageOffset:      vk.Offset3D{Y: int32(sl.ovUploadY0)},
+			ImageExtent:      vk.Extent3D{Width: uint32(wr.w), Height: rows, Depth: 1},
+		}
+		vk.CmdCopyBufferToImage(cmd, sl.ovStage, sl.ovImg.image, vk.ImageLayoutTransferDstOptimal, 1, []vk.BufferImageCopy{cp})
+		barrier(cmd, sl.ovImg.image, rng, vk.ImageLayoutTransferDstOptimal, vk.ImageLayoutShaderReadOnlyOptimal,
+			vk.AccessFlags(vk.AccessTransferWriteBit), vk.AccessFlags(vk.AccessShaderReadBit),
+			vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit))
+		sl.ovLayout = vk.ImageLayoutShaderReadOnlyOptimal
 	}
-	barrier(cmd, sl.ovImg.image, rng, sl.ovLayout, vk.ImageLayoutTransferDstOptimal,
-		srcAccess, vk.AccessFlags(vk.AccessTransferWriteBit),
-		srcStage, vk.PipelineStageFlags(vk.PipelineStageTransferBit))
-	cp := vk.BufferImageCopy{
-		ImageSubresource: vk.ImageSubresourceLayers{AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit), LayerCount: 1},
-		ImageExtent:      vk.Extent3D{Width: uint32(wr.w), Height: uint32(wr.h), Depth: 1},
-	}
-	vk.CmdCopyBufferToImage(cmd, sl.ovStage, sl.ovImg.image, vk.ImageLayoutTransferDstOptimal, 1, []vk.BufferImageCopy{cp})
-	barrier(cmd, sl.ovImg.image, rng, vk.ImageLayoutTransferDstOptimal, vk.ImageLayoutShaderReadOnlyOptimal,
-		vk.AccessFlags(vk.AccessTransferWriteBit), vk.AccessFlags(vk.AccessShaderReadBit),
-		vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit))
-	sl.ovLayout = vk.ImageLayoutShaderReadOnlyOptimal
+
+	// (1.5) real shadow maps (config realShadows): render up to
+	// shadowLightSlots cube depth maps from the leading lights' own
+	// positions into sl.shadowCube[], before the colour pass below samples
+	// them — see worldshadow.go. No-op (returns immediately) when
+	// !wr.realShadows.
+	r.recordShadowMaps(cmd, frame, g, lights)
 
 	// (2) opaque pass -> offscreen scene colour (+ depth). Water is excluded
 	// from g.StaticDraws (see worldgeo.Geometry.WaterDraws) when
@@ -869,6 +1031,13 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 	// rejects every occluded wall/flat pixel before it runs the fade + light
 	// loop. Masked 2-sided middles (StaticTris[StaticOpaqueCount:]) are
 	// excluded — their holes must not write depth.
+	//
+	// Measured (2026-09): disabling this cost ~100 FPS on a real test map —
+	// the per-pixel dynamic-light loop it protects (world.frag's
+	// dynamicDiffuse) costs more than the doubled vertex/draw submission
+	// below saves, so it stays on. Kept as a data point for anyone touching
+	// this again: a bigger/more-occluded custom level could tip the other
+	// way, but this codebase's typical geometry does not.
 	//
 	// This walks g.StaticDraws' opaque prefix (every entry's First is <
 	// StaticOpaqueCount, in the order Invalidate appended them — masked
@@ -1011,7 +1180,7 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 	// to shader-read for us.
 
 	// (3) ambient term: quarter-res shadow/AO/god-ray buffer (worldambient.go)
-	// — its low resolution plus the present pass's bilinear read of it is
+	// — its low resolution plus the resolve pass's bilinear read of it is
 	// both a real perf win (SSAO's disc gather and god rays' march run at
 	// 1/16th the pixel count) and what makes the shadow edge soft, not any
 	// math in the shader itself.
@@ -1020,8 +1189,58 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 	// (4) bloom: build the HDR mip pyramid -> bloom mip 0.
 	r.recordBloom(cmd, frame)
 
-	// (5) present blit: tonemap(scene*exposure + bloom*strength), upscaled
-	// letterboxed, with the crisp overlay composited on top.
+	// blitPC/PC prep, hoisted above (5)/(6) so both the resolve pass and the
+	// present blit can use it: worldblit.frag PC: tonemap params + the
+	// camera basis needed to reconstruct a world point from (screen pixel,
+	// sampled depth) and march the depth buffer for the water SSR
+	// reflection. horizonY / focal match raster.horizonY and
+	// world.frag skyColorAt. basis (computed once above, shared with
+	// recordAmbientTerm) is the same derivation. p0..p3 (the first 64
+	// bytes/16 floats) are exactly what worldresolve.frag's own PC needs —
+	// see recordResolve's doc comment on why it reads this same array
+	// instead of rebuilding its own copy.
+	bFocal := basis.focal
+	bSin := float32(basis.sin)
+	bCos := float32(basis.cos)
+	bHorizon := float32(basis.horizon)
+	// worldblit.frag post-chain tuning still owned here (SSR/CAS/dither).
+	// aoStrength, aoRadius/aoBias, sunDir, and the dyn-light shadow march
+	// constants used to be threaded through here too, back when this
+	// shader ran SSAO/god-rays/shadows itself — now that they've moved to
+	// worldambient.go's own pass (and SSR/the ambient combine/tonemap into
+	// worldresolve.go's), this array carries only what worldblit.frag
+	// itself still actually reads, plus the p0-p3 subset worldresolve.frag
+	// needs.
+	const (
+		ssrStrength     = 0.9
+		sharpenStrength = 0.35 // CAS 0..1
+		ditherStrength  = 1.0  // +/- 1 LSB triangular-PDF, kills 8-bit banding
+	)
+	outlineStrength := float32(0)
+	if cam.CartoonShading {
+		outlineStrength = cartoonOutlineStrength
+	}
+	blitPC := [24]float32{
+		wr.bloom.exposure, wr.bloom.strength, float32(cam.Time), float32(worldgeo.NearPlane),
+		bSin, bCos, float32(bFocal), float32(worldgeo.FarPlane),
+		float32(cam.X), float32(cam.Y), float32(cam.Z), bHorizon,
+		// p3.w (godrayStrength) scales+tints the pre-marched god-ray luma
+		// worldresolve.frag samples from worldambient.go's ambient buffer.
+		float32(wr.w), float32(wr.h), ssrStrength, ambGodrayStrength,
+		// p4.w was the last unused pad; now cartoon shading's depth-edge
+		// outline strength (0 = off — see cartoonOutlineStrength's doc).
+		sharpenStrength, ditherStrength, 0, outlineStrength,
+		// p5: full-frame sector-effect tint (rgb, amount; A<0 also = heat wobble)
+		cam.TintR, cam.TintG, cam.TintB, cam.TintA,
+	}
+
+	// (5) resolve: water SSR + the ambient combine + the ACES tonemap, once
+	// per pixel, into wr.resolve.img — see worldresolve.go's own doc
+	// comment for why this is its own pass now.
+	r.recordResolve(cmd, frame, (*[16]float32)(blitPC[:16]))
+
+	// (6) present blit: FXAA/CAS/cartoon-outline/tint the resolved image,
+	// upscaled letterboxed, with the crisp overlay composited on top.
 	vpLB := r.letterboxViewport()
 	vk.CmdBeginRenderPass(cmd, &vk.RenderPassBeginInfo{
 		SType:           vk.StructureTypeRenderPassBeginInfo,
@@ -1038,44 +1257,7 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 		Extent: vk.Extent2D{Width: uint32(vpLB.Width), Height: uint32(vpLB.Height)},
 	}})
 	vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, wr.plBlit, 0, 2,
-		[]vk.DescriptorSet{sl.setBlit, wr.ambient.setSample}, 0, nil)
-	// worldblit.frag PC: tonemap params + the camera basis it needs to
-	// reconstruct a world point from (screen pixel, sampled depth) and march
-	// the depth buffer for the water SSR reflection. horizonY / focal match
-	// raster.horizonY and world.frag skyColorAt. basis (computed once above,
-	// shared with recordAmbientTerm) is the same derivation.
-	bFocal := basis.focal
-	bSin := float32(basis.sin)
-	bCos := float32(basis.cos)
-	bHorizon := float32(basis.horizon)
-	// worldblit.frag post-chain tuning still owned here (SSR/CAS/dither).
-	// aoStrength, aoRadius/aoBias, sunDir, and the dyn-light shadow march
-	// constants used to be threaded through here too, back when this
-	// shader ran SSAO/god-rays/shadows itself — now that they've moved to
-	// worldambient.go's own pass (see p3/p4 below), this array carries only
-	// what worldblit.frag still actually reads.
-	const (
-		ssrStrength     = 0.9
-		sharpenStrength = 0.35 // CAS 0..1
-		ditherStrength  = 1.0  // +/- 1 LSB triangular-PDF, kills 8-bit banding
-	)
-	outlineStrength := float32(0)
-	if cam.CartoonShading {
-		outlineStrength = cartoonOutlineStrength
-	}
-	blitPC := [24]float32{
-		wr.bloom.exposure, wr.bloom.strength, float32(cam.Time), float32(worldgeo.NearPlane),
-		bSin, bCos, float32(bFocal), float32(worldgeo.FarPlane),
-		float32(cam.X), float32(cam.Y), float32(cam.Z), bHorizon,
-		// p3.w (godrayStrength) scales+tints the pre-marched god-ray luma
-		// worldblit.frag samples from worldambient.go's ambient buffer.
-		float32(wr.w), float32(wr.h), ssrStrength, ambGodrayStrength,
-		// p4.w was the last unused pad; now cartoon shading's depth-edge
-		// outline strength (0 = off — see cartoonOutlineStrength's doc).
-		sharpenStrength, ditherStrength, 0, outlineStrength,
-		// p5: full-frame sector-effect tint (rgb, amount; A<0 also = heat wobble)
-		cam.TintR, cam.TintG, cam.TintB, cam.TintA,
-	}
+		[]vk.DescriptorSet{sl.setBlit, wr.resolve.setSample}, 0, nil)
 	vk.CmdPushConstants(cmd, wr.plBlit, vk.ShaderStageFlags(vk.ShaderStageFragmentBit), 0, 96, unsafe.Pointer(&blitPC[0]))
 	vk.CmdDraw(cmd, 3, 1, 0, 0)
 	vk.CmdEndRenderPass(cmd)
@@ -1095,14 +1277,15 @@ func (r *Renderer) destroyWorldResources() {
 
 	r.destroyBloom()
 	r.destroyAmbientPass()
+	r.destroyResolvePass()
 	r.destroyVoxelResources()
 
-	for _, p := range []vk.Pipeline{wr.pipeWorld, wr.pipeDepth, wr.pipeParticleAdd, wr.pipeParticleTrans, wr.pipeWorldLiquid, wr.pipeBlit} {
+	for _, p := range []vk.Pipeline{wr.pipeWorld, wr.pipeDepth, wr.pipeParticleAdd, wr.pipeParticleTrans, wr.pipeWorldLiquid, wr.pipeShadow, wr.pipeBlit} {
 		if p != nil {
 			vk.DestroyPipeline(dev, p, nil)
 		}
 	}
-	for _, l := range []vk.PipelineLayout{wr.plWorld, wr.plBlit, wr.plWorldLiquid} {
+	for _, l := range []vk.PipelineLayout{wr.plWorld, wr.plBlit, wr.plWorldLiquid, wr.plShadow} {
 		if l != nil {
 			vk.DestroyPipelineLayout(dev, l, nil)
 		}
@@ -1124,6 +1307,7 @@ func (r *Renderer) destroyWorldResources() {
 	}
 	wr.texCache = nil
 	freeLitImage(dev, wr.dummyTex)
+	freeShadowCube(dev, wr.dummyShadowCube)
 	for i := range wr.slots {
 		sl := &wr.slots[i]
 		if sl.fb != nil {
@@ -1134,6 +1318,9 @@ func (r *Renderer) destroyWorldResources() {
 		freeLitImage(dev, sl.preWaterColor)
 		freeLitImage(dev, sl.preWaterDepth)
 		freeLitImage(dev, sl.ovImg)
+		for s := range sl.shadowCube {
+			freeShadowCube(dev, sl.shadowCube[s])
+		}
 		freeHostBuffer(dev, sl.ubo, sl.uboMem, sl.uboMapped)
 		freeHostBuffer(dev, sl.vbuf, sl.vbufMem, sl.vbufMapped)
 		freeHostBuffer(dev, sl.ovStage, sl.ovStageMem, sl.ovStageMapped)
@@ -1148,6 +1335,9 @@ func (r *Renderer) destroyWorldResources() {
 	}
 	if wr.rpWater != nil {
 		vk.DestroyRenderPass(dev, wr.rpWater, nil)
+	}
+	if wr.rpShadow != nil {
+		vk.DestroyRenderPass(dev, wr.rpShadow, nil)
 	}
 	for _, s := range []vk.Sampler{wr.texSampler, wr.clampSampler, wr.depthSampler} {
 		if s != nil {

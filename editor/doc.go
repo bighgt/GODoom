@@ -1,9 +1,13 @@
 package editor
 
 import (
+	"log"
 	"math"
+	"sort"
+	"strings"
 
 	"twopointfive/bsp"
+	"twopointfive/engine/slopes"
 	"twopointfive/nodebuild"
 	"twopointfive/wad"
 )
@@ -26,6 +30,15 @@ type Doc struct {
 	geomDirty  bool // geometry changed since the last rebuild
 
 	Sel selection
+
+	// extraFloors are this map's room-over-room links — target sector
+	// index to the control sector(s) whose floor/ceiling become a
+	// floating platform inside it (see engine/slopes' own doc comment for
+	// the concept, and AddExtraFloor/RemoveExtraFloor below). Populated
+	// from any SLOPES lump in the source WAD on load (loadSlopes), written
+	// back out by SavePWAD (see encodeSlopes in save.go), and read by
+	// view3d (extraFloorMap) to feed worldgeo.Builder.SetExtraFloors.
+	extraFloors []slopes.ExtraFloorDef
 }
 
 // selection holds selected element indices per kind.
@@ -70,6 +83,7 @@ func NewDoc(w *wad.WAD, wadPath, mapName string) (*Doc, error) {
 		return nil, err
 	}
 	d := &Doc{WADPath: wadPath, MapName: mapName, WAD: w, Level: lvl, Sel: newSelection()}
+	d.loadSlopes()
 	d.rebuildTree()
 	return d, nil
 }
@@ -317,6 +331,410 @@ func (d *Doc) SetSectorFlat(idx int, name string, ceil bool) bool {
 		d.Level.Sectors[idx].FloorTexture = name
 	}
 	d.markDirty() // see SetLineTexture's comment on why this is needed
+	return true
+}
+
+// ---- sector/linedef properties -----------------------------------------
+
+// SetSectorHeights sets sector idx's floor/ceiling height — geometry, so
+// this marks the render tree dirty the same way SetSectorFlat/
+// SetLineTexture do.
+func (d *Doc) SetSectorHeights(idx int, floor, ceiling int16) bool {
+	if idx < 0 || idx >= len(d.Level.Sectors) {
+		return false
+	}
+	d.Level.Sectors[idx].FloorHeight = floor
+	d.Level.Sectors[idx].CeilingHeight = ceiling
+	d.markDirty()
+	return true
+}
+
+// SetSectorLight sets sector idx's light level (0..255) — also baked into
+// the render tree's per-vertex shading, so this marks it dirty too.
+func (d *Doc) SetSectorLight(idx int, light int16) bool {
+	if idx < 0 || idx >= len(d.Level.Sectors) {
+		return false
+	}
+	d.Level.Sectors[idx].LightLevel = light
+	d.markDirty()
+	return true
+}
+
+// SetSectorSpecial/SetSectorTag set sector idx's special-behavior type and
+// tag — pure gameplay data with no effect on the built render tree, so
+// unlike the geometry/light setters above these don't markDirty.
+func (d *Doc) SetSectorSpecial(idx int, special uint16) bool {
+	if idx < 0 || idx >= len(d.Level.Sectors) {
+		return false
+	}
+	d.Level.Sectors[idx].SpecialType = special
+	return true
+}
+
+func (d *Doc) SetSectorTag(idx int, tag uint16) bool {
+	if idx < 0 || idx >= len(d.Level.Sectors) {
+		return false
+	}
+	d.Level.Sectors[idx].Tag = tag
+	return true
+}
+
+// SetLineFlags/SetLineSpecial/SetLineTag set linedef idx's Flags/
+// SpecialType/SectorTag — like the sector special/tag setters above, pure
+// gameplay data, no render-tree effect.
+func (d *Doc) SetLineFlags(idx int, flags uint16) bool {
+	if idx < 0 || idx >= len(d.Level.Linedefs) {
+		return false
+	}
+	d.Level.Linedefs[idx].Flags = flags
+	return true
+}
+
+func (d *Doc) SetLineSpecial(idx int, special uint16) bool {
+	if idx < 0 || idx >= len(d.Level.Linedefs) {
+		return false
+	}
+	d.Level.Linedefs[idx].SpecialType = special
+	return true
+}
+
+func (d *Doc) SetLineTag(idx int, tag uint16) bool {
+	if idx < 0 || idx >= len(d.Level.Linedefs) {
+		return false
+	}
+	d.Level.Linedefs[idx].SectorTag = tag
+	return true
+}
+
+// ---- slopes & room-over-room ---------------------------------------------
+
+// loadSlopes reads this WAD's SLOPES lump (if any — see engine/slopes' own
+// doc comment for the grammar) and applies any plane/extra-floor entries
+// for this map: tilts go straight onto Level.Sectors (the same fields
+// wad.Sector.FloorZAt/CeilZAt already read — no separate render-side step
+// needed, unlike extra floors), and extra-floor links populate
+// d.extraFloors (read by view3d's extraFloorMap). A no-op, not an error, if
+// the WAD has no SLOPES lump or none of its entries are for this map,
+// matching every other optional-sidecar convention in this codebase
+// (GLDEFS, ANIMDEFS, ...).
+func (d *Doc) loadSlopes() {
+	if d.WAD == nil {
+		return
+	}
+	data, ok := d.WAD.Find("SLOPES")
+	if !ok {
+		return
+	}
+	planes, floors, errs := slopes.Parse(data)
+	for _, e := range errs {
+		log.Printf("editor: SLOPES: %v", e)
+	}
+	mapName := strings.ToUpper(d.MapName)
+	for _, def := range planes[mapName] {
+		applySlopePlane(d.Level, def)
+	}
+	d.extraFloors = append([]slopes.ExtraFloorDef(nil), floors[mapName]...)
+}
+
+// applySlopePlane mutates sec's tilt fields from def — the same math as
+// engine/slopes_load.go's applySlopes/planeTilt, duplicated here (not
+// imported: that lives in package engine, which the editor doesn't
+// otherwise depend on) following this codebase's own established
+// convention of each package keeping its own tiny copy of a small, stable
+// helper like this rather than pulling in a whole unrelated package for it.
+func applySlopePlane(lvl *wad.Level, def slopes.Def) {
+	if def.SectorIndex < 0 || def.SectorIndex >= len(lvl.Sectors) {
+		return
+	}
+	sec := &lvl.Sectors[def.SectorIndex]
+	tiltX, tiltY, ok := planeTilt(def.P1, def.P2, def.P3)
+	if !ok {
+		return
+	}
+	sec.SlopePivotX, sec.SlopePivotY = def.P1[0], def.P1[1]
+	if def.Ceiling {
+		sec.CeilingHeight = int16(math.Round(def.P1[2]))
+		sec.CeilTiltX, sec.CeilTiltY = tiltX, tiltY
+	} else {
+		sec.FloorHeight = int16(math.Round(def.P1[2]))
+		sec.FloorTiltX, sec.FloorTiltY = tiltX, tiltY
+	}
+}
+
+// planeTilt solves for the (tiltX, tiltY) of the plane through p1, p2, p3
+// that passes through p1 at that exact height — see
+// engine/slopes_load.go's own copy of this for the full derivation.
+func planeTilt(p1, p2, p3 [3]float64) (tiltX, tiltY float64, ok bool) {
+	dx2, dy2, dz2 := p2[0]-p1[0], p2[1]-p1[1], p2[2]-p1[2]
+	dx3, dy3, dz3 := p3[0]-p1[0], p3[1]-p1[1], p3[2]-p1[2]
+	det := dx2*dy3 - dx3*dy2
+	if det == 0 {
+		return 0, 0, false
+	}
+	tiltX = (dz2*dy3 - dz3*dy2) / det
+	tiltY = (dx2*dz3 - dx3*dz2) / det
+	return tiltX, tiltY, true
+}
+
+// SetSectorTilt sets sector idx's floor/ceiling plane tilt directly — the
+// same FloorTiltX/Y, CeilTiltX/Y, SlopePivotX/Y fields wad.Sector.FloorZAt/
+// CeilZAt already read, so a markDirty (the plane shape is part of the
+// built geometry) is the only render-side step needed. tiltX/tiltY are
+// rise per map unit along X/Y, evaluated relative to (pivotX, pivotY); 0/0
+// is flat, matching every vanilla sector.
+func (d *Doc) SetSectorTilt(idx int, floorTiltX, floorTiltY, ceilTiltX, ceilTiltY, pivotX, pivotY float64) bool {
+	if idx < 0 || idx >= len(d.Level.Sectors) {
+		return false
+	}
+	sec := &d.Level.Sectors[idx]
+	sec.FloorTiltX, sec.FloorTiltY = floorTiltX, floorTiltY
+	sec.CeilTiltX, sec.CeilTiltY = ceilTiltX, ceilTiltY
+	sec.SlopePivotX, sec.SlopePivotY = pivotX, pivotY
+	d.markDirty()
+	return true
+}
+
+// AddExtraFloor links control's floor/ceiling as a room-over-room platform
+// floating inside target's footprint — see engine/slopes' own doc comment
+// for the concept and engine/roomoverroom.go for the runtime side. Refuses
+// a self-link (a sector can't float inside itself) or an out-of-range
+// index. markDirty rebuilds the render tree, which is when view3d
+// re-installs the full extraFloors map on worldgeo.Builder — see
+// extraFloorMap.
+func (d *Doc) AddExtraFloor(target, control int) bool {
+	if target < 0 || target >= len(d.Level.Sectors) || control < 0 || control >= len(d.Level.Sectors) || target == control {
+		return false
+	}
+	d.extraFloors = append(d.extraFloors, slopes.ExtraFloorDef{TargetSector: target, ControlSector: control})
+	d.markDirty()
+	return true
+}
+
+// RemoveExtraFloor removes the i-th extra-floor link on target — i indexes
+// only THAT sector's own links, in the order ExtraFloorsFor lists them,
+// not the whole d.extraFloors slice.
+func (d *Doc) RemoveExtraFloor(target, i int) bool {
+	n := -1
+	for j := range d.extraFloors {
+		if d.extraFloors[j].TargetSector != target {
+			continue
+		}
+		n++
+		if n == i {
+			d.extraFloors = append(d.extraFloors[:j], d.extraFloors[j+1:]...)
+			d.markDirty()
+			return true
+		}
+	}
+	return false
+}
+
+// ExtraFloorsFor returns target's own extra-floor links, for the inspector
+// to list.
+func (d *Doc) ExtraFloorsFor(target int) []slopes.ExtraFloorDef {
+	var out []slopes.ExtraFloorDef
+	for _, ef := range d.extraFloors {
+		if ef.TargetSector == target {
+			out = append(out, ef)
+		}
+	}
+	return out
+}
+
+// extraFloorMap flattens d.extraFloors into worldgeo.Builder.SetExtraFloors'
+// own shape (target sector -> control sector indices) — the exact
+// transform engine/mapinfo_load.go's ApplyMapInfo does for live gameplay,
+// read by view3d each time it rebuilds its Builder.
+func (d *Doc) extraFloorMap() map[int][]int {
+	if len(d.extraFloors) == 0 {
+		return nil
+	}
+	m := make(map[int][]int, len(d.extraFloors))
+	for _, ef := range d.extraFloors {
+		m[ef.TargetSector] = append(m[ef.TargetSector], ef.ControlSector)
+	}
+	return m
+}
+
+// ---- geometry: move/delete ----------------------------------------------
+
+// MoveThing relocates thing idx. Unlike MoveVertex this doesn't markDirty:
+// Things are drawn as per-frame billboards (view3d's thingSprites,
+// engine/mobj.go's real-game equivalent), rebuilt fresh every frame
+// regardless of the BSP tree's own identity, not baked into the cached
+// static geometry the way wall/flat textures and sector heights are.
+func (d *Doc) MoveThing(idx int, x, y int16) bool {
+	if idx < 0 || idx >= len(d.Level.Things) {
+		return false
+	}
+	d.Level.Things[idx].X = x
+	d.Level.Things[idx].Y = y
+	return true
+}
+
+// DeleteSelection deletes whatever is currently selected, across all four
+// element kinds — selectOne (see the selection type) always clears every
+// other set before selecting, so in practice at most one kind ever holds
+// entries, but this doesn't assume that: it simply acts on whichever sets
+// aren't empty, so it behaves correctly regardless of which pane (2D or
+// 3D) made the selection. Each per-kind Delete method already refuses
+// (silently, a no-op) an element still referenced by something else.
+func (d *Doc) DeleteSelection() {
+	for idx := range d.Sel.Verts {
+		d.DeleteVertex(idx)
+	}
+	for idx := range d.Sel.Lines {
+		d.DeleteLinedef(idx)
+	}
+	for idx := range d.Sel.Sectors {
+		d.DeleteSector(idx)
+	}
+	for idx := range d.Sel.Things {
+		d.DeleteThing(idx)
+	}
+}
+
+// MoveVertex relocates vertex idx.
+func (d *Doc) MoveVertex(idx int, x, y int16) bool {
+	if idx < 0 || idx >= len(d.Level.Vertexes) {
+		return false
+	}
+	d.Level.Vertexes[idx].X = x
+	d.Level.Vertexes[idx].Y = y
+	d.markDirty()
+	return true
+}
+
+// DeleteVertex removes vertex idx, refusing if any linedef still
+// references it (matching the rest of this file's "refuse rather than
+// silently corrupt state" convention — the caller deletes the bordering
+// linedefs first). Every OTHER linedef's vertex index above idx is
+// decremented to track the slice shift.
+func (d *Doc) DeleteVertex(idx int) bool {
+	if idx < 0 || idx >= len(d.Level.Vertexes) {
+		return false
+	}
+	for _, ld := range d.Level.Linedefs {
+		if int(ld.StartVertex) == idx || int(ld.EndVertex) == idx {
+			return false
+		}
+	}
+	d.Level.Vertexes = append(d.Level.Vertexes[:idx], d.Level.Vertexes[idx+1:]...)
+	for i := range d.Level.Linedefs {
+		if int(d.Level.Linedefs[i].StartVertex) > idx {
+			d.Level.Linedefs[i].StartVertex--
+		}
+		if int(d.Level.Linedefs[i].EndVertex) > idx {
+			d.Level.Linedefs[i].EndVertex--
+		}
+	}
+	d.Sel.clearAll() // indices shifted under it — a stale selection could now point at the wrong element
+	d.markDirty()
+	return true
+}
+
+// removeSidedef deletes sidedef sdIdx and re-indexes every linedef's
+// Front/BackSidedef reference above it — shared by DeleteLinedef, which may
+// need to remove two sidedefs (front and back) for the one linedef it's
+// deleting.
+func (d *Doc) removeSidedef(sdIdx uint16) {
+	d.Level.Sidedefs = append(d.Level.Sidedefs[:sdIdx], d.Level.Sidedefs[sdIdx+1:]...)
+	for i := range d.Level.Linedefs {
+		ld := &d.Level.Linedefs[i]
+		if ld.FrontSidedef != wad.NoSidedef && ld.FrontSidedef > sdIdx {
+			ld.FrontSidedef--
+		}
+		if ld.BackSidedef != wad.NoSidedef && ld.BackSidedef > sdIdx {
+			ld.BackSidedef--
+		}
+	}
+}
+
+// DeleteLinedef removes linedef idx and its own sidedef(s) — a Doom
+// sidedef always belongs to exactly one linedef, so nothing else can still
+// reference them. Vertices are left in place (a separate, explicit
+// DeleteVertex call), matching classic Doom editors' convention of never
+// deleting geometry implicitly.
+func (d *Doc) DeleteLinedef(idx int) bool {
+	if idx < 0 || idx >= len(d.Level.Linedefs) {
+		return false
+	}
+	ld := d.Level.Linedefs[idx]
+	var sidedefs []uint16
+	if ld.FrontSidedef != wad.NoSidedef {
+		sidedefs = append(sidedefs, ld.FrontSidedef)
+	}
+	if ld.BackSidedef != wad.NoSidedef {
+		sidedefs = append(sidedefs, ld.BackSidedef)
+	}
+	d.Level.Linedefs = append(d.Level.Linedefs[:idx], d.Level.Linedefs[idx+1:]...)
+	// Highest index first, so removing one doesn't shift the index of
+	// another still queued for removal.
+	sort.Sort(sort.Reverse(sortUint16(sidedefs)))
+	for _, sd := range sidedefs {
+		d.removeSidedef(sd)
+	}
+	d.Sel.clearAll()
+	d.markDirty()
+	return true
+}
+
+type sortUint16 []uint16
+
+func (s sortUint16) Len() int           { return len(s) }
+func (s sortUint16) Less(i, j int) bool { return s[i] < s[j] }
+func (s sortUint16) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+
+// DeleteThing removes thing idx.
+func (d *Doc) DeleteThing(idx int) bool {
+	if idx < 0 || idx >= len(d.Level.Things) {
+		return false
+	}
+	d.Level.Things = append(d.Level.Things[:idx], d.Level.Things[idx+1:]...)
+	d.Sel.clearAll()
+	return true
+}
+
+// DeleteSector removes sector idx, refusing if any sidedef still
+// references it (the caller reassigns or deletes those linedefs first, the
+// same "refuse rather than corrupt" convention DeleteVertex uses). Every
+// OTHER sidedef's Sector index above idx is decremented to track the slice
+// shift.
+func (d *Doc) DeleteSector(idx int) bool {
+	if idx < 0 || idx >= len(d.Level.Sectors) {
+		return false
+	}
+	for _, sd := range d.Level.Sidedefs {
+		if int(sd.Sector) == idx {
+			return false
+		}
+	}
+	d.Level.Sectors = append(d.Level.Sectors[:idx], d.Level.Sectors[idx+1:]...)
+	for i := range d.Level.Sidedefs {
+		if int(d.Level.Sidedefs[i].Sector) > idx {
+			d.Level.Sidedefs[i].Sector--
+		}
+	}
+	// Drop any extra-floor link touching the deleted sector (as either
+	// target or control — neither makes sense once it's gone), and shift
+	// every other link's own indices down to track the slice removal, the
+	// same reindexing done above for Sidedef.Sector.
+	kept := d.extraFloors[:0]
+	for _, ef := range d.extraFloors {
+		if ef.TargetSector == idx || ef.ControlSector == idx {
+			continue
+		}
+		if ef.TargetSector > idx {
+			ef.TargetSector--
+		}
+		if ef.ControlSector > idx {
+			ef.ControlSector--
+		}
+		kept = append(kept, ef)
+	}
+	d.extraFloors = kept
+	d.Sel.clearAll()
+	d.markDirty()
 	return true
 }
 

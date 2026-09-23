@@ -19,16 +19,24 @@ package raster
 // This renderer has no palette to remap, so each COLORMAP row is collapsed
 // to a plain brightness multiply, (NUMCOLORMAPS - row) / NUMCOLORMAPS — the
 // same near-linear approximation of the real COLORMAP fade that GZDoom's
-// software "Doom" light mode uses — and both tables are baked to 0..256
+// software "Doom" light mode uses — and the table is baked to 0..256
 // integer multipliers so a texel shades with `c*m >> 8`, no per-pixel
 // arithmetic.
+//
+// Only scalelight (walls/sprites/the weapon viewmodel) is actually built
+// below — flat shading moved to a continuous per-pixel formula (this
+// engine's enhanced/hardware fade, not a zlight lookup) before this file's
+// zlight table, its accessors, and the LUT-flattening code that fed an
+// earlier hardware-renderer LUT upload ever got used by anything still
+// live; all of that was removed as dead code rather than kept "just in
+// case." zlight is mentioned above only as background on the vanilla
+// algorithm this table is ported from.
 const (
-	lightLevels   = 16  // LIGHTLEVELS
-	numColormaps  = 32  // NUMCOLORMAPS   (row 0 = identity, 31 = darkest)
-	lightSegShift = 4   // LIGHTSEGSHIFT: 8-bit sector light -> lightnum
-	maxLightScale = 48  // MAXLIGHTSCALE: wall scalelight columns
-	maxLightZ     = 128 // MAXLIGHTZ:     flat zlight columns
-	distMap       = 2   // DISTMAP
+	lightLevels   = 16 // LIGHTLEVELS
+	numColormaps  = 32 // NUMCOLORMAPS   (row 0 = identity, 31 = darkest)
+	lightSegShift = 4  // LIGHTSEGSHIFT: 8-bit sector light -> lightnum
+	maxLightScale = 48 // MAXLIGHTSCALE: wall scalelight columns
+	distMap       = 2  // DISTMAP
 
 	// wallScaleRef is vanilla's rw_scale >> LIGHTSCALESHIFT for a wall
 	// column one map unit deep, evaluated at the 320-wide / 90-degree
@@ -55,9 +63,9 @@ var ExtraLight int
 // lightScale multiplies every raw sector light level before it is turned
 // into a table row (config lightScale, section 17). 1.0 is the WAD's
 // authored brightness; SetLightScale changes it. It sits here rather than
-// on Renderer because lightnumOf / shadeMul / spriteShade are package
-// functions shared by the 2D overlay's own weapon shading (pspriteShade)
-// and, via LightScaleValue/BuildLightLUT, the hardware renderer's shader.
+// on Renderer because lightnumOf / shadeMul are package functions shared by
+// the 2D overlay's own weapon shading (pspriteShade) and, via
+// LightScaleValue, the hardware renderer's shader.
 var lightScale = 1.0
 
 // SetLightScale sets the global sector-light multiplier the hardware
@@ -69,12 +77,9 @@ func SetLightScale(s float64) {
 	}
 }
 
-// scaleLight / zLight are R_InitLightTables' two tables, already reduced
-// from "COLORMAP row 0..31" to "0..256 brightness multiplier".
-var (
-	scaleLight [lightLevels][maxLightScale]uint16
-	zLight     [lightLevels][maxLightZ]uint16
-)
+// scaleLight is R_InitLightTables' wall/sprite table, already reduced from
+// "COLORMAP row 0..31" to "0..256 brightness multiplier".
+var scaleLight [lightLevels][maxLightScale]uint16
 
 func init() {
 	for i := 0; i < lightLevels; i++ {
@@ -83,14 +88,6 @@ func init() {
 		for j := 0; j < maxLightScale; j++ {
 			// scalelight[i][j] = startmap - j/DISTMAP  (SCREENWIDTH == viewwidth)
 			scaleLight[i][j] = colormapMul(startmap - j/distMap)
-		}
-		for j := 0; j < maxLightZ; j++ {
-			// zlight[i][j] = startmap -
-			//   (FixedDiv(160*FRACUNIT, (j+1)<<LIGHTZSHIFT) >> LIGHTSCALESHIFT) / DISTMAP
-			// with FRACUNIT=1<<16, LIGHTZSHIFT=20, LIGHTSCALESHIFT=12 that
-			// inner term is (655360 / (j+1)) >> 12.
-			scale := (655360 / (j + 1)) >> 12
-			zLight[i][j] = colormapMul(startmap - scale/distMap)
 		}
 	}
 }
@@ -158,21 +155,6 @@ func shadeMul(light int16, depth float64) uint32 {
 	return uint32(scaleLight[lightnumOf(light)][scaleLightCol(depth)])
 }
 
-// spriteShade is the 0..256 brightness a world sprite of sector light level
-// `light` gets at camera-space `depth`. Sprites read the same scalelight
-// table the walls do, indexed by the sprite's on-screen scale — which at
-// this engine's reference is a wall's 2560/depth — so a monster or item
-// shades to match the wall it stands against (id's R_ProjectSprite:
-// spritelights = scalelight[lightlevel>>LIGHTSEGSHIFT], no fake contrast).
-// A fullbright frame (id's FF_FULLBRIGHT — a lit powerup, a projectile, a
-// monster's attack flash) is lit by nothing and returns 256 unchanged.
-func spriteShade(light int16, depth float64, fullBright bool) uint32 {
-	if fullBright {
-		return 256
-	}
-	return shadeMul(light, depth)
-}
-
 // pspriteShade is the brightness for the player's own weapon viewmodel. id
 // shades a psprite with spritelights[MAXLIGHTSCALE-1] — the bright end of
 // its sector's scalelight, i.e. "point blank" for that light level — so the
@@ -183,54 +165,6 @@ func pspriteShade(light int16, fullBright bool) uint32 {
 		return 256
 	}
 	return shadeMul(light, 0)
-}
-
-// lightRow returns a flat's zlight row for sector light level light.
-// drawFlatSpan holds one row across a whole span and indexes it per screen
-// row with distIdx, since a flat span's depth changes every row.
-func lightRow(light int16) *[maxLightZ]uint16 {
-	return &zLight[lightnumOf(light)]
-}
-
-// distIdx maps a camera-space depth to a zlight column: distance >>
-// LIGHTZSHIFT, i.e. map units / 16, clamped to 0..MAXLIGHTZ-1.
-func distIdx(depth float64) int {
-	i := int(depth * (1.0 / 16.0))
-	if i < 0 {
-		return 0
-	}
-	if i > maxLightZ-1 {
-		return maxLightZ - 1
-	}
-	return i
-}
-
-// LightLUT is raster's baked sector/distance shading, laid out for a GPU
-// upload: Scale is the wall/sprite scalelight table (Levels rows of
-// ScaleCols columns), Z the flat zlight table (Levels rows of ZCols), both
-// row-major ([row*cols + col]), values 0..256 brightness multipliers (row 0
-// = full bright). A hardware renderer uploads these as a texture and
-// reproduces the exact vanilla fade with the index helpers below — the
-// software path here calls the same underlying code, so the two can't drift.
-type LightLUT struct {
-	Levels           int
-	ScaleCols, ZCols int
-	Scale            []uint16
-	Z                []uint16
-}
-
-// BuildLightLUT flattens the two package tables for upload.
-func BuildLightLUT() LightLUT {
-	l := LightLUT{
-		Levels: lightLevels, ScaleCols: maxLightScale, ZCols: maxLightZ,
-		Scale: make([]uint16, lightLevels*maxLightScale),
-		Z:     make([]uint16, lightLevels*maxLightZ),
-	}
-	for i := 0; i < lightLevels; i++ {
-		copy(l.Scale[i*maxLightScale:], scaleLight[i][:])
-		copy(l.Z[i*maxLightZ:], zLight[i][:])
-	}
-	return l
 }
 
 // LightScaleRef is vanilla's fixed wall-scale reference (2560/depth) the

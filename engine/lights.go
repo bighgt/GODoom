@@ -217,6 +217,22 @@ func (g *Game) collectLights() (lights []render.Light, dynamicN int) {
 			}
 		}
 	}
+	// Burning-puddle fire (engine/burningpuddle.go) — a barrel's spilled
+	// fuel still alight on the floor throws its own flickering glow, the
+	// same way a torch or lava's static light does (see puddleLight). A
+	// dynamic emitter, not a static one: puddles spawn/despawn at runtime,
+	// so they're scored here every frame rather than baked into
+	// g.staticLights once at level load. Distance-culled first since one
+	// barrel can leave dozens of these burning at once.
+	for _, p := range g.burningPuddles {
+		dx, dy := float32(p.x)-cx, float32(p.y)-cy
+		if dx*dx+dy*dy > puddleLightCullDist*puddleLightCullDist {
+			continue
+		}
+		if l, ok := g.puddleLight(p); ok {
+			out = append(out, l)
+		}
+	}
 	// Dynamic lights alone overflowing the budget is pathological (BFG
 	// spam) — if it happens, keep the nearest.
 	if len(out) > activeLightBudget {

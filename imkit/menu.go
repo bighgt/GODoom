@@ -1,9 +1,8 @@
 package imkit
 
-// A top menu bar with click-to-open popups, and a right-click context menu.
-// Popups are drawn immediately; while one is open its rectangle is recorded
-// in ui.menuBlock so hover() ignores widgets beneath it (same trick as the
-// dropdown overlay). Selections resolve the same frame.
+// A top menu bar with click-to-open popups. Popups are drawn immediately;
+// while one is open its rectangle is recorded in ui.menuBlock so hover()
+// ignores widgets beneath it. Selections resolve the same frame.
 
 // MenuItem is one popup row. An empty Label is a separator.
 type MenuItem struct {
@@ -54,20 +53,6 @@ func (ui *UI) Menu(title string, items []MenuItem) int {
 		return -1
 	}
 	return ui.popup("menu:"+title, Rect{r.X, r.Y + r.H, 0, 0}, items, func() { ui.openMenu = "" })
-}
-
-// ContextMenu opens a popup at the mouse when trigger is true (a right-click
-// in a pane). Returns the chosen index, or -1.
-func (ui *UI) ContextMenu(id string, trigger bool, items []MenuItem) int {
-	key := "ctx:" + id
-	if trigger {
-		ui.openMenu = key
-		ui.ctxAt = Rect{int(ui.In.MouseX), int(ui.In.MouseY), 0, 0}
-	}
-	if ui.openMenu != key {
-		return -1
-	}
-	return ui.popup(key, ui.ctxAt, items, func() { ui.openMenu = "" })
 }
 
 // popup lays out a popup whose top-left is anchor.{X,Y}, records it for End

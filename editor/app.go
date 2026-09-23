@@ -119,7 +119,11 @@ func Run(wadArg string, startNew, fullscreen bool) error {
 				Angle: a.v3.cam.Angle, Pitch: a.v3.cam.Pitch, FOVDeg: a.v3.cam.FOVDeg,
 			}
 		}
-		if err := a.blit.DrawWorld(geom, camv, a.cv.W, a.cv.H, a.cv.Img.Pix, nil); err != nil {
+		// 0, a.cv.H (the whole plane): the editor has no dirty-rect tracking
+		// of its own canvas like raster.Renderer's HUD overlay does, and
+		// preview redraws are already gated on actual edits, not every
+		// frame — no need for the game loop's partial-upload optimization.
+		if err := a.blit.DrawWorld(geom, camv, a.cv.W, a.cv.H, a.cv.Img.Pix, 0, a.cv.H, nil); err != nil {
 			return err
 		}
 		if a.pending != nil {
@@ -215,7 +219,7 @@ func (a *App) openWindow(fullscreen bool) error {
 	if fw == 0 || fh == 0 {
 		fw, fh = a.windowedW, a.windowedH
 	}
-	blit, err := vulkan.NewWorld(win, fw, fh, true, false, false) // waterRefraction: editor preview doesn't need real refraction
+	blit, err := vulkan.NewWorld(win, fw, fh, true, false, false, false) // waterRefraction/realShadows: editor preview doesn't need either
 	if err != nil {
 		win.Destroy()
 		return fmt.Errorf("open %s renderer: %w", fullscreenWord(fullscreen), err)
@@ -277,7 +281,10 @@ func (a *App) frame(dt float64) {
 		v3r := imkit.Rect{X: right.X, Y: right.Y, W: right.W - panelW - 1, H: right.H}
 		a.cv.FillRect(imkit.Rect{X: v3r.X + v3r.W, Y: v3r.Y, W: 1, H: v3r.H}, imkit.Theme.Border)
 
-		a.v2.draw(a.ui, left, a.doc, a.bank, &a.panel)
+		// a.v3.cam is last frame's pose (v3 hasn't drawn yet this frame) —
+		// a one-frame-old camera position for the 2D view's marker, well
+		// under a tenth of a second of lag and not perceptible.
+		a.v2.draw(a.ui, left, a.doc, a.bank, &a.panel, a.v3.cam.X, a.v3.cam.Y, a.v3.cam.Angle)
 		a.v3.draw(a.ui, v3r, a.doc, dt)
 		a.panel.draw(a.ui, pnl, a.doc, a.bank)
 

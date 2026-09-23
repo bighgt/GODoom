@@ -1,7 +1,5 @@
 package raster
 
-import "fmt"
-
 // weaponDropPx is how far below its resting position the weapon sprite
 // travels while fully lowered — comfortably more than any vanilla weapon
 // sprite's height, so "fully lowered" reads as fully offscreen.
@@ -14,11 +12,12 @@ const weaponDropPx = 300
 // weapon sprites (especially third-party HD packs, which don't all agree
 // on how much transparent padding to leave below the drawn pixels) don't
 // actually reach the bottom row of their own bounding box; and
-// engine.Game.weaponBobY lifts the gun UP from its resting position while
-// walking, which would crack a gap open on its own even with a perfectly
-// tight sprite. Comfortably bigger than weaponBobMaxY so the bob's rise
-// never uncovers it — the extra pixels are simply clipped by blit's normal
-// off-screen check, the same as the lowered-weapon travel below.
+// engine.Game.weaponBob's y component lifts the gun UP from its resting
+// position while walking, which would crack a gap open on its own even
+// with a perfectly tight sprite. Comfortably bigger than weaponBobMaxY so
+// the bob's rise never uncovers it — the extra pixels are simply clipped
+// by blit's normal off-screen check, the same as the lowered-weapon
+// travel below.
 const weaponBottomOverlap = 20
 
 // DrawWeapon draws the current weapon's viewmodel sprite at gunFrame (e.g.
@@ -31,8 +30,8 @@ const weaponBottomOverlap = 20
 // told to. raiseOffset is 0 (fully raised/ready) to 1 (fully lowered/
 // offscreen) — see engine.WeaponState.Offset. bobX/bobY/bobScale are the
 // walking sway/bob/toward-camera-and-back motion, all in the same HUD
-// pixel space — see engine.Game.weaponBobX/weaponBobY/weaponBobScale —
-// applied to the gun only; the flash then rides along with it (in position;
+// pixel space — see engine.Game.weaponBob — applied to the gun only; the
+// flash then rides along with it (in position;
 // it stays its own native size) since its own position is computed
 // relative to the gun's.
 //
@@ -60,7 +59,6 @@ const weaponBottomOverlap = 20
 // share one canvas size and offset, this reduces to exactly the old
 // independently-self-centered position (the delta is zero) — no visual
 // change.
-//
 func (r *Renderer) DrawWeapon(spritePrefix string, gunFrame byte, flashPrefix string, flashFrame byte, hasFlash bool, raiseOffset, bobX, bobY, bobScale float64, sectorLight int16) {
 	gunSp, ok := r.textures.Sprite(spriteName(spritePrefix, gunFrame))
 	if !ok {
@@ -83,11 +81,11 @@ func (r *Renderer) DrawWeapon(spritePrefix string, gunFrame byte, flashPrefix st
 			refSp, refTPU = rs, tpu(rs)
 		}
 	}
-	// bobScale (engine.Game.weaponBobScale) is applied to the resting
-	// footprint BEFORE centering it, so growing/shrinking it for the
-	// toward/away-from-camera motion keeps it centered horizontally and
-	// anchored to the same resting baseline rather than drifting off one
-	// corner as it scales.
+	// bobScale (the scale component of engine.Game.weaponBob) is applied
+	// to the resting footprint BEFORE centering it, so growing/shrinking
+	// it for the toward/away-from-camera motion keeps it centered
+	// horizontally and anchored to the same resting baseline rather than
+	// drifting off one corner as it scales.
 	refW := float64(refSp.Width) / refTPU * bobScale
 	refH := float64(refSp.Height) / refTPU * bobScale
 	// bottomPad converts refSp.BottomPad — transparent canvas rows below the
@@ -97,9 +95,10 @@ func (r *Renderer) DrawWeapon(spritePrefix string, gunFrame byte, flashPrefix st
 	// vast majority of sprites (every vanilla WAD patch, and any HD pack
 	// frame cropped tight to its own art), so this is a no-op for them.
 	bottomPad := float64(refSp.BottomPad) / refTPU * bobScale
-	refX := (hudLogicalW-refW)/2 + bobX // bobX: the walking side-to-side sway (engine.Game.weaponBobX)
-	// bobY (engine.Game.weaponBobY) is subtracted, not added: positive bobY
-	// is "risen above rest", and Y grows downward in this pixel space.
+	refX := (hudLogicalW-refW)/2 + bobX // bobX: the walking side-to-side sway (engine.Game.weaponBob's x)
+	// bobY (the y component of engine.Game.weaponBob) is subtracted, not
+	// added: positive bobY is "risen above rest", and Y grows downward in
+	// this pixel space.
 	refY := weaponRefY(refH, bottomPad, raiseOffset, bobY)
 
 	gunX, gunY := weaponAnchorPos(refX, refY, refSp.OffsetX, refSp.OffsetY, refTPU, gunSp.OffsetX, gunSp.OffsetY, gunTPU, bobScale)
@@ -123,7 +122,11 @@ func (r *Renderer) DrawWeapon(spritePrefix string, gunFrame byte, flashPrefix st
 }
 
 func spriteName(prefix string, frame byte) string {
-	return fmt.Sprintf("%s%c0", prefix, frame)
+	// Direct concatenation instead of fmt.Sprintf: this runs 2-3x every
+	// frame for the held weapon/muzzle-flash sprite lookup, and frame is
+	// always a single ASCII byte — fmt's reflection-based formatting is
+	// pure overhead for something this simple.
+	return prefix + string(frame) + "0"
 }
 
 // weaponAnchorPos is DrawWeapon's shared-origin math, factored out for
@@ -155,7 +158,8 @@ func weaponAnchorPos(refX, refY float64, refOffX, refOffY int, refTPU float64, f
 // cropped tight to its own art) reduces this to exactly the previous
 // "anchor the full canvas" placement.
 func weaponRefY(refH, bottomPad, raiseOffset, bobY float64) float64 {
-	// bobY (engine.Game.weaponBobY) is subtracted, not added: positive bobY
-	// is "risen above rest", and Y grows downward in this pixel space.
+	// bobY (the y component of engine.Game.weaponBob) is subtracted, not
+	// added: positive bobY is "risen above rest", and Y grows downward in
+	// this pixel space.
 	return hudLogicalH - (refH - bottomPad) + weaponBottomOverlap + raiseOffset*(refH+weaponDropPx) - bobY
 }

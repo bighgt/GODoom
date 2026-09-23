@@ -88,9 +88,6 @@ func (c *Canvas) Clip(r Rect) Rect {
 // SetClip restores a clip rect previously returned by Clip.
 func (c *Canvas) SetClip(r Rect) { c.clip = r }
 
-// ClipRect reports the current clip rectangle.
-func (c *Canvas) ClipRect() Rect { return c.clip }
-
 func intersect(a, b Rect) Rect {
 	x0, y0 := max(a.X, b.X), max(a.Y, b.Y)
 	x1, y1 := min(a.X+a.W, b.X+b.W), min(a.Y+a.H, b.Y+b.H)

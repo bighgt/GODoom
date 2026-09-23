@@ -73,8 +73,19 @@ type worldAmbient struct {
 
 	// dslSrc: binding0 = this slot's depth, binding1 = this slot's World
 	// UBO, binding2 = this slot's scene colour (god rays only).
-	dslSrc    vk.DescriptorSetLayout
-	dslSample vk.DescriptorSetLayout // binding0 = the shared ambient image — worldblit's 2nd descriptor set
+	dslSrc vk.DescriptorSetLayout
+	// dslSample/setSample: binding0 = the shared ambient image (imgBlur).
+	// Used to be worldblit's 2nd descriptor set directly; worldblit.frag no
+	// longer samples the ambient term at all — worldresolve.go's resolve
+	// pass does that now, through ITS OWN descriptor set bound to the same
+	// imgBlur view (not this one), as part of folding SSR/ambient/tonemap
+	// into one pre-blit pass (see worldresolve.go's doc comment). So
+	// dslSample/setSample are unused dead weight now, left allocated/
+	// written here rather than torn out — this pass's own small dedicated
+	// pool, not worldsetup.go's shared framePool, so there's nothing to
+	// save by removing it and a real (if small) risk in touching this
+	// file's own pool arithmetic for a purely cosmetic trim.
+	dslSample vk.DescriptorSetLayout
 	pool      vk.DescriptorPool
 
 	plGen   vk.PipelineLayout

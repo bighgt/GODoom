@@ -250,7 +250,16 @@ float godRaysLuma(vec2 uv) {
     float sunVis = clamp(1.0 - off / (0.6 * h), 0.0, 1.0);
     if (sunVis <= 0.0) return 0.0;
 
-    const int N = 24;
+    // N is uniform across the whole frame (sunVis doesn't depend on uv —
+    // see the file header on why), so this is a wave-coherent branch, not
+    // per-pixel divergence. delta's own /float(N) keeps the march's total
+    // reach (0.85 of the sun-to-pixel vector) the same regardless of N —
+    // fewer steps only coarsens the sampling density, it doesn't shorten
+    // the streak. Halving it when the sun is already fading toward the
+    // edge of view (sunVis low, so the final result is heavily damped by
+    // the `* sunVis` below anyway) trades a little accumulation smoothness
+    // for cost only in the regime where that smoothness is least visible.
+    int N = sunVis > 0.4 ? 24 : 12;
     vec2 delta = (sun - uv) * (0.85 / float(N));
     // Jitter the march's starting phase per pixel (same hash12 the SSAO
     // gather below rotates its disc with) instead of every pixel sampling

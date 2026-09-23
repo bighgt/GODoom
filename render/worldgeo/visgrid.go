@@ -19,11 +19,16 @@ import "math"
 // visGridCellSize is the bucket size. engine/collisiongrid.go's
 // collisionGrid — the pattern this mirrors — uses 128 units/cell, tuned for
 // collision-query density; that tradeoff doesn't apply here; the one that
-// does is granularity vs. draw-call count; and 512 is a first empirical
-// guess (Stage 1's measurement pass found it culled a meaningful fraction
-// of a real level from a real vantage point — see the plan doc's numbers —
-// but it hasn't been tuned beyond that one data point).
-const visGridCellSize = 512.0
+// does is granularity vs. draw-call count. Was 512 (a first, untuned
+// guess); lowered to 256 after disabling the hardware renderer's opaque
+// depth pre-pass as an experiment measured ~100 FPS worse (see
+// recordWorldCommandBuffer's own comment) — that result says the per-pixel
+// dynamic-light shading this cull skips is the expensive resource on this
+// hardware, not draw-call count, so trading more (still cheap) draw calls
+// for finer culling — fewer off-screen-but-in-cell fragments admitted
+// through to that expensive shading — should net positive the same
+// direction the pre-pass finding pointed.
+const visGridCellSize = 256.0
 
 // visGrid is a uniform grid over one level's vertex bounds. Unlike
 // collisionGrid, a cell doesn't need to list what's in it — Builder visits
@@ -102,11 +107,20 @@ const cullMarginDeg = 15.0
 // box's angular SPAN against the cone's doesn't have that blind spot.
 func cellVisible(cam Camera, minX, minY, maxX, maxY float32) bool {
 	cx, cy := (minX+maxX)/2, (minY+maxY)/2
-	dx, dy := float64(cx)-cam.X, float64(cy)-cam.Y
-	dist := math.Hypot(dx, dy)
 	radius := math.Hypot(float64(maxX-minX), float64(maxY-minY)) / 2 // bounding-circle radius
-	if dist <= radius {
-		return true // camera is inside (or right on top of) the box
+	return circleVisible(cam, float64(cx), float64(cy), radius)
+}
+
+// circleVisible reports whether a world-space circle centred at (cx, cy)
+// with radius r can be seen from cam — the camera-inside-it or angular-span-
+// overlaps-the-(widened)-FOV-cone test cellVisible's own doc comment
+// explains, factored out so LightVisible can reuse it for a light's reach
+// instead of a geometry cell's bounding box.
+func circleVisible(cam Camera, cx, cy, r float64) bool {
+	dx, dy := cx-cam.X, cy-cam.Y
+	dist := math.Hypot(dx, dy)
+	if dist <= r {
+		return true // camera is inside (or right on top of) the circle
 	}
 	angToCenter := math.Atan2(dy, dx) - cam.Angle
 	angToCenter = math.Mod(angToCenter+math.Pi, 2*math.Pi)
@@ -114,7 +128,21 @@ func cellVisible(cam Camera, minX, minY, maxX, maxY float32) bool {
 		angToCenter += 2 * math.Pi
 	}
 	angToCenter -= math.Pi
-	angularRadius := math.Asin(radius / dist) // dist > radius above, so radius/dist < 1
+	angularRadius := math.Asin(r / dist) // dist > r above, so r/dist < 1
 	half := (cam.FOVDeg/2 + cullMarginDeg) * math.Pi / 180
 	return math.Abs(angToCenter)-angularRadius <= half
+}
+
+// LightVisible reports whether a point light at world position (x, y) with
+// reach radius r could contribute to anything on screen from cam — the same
+// generous cone test cellVisible uses for static-geometry culling (see its
+// own doc comment for why the angular-span test is safe to use as a real
+// cull, not just an estimate), applied to a light's own sphere instead of a
+// geometry cell's bounding box. A render backend can use this to skip
+// uploading/shading a light that's nowhere near the camera's view, the same
+// way UpdateVisibility already skips drawing an off-screen geometry cell.
+// Ignores Z (camera pitch): Doom levels are shallow enough that cellVisible
+// already gets away with a 2D horizontal-only cone too.
+func LightVisible(cam Camera, x, y, r float64) bool {
+	return circleVisible(cam, x, y, r)
 }

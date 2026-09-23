@@ -180,7 +180,11 @@ func (r *Renderer) drawDigitsRightAligned(value int, digitPrefix, minusName stri
 		for value > 0 {
 			d := value % 10
 			value /= 10
-			if sp, ok := r.textures.Sprite(fmt.Sprintf("%s%d", digitPrefix, d)); ok {
+			// Direct concatenation instead of fmt.Sprintf: this runs for
+			// every decimal digit of every health/armour/ammo readout, every
+			// frame the status bar draws — d is always a single 0-9 digit,
+			// so fmt's reflection-based formatting is pure overhead here.
+			if sp, ok := r.textures.Sprite(digitPrefix + string(rune('0'+d))); ok {
 				x -= logicalWidth(sp)
 				r.blitSpriteImage(sp, x, y)
 			}

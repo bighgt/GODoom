@@ -72,8 +72,10 @@ func (g *Game) pCheckPosition(mo *Mobj, x, y float64, res *checkPosResult) bool 
 		return false
 	}
 
-	// Solid things — the live mobjs, plus the player's body. Linear scan;
-	// the count is small and a spatial index can come later if it matters.
+	// Solid things — the live mobjs, plus the player's body. Found via
+	// mobjGrid (mobjgrid.go) instead of a linear scan of every mobj in the
+	// level; solidThingHit still does its own precise check on each
+	// candidate the grid hands back, same as the linedef query above.
 	solidThingHit := func(other *Mobj) bool {
 		if other == nil || other == mo || other.removed || other.Flags&MF_SOLID == 0 {
 			return false
@@ -81,16 +83,16 @@ func (g *Game) pCheckPosition(mo *Mobj, x, y float64, res *checkPosResult) bool 
 		block := other.Radius + mo.Radius
 		return math.Abs(other.X-x) < block && math.Abs(other.Y-y) < block
 	}
-	if solidThingHit(g.playerMobj) {
-		return false
-	}
-	for _, other := range g.mobjs {
+	thingBlocked := false
+	g.forEachMobjNear(x, y, mo.Radius, func(other *Mobj) bool {
 		// (Phase 3: MF_MISSILE impact damage. Phase 4: MF_SPECIAL pickup.)
 		if solidThingHit(other) {
+			thingBlocked = true
 			return false
 		}
-	}
-	return true
+		return true
+	})
+	return !thingBlocked
 }
 
 // pTryMove attempts to move mo to (x, y), applying id's P_TryMove rules:
