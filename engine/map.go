@@ -15,6 +15,7 @@ import (
 const (
 	mlBlocking      = 0x0001 // blocks players and monsters
 	mlBlockMonsters = 0x0002 // blocks monsters only
+	mlSecret        = 0x0020 // shown as a plain wall on the automap; monsters never open its door
 )
 
 // Results of the last P_CheckPosition, id's tm* globals. Read by P_TryMove.
@@ -120,7 +121,9 @@ func (g *Game) pTryMove(mo *Mobj, x, y float64) bool {
 		}
 	}
 
+	ox, oy := mo.X, mo.Y
 	mo.X, mo.Y = x, y
+	g.relinkMobj(mo, ox, oy)
 	mo.FloorZ, mo.CeilingZ = res.floorZ, res.ceilingZ
 	return true
 }

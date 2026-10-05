@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"math"
 	"testing"
 
 	"twopointfive/wad"
@@ -38,9 +39,6 @@ func TestApplySectorInterp(t *testing.T) {
 	g.ticAccum = ticDuration / 2 // renderLerp() == 0.5
 
 	restore := g.applySectorInterp()
-	if !g.sectorInterpActive {
-		t.Fatal("sectorInterpActive not set")
-	}
 	if g.Level.Sectors[0].FloorHeight != 0 || g.Level.Sectors[0].CeilingHeight != 128 {
 		t.Errorf("static sector 0 was touched: %+v", g.Level.Sectors[0])
 	}
@@ -73,41 +71,8 @@ func TestApplySectorInterpNoOpAtTicBoundary(t *testing.T) {
 	g.ticAccum = 0 // renderLerp() == 0
 
 	g.applySectorInterp()()
-	if g.sectorInterpActive {
-		t.Error("sectorInterpActive set with renderLerp == 0")
-	}
 	if g.Level.Sectors[0].FloorHeight != 40 {
 		t.Errorf("heights changed at tic boundary: %d", g.Level.Sectors[0].FloorHeight)
-	}
-}
-
-func TestRenderedSectorHeightsChanged(t *testing.T) {
-	g := &Game{Level: &wad.Level{Sectors: []wad.Sector{
-		{FloorHeight: 0, CeilingHeight: 128},
-		{FloorHeight: 40, CeilingHeight: 128},
-	}}}
-
-	if !g.renderedSectorHeightsChanged() {
-		t.Error("first call: want true (force an initial build)")
-	}
-	if g.renderedSectorHeightsChanged() {
-		t.Error("second call, nothing moved: want false")
-	}
-
-	// A mover mid-glide rounds to the exact same int16 height two render
-	// frames in a row — the case this exists to catch (see its own doc
-	// comment): still false, since nothing actually changed since the last
-	// call.
-	if g.renderedSectorHeightsChanged() {
-		t.Error("third call, still nothing moved: want false")
-	}
-
-	g.Level.Sectors[1].FloorHeight = 41
-	if !g.renderedSectorHeightsChanged() {
-		t.Error("after a height actually moved: want true")
-	}
-	if g.renderedSectorHeightsChanged() {
-		t.Error("call right after a detected change: want false (snapshot now matches)")
 	}
 }
 
@@ -148,5 +113,27 @@ func TestCollectGroundShadows(t *testing.T) {
 	}
 	if got[0][0] != 20 || got[len(got)-1][0] != float32(20*hwGroundShadowCap) {
 		t.Errorf("not nearest-first: front=%v back=%v", got[0][0], got[len(got)-1][0])
+	}
+}
+
+// Standing in nukage only washes the view green when looking down at it,
+// and only faintly; looking level (or up) there's no wash at all.
+func TestAcidTintOnlyLookingDown(t *testing.T) {
+	cases := []struct {
+		pitchDeg float64
+		min, max float32
+	}{
+		{20, 0, 0}, // looking up
+		{0, 0, 0},  // level
+		{-5, 0, 0}, // barely down
+		{-35, 0.03, 0.07},
+		{-80, 0.1, 0.1}, // straight down: the full, slight glow
+	}
+	for _, c := range cases {
+		_, _, _, amt := liquidTintFor(liqAcid)
+		amt *= float32(lookDownFactor(c.pitchDeg * math.Pi / 180))
+		if amt < c.min-1e-6 || amt > c.max+1e-6 {
+			t.Errorf("pitch %v°: acid tint %.3f, want %.3f..%.3f", c.pitchDeg, amt, c.min, c.max)
+		}
 	}
 }

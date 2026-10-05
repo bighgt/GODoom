@@ -1,6 +1,14 @@
 package engine
 
-import "twopointfive/wad"
+import (
+	"archive/zip"
+	"io"
+	"path"
+	"strings"
+
+	"twopointfive/assets"
+	"twopointfive/wad"
+)
 
 // loadSound decodes and caches a DS* sound effect lump by name, returning
 // nil (cached) if it doesn't exist or fails to decode, so repeated
@@ -24,6 +32,13 @@ func (g *Game) loadSound(name string) *wad.Sound {
 	}
 	var snd *wad.Sound
 	raw, ok := g.WAD.Find(name)
+	if !ok {
+		// A real-3D WAD carries every arsenal's weapon sounds (cmd/wad3d),
+		// under the post-remap name or the original DS* one.
+		if raw, ok = g.embeddedSound(name); !ok && orig != name {
+			raw, ok = g.embeddedSound(orig)
+		}
+	}
 	if !ok && g.AltWAD != nil {
 		// switchWeapons: a weapon fire lump the played WAD lacks — the other
 		// game's IWAD has it, under the post-remap name or (for a Doom gun in
@@ -105,4 +120,33 @@ func (g *Game) soundDuration(name string) float64 {
 		return 0
 	}
 	return float64(len(s.Samples)) / float64(s.SampleRate)
+}
+
+// embeddedSound returns a sound lump from the WAD's TPFWEAPN container
+// (wad.TPFWeaponsLump), ok=false when the WAD has no such container or it
+// lacks name.
+func (g *Game) embeddedSound(name string) ([]byte, bool) {
+	if !g.embeddedSoundsProbed {
+		g.embeddedSoundsProbed = true
+		if zr, ok := g.WAD.ZipLump(wad.TPFWeaponsLump); ok {
+			g.embeddedSounds = map[string]*zip.File{}
+			for _, f := range zr.File {
+				dir, file := path.Split(f.Name)
+				if strings.TrimSuffix(dir, "/") == assets.EmbeddedSoundsDir {
+					g.embeddedSounds[strings.ToUpper(strings.TrimSuffix(file, path.Ext(file)))] = f
+				}
+			}
+		}
+	}
+	f, ok := g.embeddedSounds[name]
+	if !ok {
+		return nil, false
+	}
+	rc, err := f.Open()
+	if err != nil {
+		return nil, false
+	}
+	defer rc.Close()
+	b, err := io.ReadAll(rc)
+	return b, err == nil
 }

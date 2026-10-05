@@ -9,7 +9,7 @@ import (
 func TestPlaneTilt(t *testing.T) {
 	// A floor rising 0.5 units per unit of +X, flat in Y: through (0,0,64),
 	// (128,0,128), (0,64,64).
-	tiltX, tiltY, ok := planeTilt([3]float64{0, 0, 64}, [3]float64{128, 0, 128}, [3]float64{0, 64, 64})
+	tiltX, tiltY, ok := slopes.PlaneTilt([3]float64{0, 0, 64}, [3]float64{128, 0, 128}, [3]float64{0, 64, 64})
 	if !ok {
 		t.Fatal("expected a valid plane")
 	}
@@ -18,13 +18,13 @@ func TestPlaneTilt(t *testing.T) {
 	}
 
 	// Collinear points: no unique plane.
-	if _, _, ok := planeTilt([3]float64{0, 0, 0}, [3]float64{1, 0, 0}, [3]float64{2, 0, 0}); ok {
+	if _, _, ok := slopes.PlaneTilt([3]float64{0, 0, 0}, [3]float64{1, 0, 0}, [3]float64{2, 0, 0}); ok {
 		t.Error("collinear points should not resolve to a plane")
 	}
 }
 
 // TestApplySlopesTiltsTheNamedSector: an end-to-end check of the WAD-glue
-// path (applySlopes), not just planeTilt's math — g.slopeDefs, keyed by
+// path (applySlopes), not just slopes.PlaneTilt's math — g.slopeDefs, keyed by
 // upper-cased map name, must land on the right sector's FloorTiltX/Y,
 // SlopePivotX/Y and FloorHeight (P1's height, since P1 is the pivot).
 func TestApplySlopesTiltsTheNamedSector(t *testing.T) {

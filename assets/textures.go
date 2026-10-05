@@ -5,6 +5,7 @@
 package assets
 
 import (
+	"archive/zip"
 	"fmt"
 	"sync"
 
@@ -138,6 +139,21 @@ type Textures struct {
 	hereticFlats map[string]string
 	heretic      bool
 
+	// embeddedWalls/embeddedFlats index a cmd/wad3d WAD's own TPFHIRES
+	// texture container (embedded.go) by lump name. Consulted after the
+	// opt-in Heretic/Quake 1 packs and before the disk hi-res set. nil when
+	// the WAD carries none.
+	embeddedWalls map[string]*zip.File
+	embeddedFlats map[string]*zip.File
+
+	// embeddedSprites is a cmd/wad3d WAD's TPFWEAPN weapon set (every
+	// arsenal's viewmodel/pickup/projectile/puff art, already palette-
+	// resolved), consulted by Sprite for a name the WAD itself lacks — ahead
+	// of the switchWeapons fallback IWAD, which it makes unnecessary.
+	// embeddedSpriteIndex is its SpriteFrame index, built lazily.
+	embeddedSprites     map[string]embeddedSprite
+	embeddedSpriteIndex map[string]*spriteDef
+
 	// fallbackW is consulted for a SPRITE lump the primary WAD lacks — the
 	// other game's IWAD when config's switchWeapons is on (SetSpriteFallback).
 	// Its own palette (fallbackPal) decodes those lumps, so a Heretic gun in
@@ -165,6 +181,22 @@ type Textures struct {
 	// own decode. See texturesdef.go.
 	zd zdRegistry
 }
+
+// noHiresSprites are sprites whose generic hi-res override (assets/
+// textures/sprites/) is never used: PLSF, the plasma rifle's muzzle flash.
+// That override's hotspot is scaled from the VANILLA patch's offset, but
+// the gun under it is drawn from the separately-authored HD weapon pack
+// (weapons.go, its own offset convention) that ships no matching flash.
+// raster/weapon.go's DrawWeapon positions the flash relative to the gun by
+// assuming both share one origin — true for two vanilla sprites, not here
+// — and the override's ~4x upscale magnifies the disagreement until the
+// flash lands on the left edge of the screen. Without the override PLSF
+// resolves from the vanilla patch: self-consistent, and small enough that
+// any residual mismatch against the HD gun stays small. Dropped here, in
+// New, rather than by the game, so every consumer agrees — cmd/wad3d
+// freezes sprites into a WAD's TPFWEAPN set through this same loader, and
+// once froze the upscaled flash when the game alone applied this rule.
+var noHiresSprites = []string{"PLSFA0", "PLSFB0", "PLSFC0", "PLSFD0"}
 
 // New loads the palette, PNAMES, and TEXTURE1(+TEXTURE2) definitions needed
 // to resolve any texture/flat name a level might reference. Composite wall
@@ -206,6 +238,12 @@ func New(w *wad.WAD) (*Textures, error) {
 		}
 		t.pnames = names
 	}
+
+	for _, n := range noHiresSprites {
+		delete(t.hiresSprites, n)
+	}
+	t.embeddedWalls, t.embeddedFlats = indexEmbedded(w)
+	t.embeddedSprites = indexEmbeddedSprites(w)
 
 	for _, lump := range []string{"TEXTURE1", "TEXTURE2"} {
 		raw, ok := w.Find(lump)
@@ -320,7 +358,8 @@ func (t *Textures) Inject(name string, im *RGBA, flat bool) {
 // reference, which is why this still falls through to the normal WAD path
 // rather than replacing it outright. When the Quake 1 pack is enabled
 // (SetQuake1Textures) and covers this name, it is preferred over even the
-// hi-res override.
+// hi-res override. A cmd/wad3d WAD's own embedded texture (embedded.go)
+// sits between the two: after the opt-in packs, ahead of the disk set.
 func (t *Textures) WallTexture(name string) (*RGBA, bool) {
 	if name == "" || name == "-" {
 		return nil, false
@@ -373,6 +412,18 @@ func (t *Textures) WallTexture(name string) (*RGBA, bool) {
 			}
 			// decode failed — fall through to the hi-res / WAD paths
 		}
+	}
+
+	if f, eok := t.embeddedWalls[name]; eok {
+		origW := 0.0
+		if ok {
+			origW = float64(def.Width)
+		}
+		if im := loadEmbedded(f, origW); im != nil {
+			t.walls[name] = im
+			return im, true
+		}
+		// decode failed — fall through to the disk hi-res / WAD paths
 	}
 
 	if path, hok := t.hiresWalls[name]; hok {
@@ -442,6 +493,13 @@ func (t *Textures) Flat(name string) (*RGBA, bool) {
 			// decode failed — fall through to the hi-res / WAD paths
 		}
 	}
+	if f, ok := t.embeddedFlats[name]; ok {
+		if im := loadEmbedded(f, 64); im != nil {
+			t.flats[name] = im
+			return im, true
+		}
+		// decode failed — fall through to the disk hi-res / WAD paths
+	}
 	if path, ok := t.hiresFlats[name]; ok {
 		// Doom flats are always 64x64, so the override's TexelsPerUnit is
 		// its own width / 64.
@@ -494,6 +552,17 @@ func (t *Textures) Sprite(name string) (*RGBA, bool) {
 	}
 
 	raw, hasLump := t.w.Find(name)
+	// A real-3D WAD's embedded weapon set (embedded.go) — a frozen copy of
+	// exactly what the lookup below would produce from the right IWAD and
+	// HD pack, so it stands in for all of them.
+	if !hasLump {
+		if es, ok := t.embeddedSprites[name]; ok {
+			if im := loadEmbeddedSprite(es); im != nil {
+				t.sprites[name] = im
+				return im, true
+			}
+		}
+	}
 	// A sprite the played WAD doesn't ship — for switchWeapons, the other
 	// game's weapon / projectile / puff sprite. Decode it with that game's
 	// own palette (spritePal below).

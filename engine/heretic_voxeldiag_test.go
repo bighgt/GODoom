@@ -34,7 +34,7 @@ func TestHereticVoxelFirstPersonPath(t *testing.T) {
 	const W, H = 1280, 720
 	g.Raster = raster.New(tex, W, H)
 	g.Voxels = vs
-	g.VoxelScale = 0.9
+	g.ModelScale = 0.9
 
 	var sx, sy float64
 	for _, th := range g.Level.Things {

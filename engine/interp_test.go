@@ -72,3 +72,58 @@ func TestMobjRenderStateLerpAndTeleportSnap(t *testing.T) {
 		t.Errorf("teleport lerped to (%v,%v), want snap to (900,900)", x, y)
 	}
 }
+
+// A 4-tic walk frame whose A_Chase steps 8 units must draw as one
+// continuous glide across all 4 tics — no pop at any tic boundary — and
+// land exactly on the simulated position as the next step fires.
+func TestStepGlideSpreadsStepOverWalkFrame(t *testing.T) {
+	g := &Game{smoothMonsterMovement: true}
+	mo := &Mobj{Tics: 4}
+	const step = 8.0
+
+	tick := func() { // mobjTick's snapshot + glide aging, then the state countdown
+		mo.prevX, mo.prevY, mo.prevZ, mo.prevAngle = mo.X, mo.Y, mo.Z, mo.Angle
+		mo.ageStepGlide()
+	}
+	walk := func() { // an A_Chase step
+		mo.X += step
+		g.beginStepGlide(mo, step, 0, 0, 0)
+	}
+	draw := func(frac float64) float64 { x, _, _, _ := mo.renderState(frac); return x }
+
+	tick()
+	walk()
+	last := draw(1e-6)
+	if math.Abs(last) > 1e-3 {
+		t.Fatalf("step tic starts at %v, want ~0 (the pre-step position)", last)
+	}
+	for tic := 0; tic < 8; tic++ { // two walk frames back to back
+		for _, f := range []float64{0.25, 0.5, 0.75, 1} {
+			x := draw(f)
+			if x < last-1e-9 {
+				t.Fatalf("tic %d frac %v: x=%v went backwards from %v", tic, f, x, last)
+			}
+			if x-last > step/4+1e-9 {
+				t.Fatalf("tic %d frac %v: jumped %v in a quarter tic", tic, f, x-last)
+			}
+			last = x
+		}
+		tick()
+		if tic == 3 {
+			if math.Abs(last-step) > 1e-9 {
+				t.Fatalf("end of first frame drawn at %v, want %v", last, step)
+			}
+			walk() // the next A_Chase, mid-stream
+		}
+	}
+	if math.Abs(last-mo.X) > 1e-9 || mo.glideTics != 0 {
+		t.Errorf("settled at %v (glide %d), want %v with no glide", last, mo.glideTics, mo.X)
+	}
+
+	// Off: the step is left to the ordinary one-tic lerp.
+	off := &Mobj{Tics: 4, X: step}
+	(&Game{}).beginStepGlide(off, step, 0, 0, 0)
+	if off.glideTics != 0 || off.prevX != 0 {
+		t.Errorf("smoothMonsterMovement off still glided: %+v", off)
+	}
+}

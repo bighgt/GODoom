@@ -314,3 +314,22 @@ func windowsSoundFonts() []string {
 	}
 	return out
 }
+
+// findSoundFont returns the first usable path: $TPF_SOUNDFONT if it is set
+// and points at a file, otherwise the first existing entry in paths, else
+// "". A set-but-missing $TPF_SOUNDFONT returns "" so the caller reports the
+// "no soundfont" hint rather than silently searching.
+func findSoundFont(paths []string) string {
+	if p := os.Getenv(soundFontEnv); p != "" {
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return p
+		}
+		return ""
+	}
+	for _, p := range paths {
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return p
+		}
+	}
+	return ""
+}

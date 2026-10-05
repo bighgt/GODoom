@@ -140,6 +140,7 @@ func (g *Game) pKillMobj(source, target *Mobj) {
 	if target.Tics < 1 {
 		target.Tics = 1
 	}
+	target.stateTics = target.Tics
 
 	// Monster item drop (Phase 4's pickup code will make it collectible).
 	drop, ok := mobjType(0), false

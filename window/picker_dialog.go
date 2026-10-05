@@ -5,6 +5,7 @@ package window
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 
 	"github.com/sqweek/dialog"
 )
@@ -25,6 +26,24 @@ func pickWAD() (string, error) {
 			return "", ErrPickCancelled
 		}
 		return "", fmt.Errorf("window: WAD file dialog: %w", err)
+	}
+	return path, nil
+}
+
+// pickSaveWAD is PickSaveWADFile's Windows/macOS backend (Win32
+// GetSaveFileName / NSSavePanel — both confirm an overwrite themselves).
+func pickSaveWAD(title, defaultPath string) (string, error) {
+	path, err := dialog.File().
+		Title(title).
+		Filter("Doom WAD files", "wad").
+		SetStartDir(filepath.Dir(defaultPath)).
+		SetStartFile(filepath.Base(defaultPath)).
+		Save()
+	if err != nil {
+		if errors.Is(err, dialog.ErrCancelled) {
+			return "", ErrPickCancelled
+		}
+		return "", fmt.Errorf("window: save dialog: %w", err)
 	}
 	return path, nil
 }

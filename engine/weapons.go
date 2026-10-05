@@ -65,6 +65,16 @@ type WeaponDef struct {
 	AmmoCost     int
 	FireFrames   []WeaponFrame
 	FlashFrames  []WeaponFrame // nil/empty if the weapon has no muzzle flash
+	// FireCycle, when set, replaces FireFrames shot by shot through a held
+	// burst: shot n plays FireCycle[n % len]. The HD plasma rifle's
+	// Fire1/Fire2/Fire3 states — PLGF A, then B, then C, each re-entered by
+	// A_ReFire — are the only user; this engine otherwise restarts
+	// FireFrames at the same point every shot.
+	FireCycle [][]WeaponFrame
+	// ReleaseFrames plays once when a burst ends (fire released or out of
+	// ammo) before the weapon is ready again — see weaponCooling. Empty for
+	// every weapon whose wind-down tail is just its resting art repeated.
+	ReleaseFrames []WeaponFrame
 	// FireSoundSeq is extra one-shot sounds triggered partway through the
 	// fire animation, at a tic offset from the start of the shot — id's
 	// mid-chain action functions that only call S_StartSound. The Super
@@ -352,28 +362,34 @@ var Weapons = [numWeapons]WeaponDef{
 		},
 	},
 	wpPlasma: {
-		Name: "Plasma Rifle", SpritePrefix: "PLGG", FlashPrefix: "PLSF", FireSound: "DSPLASMA",
+		Name: "Plasma Rifle", SpritePrefix: "PLGG", FlashPrefix: "TNT1", FireSound: "DSPLASMA",
 		AmmoType: 2, AmmoCost: 1,
-		// SmoothPlasmaRifle's Fire1/2/3 phases each play one PLGF frame (A/
-		// B/C respectively, all "Bright A_FireProjectile") then either
-		// re-enter for the next phase (held fire) or fall into the PLGC
-		// idle-wobble tail — that tail is dropped (rule 3 above), and since
-		// this engine always restarts FireFrames at the same point, only
-		// PLGF A is used rather than cycling A/B/C; the visual difference
-		// between those three is minor (all the same "bright fire" pose).
-		// 3 tics/shot matches this project's own already-tuned held-fire
-		// cadence (see the previous vanilla-timed table's note: trimmed
-		// from a literal 3+20 to land near vanilla's real ~3-tic A_ReFire
-		// loop rate) — unchanged by this port.
+		// SmoothPlasmaRifle Fire1/Fire2/Fire3: PLGF A, B, C 3 Bright (each
+		// A_FireProjectile), A_ReFire stepping to the next — so a held burst
+		// cycles A->B->C->A... (FireCycle). FireFrames keeps shot 1's for
+		// anything that reads a single sequence. 3 tics/shot, unchanged.
 		FireFrames: []WeaponFrame{{Frame: 'A', Tics: 3, Prefix: "PLGF"}},
-		// SmoothPlasmaRifle's own Flash is TNT1 (invisible, a pure
-		// A_Light1 brightness bump with no separate flash sprite) — this
-		// project keeps the original vanilla PLSF flash sprite instead of
-		// dropping the muzzle flash light entirely (lights.go's
-		// muzzleFlashLight gates the dynamic flash-light spawn on
-		// hasFlash), since the mod doesn't provide a replacement asset for
-		// it either way.
-		FlashFrames: []WeaponFrame{{Frame: 'A', Tics: 4}},
+		FireCycle: [][]WeaponFrame{
+			{{Frame: 'A', Tics: 3, Prefix: "PLGF"}},
+			{{Frame: 'B', Tics: 3, Prefix: "PLGF"}},
+			{{Frame: 'C', Tics: 3, Prefix: "PLGF"}},
+		},
+		// Fire3's release tail: PLGC BCD 1; PLGC E 13; PLGC DCBA 1 — the
+		// barrel venting and settling, distinct art (not the resting pose
+		// repeated), so it's kept (ReleaseFrames / weaponCooling).
+		ReleaseFrames: []WeaponFrame{
+			{Frame: 'B', Tics: 1, Prefix: "PLGC"}, {Frame: 'C', Tics: 1, Prefix: "PLGC"}, {Frame: 'D', Tics: 1, Prefix: "PLGC"},
+			{Frame: 'E', Tics: 13, Prefix: "PLGC"},
+			{Frame: 'D', Tics: 1, Prefix: "PLGC"}, {Frame: 'C', Tics: 1, Prefix: "PLGC"}, {Frame: 'B', Tics: 1, Prefix: "PLGC"}, {Frame: 'A', Tics: 1, Prefix: "PLGC"},
+		},
+		// Flash: TNT1 — the HD pack's own flash is invisible, a pure
+		// A_Light1 brightness bump; PLGF's frames carry the glow themselves.
+		// "TNT1" keeps hasFlash (so lights.go's muzzle light still fires)
+		// while DrawWeapon draws nothing for it. It used to be the vanilla
+		// PLSF — but PLSF isn't a flash, it's the whole glowing vanilla gun
+		// (and doom_weapons.pk3's PLSF a whole HD one), so it drew as a
+		// second, smaller rifle beside the HD one.
+		FlashFrames: []WeaponFrame{{Frame: 'A', Tics: 3}},
 		// MT_PLASMA: speed 25*35=875 units/sec. Sprite/explosion/sound
 		// names (PLSS the flying ball, PLSE its splat, DSPLASMA reused for
 		// no distinct impact sound in vanilla) are NOT verified against
@@ -590,6 +606,11 @@ const (
 	weaponRaising
 	weaponReady
 	weaponFiring
+	// weaponCooling plays WeaponDef.ReleaseFrames once a burst ends — the
+	// plasma rifle's vent-and-settle animation. It can't fire or switch
+	// until it finishes, as in the HD pack (its Fire3 tail has no
+	// A_WeaponReady), then drops to weaponReady.
+	weaponCooling
 )
 
 // WeaponState is the equipped weapon's animation state.
@@ -599,7 +620,8 @@ type WeaponState struct {
 	phase   weaponPhase
 	Offset  float64 // 0 = fully raised/ready, 1 = fully lowered/hidden — read by raster.DrawWeapon
 
-	fireElapsedTics float64 // time since FireWeapon, in Doom tics — indexes into FireFrames/FlashFrames
+	fireElapsedTics float64 // time since this shot (or the cooldown) began, in Doom tics — indexes the frame lists
+	burstShot       int     // shots fired so far in the current held burst (selects WeaponDef.FireCycle)
 	idleTics        float64 // free-running tic counter for the IdleFrames loop
 	idleSoundTimer  float64 // seconds until the IdleSound is re-triggered (see updateWeapon)
 
@@ -609,6 +631,15 @@ type WeaponState struct {
 	// fast the player is moving); kept wrapped to [0, 2*pi) so it never
 	// grows unbounded over a long play session.
 	bobPhase float64
+}
+
+// shotFrames is the gun animation for shot n (0-based) of a held burst:
+// FireCycle's entry when the weapon has one, else FireFrames.
+func (d *WeaponDef) shotFrames(n int) []WeaponFrame {
+	if len(d.FireCycle) > 0 {
+		return d.FireCycle[n%len(d.FireCycle)]
+	}
+	return d.FireFrames
 }
 
 // NewWeaponState starts with the Pistol already raising in (Doom's own
@@ -761,6 +792,7 @@ func (g *Game) FireWeapon() {
 	}
 	g.Weapon.phase = weaponFiring
 	g.Weapon.fireElapsedTics = 0
+	g.Weapon.burstShot = 0
 }
 
 // beginFire runs one shot of the current weapon: ammo check + deduct, fire
@@ -1006,19 +1038,30 @@ func (g *Game) updateWeapon(dt float64) {
 				g.playWeaponSound(ts.Sound)
 			}
 		}
-		total := framesTotalTics(Weapons[w.Current].FireFrames)
+		def := &Weapons[w.Current]
+		total := framesTotalTics(def.shotFrames(w.burstShot))
 		if total <= 0 || w.fireElapsedTics >= float64(total) {
 			// Sequence done. If fire is still held and there's ammo,
 			// re-enter it seamlessly (carrying the overshoot) so a held
 			// auto weapon — chaingun, plasma, chainsaw — loops its firing
 			// frames with no ready frame flashing between rounds, the way
 			// id's 0-tic A_ReFire state does.
-			if total > 0 && g.Window != nil && g.Window.FirePressed() && g.beginFire() {
+			if total > 0 && g.fireHeld() && g.beginFire() {
 				w.fireElapsedTics -= float64(total)
+				w.burstShot++
+			} else if len(def.ReleaseFrames) > 0 {
+				w.phase = weaponCooling
+				w.fireElapsedTics = 0
 			} else {
 				w.phase = weaponReady
 				w.fireElapsedTics = 0
 			}
+		}
+	case weaponCooling:
+		w.fireElapsedTics += dt * ticsPerSecond
+		if w.fireElapsedTics >= float64(framesTotalTics(Weapons[w.Current].ReleaseFrames)) {
+			w.phase = weaponReady
+			w.fireElapsedTics = 0
 		}
 	case weaponReady:
 		if w.pending >= 0 {
@@ -1075,6 +1118,16 @@ func (g *Game) currentSprite() (gunPrefix string, gunFrame byte, flashPrefix str
 	def := Weapons[g.Weapon.Current]
 	gunPrefix, flashPrefix = def.SpritePrefix, def.FlashPrefix
 
+	if g.Weapon.phase == weaponCooling {
+		gunFrame = 'A'
+		if f, ok := frameAt(def.ReleaseFrames, g.Weapon.fireElapsedTics); ok {
+			gunFrame = f.Frame
+			if f.Prefix != "" {
+				gunPrefix = f.Prefix
+			}
+		}
+		return gunPrefix, gunFrame, flashPrefix, 0, false
+	}
 	if g.Weapon.phase != weaponFiring {
 		if f, ok := frameAtLooped(def.IdleFrames, g.Weapon.idleTics); ok {
 			if f.Prefix != "" {
@@ -1086,7 +1139,7 @@ func (g *Game) currentSprite() (gunPrefix string, gunFrame byte, flashPrefix str
 	}
 
 	gunFrame = 'A'
-	if f, ok := frameAt(def.FireFrames, g.Weapon.fireElapsedTics); ok {
+	if f, ok := frameAt(def.shotFrames(g.Weapon.burstShot), g.Weapon.fireElapsedTics); ok {
 		gunFrame = f.Frame
 		if f.Prefix != "" {
 			gunPrefix = f.Prefix
@@ -1099,4 +1152,14 @@ func (g *Game) currentSprite() (gunPrefix string, gunFrame byte, flashPrefix str
 		return gunPrefix, gunFrame, flashPrefix, f.Frame, true
 	}
 	return gunPrefix, gunFrame, flashPrefix, 0, false
+}
+
+// fireHeld reports whether the fire button is down (the auto-refire test
+// in updateWeapon). fireHeldHook, set only by tests, stands in for the
+// window.
+func (g *Game) fireHeld() bool {
+	if g.fireHeldHook != nil {
+		return g.fireHeldHook()
+	}
+	return g.Window != nil && g.Window.FirePressed()
 }

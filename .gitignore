@@ -41,6 +41,7 @@
 # hundreds of MB and not ours to redistribute. The converted output lands
 # under /assets/textures/ which is already excluded above.
 /assets/import/
+/assets/models/
 
 # Drop-in mod folder (GLDEFS / brightmap / texture packs — .pk3s or loose
 # files). Third-party content, supplied locally. The example GLDEFS and the

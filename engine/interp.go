@@ -40,17 +40,114 @@ func (g *Game) renderLerp() float64 {
 const interpTeleportDist2 = 128.0 * 128.0
 
 // renderState returns the position and facing to draw mo at this frame: its
-// start-of-tic state advanced toward its current state by frac. A jump too
-// large to be ordinary motion snaps straight to the current state.
+// start-of-tic state advanced toward its current state by frac, plus
+// whatever is left of a walking monster's step glide. A jump too large to be
+// ordinary motion snaps straight to the current state.
 func (mo *Mobj) renderState(frac float64) (x, y, z, angle float64) {
 	dx, dy, dz := mo.X-mo.prevX, mo.Y-mo.prevY, mo.Z-mo.prevZ
-	if frac <= 0 || dx*dx+dy*dy > interpTeleportDist2 {
+	if dx*dx+dy*dy > interpTeleportDist2 {
 		return mo.X, mo.Y, mo.Z, mo.Angle
 	}
-	return mo.prevX + dx*frac,
-		mo.prevY + dy*frac,
-		mo.prevZ + dz*frac,
-		mo.prevAngle + shortestAngleDelta(mo.prevAngle, mo.Angle)*frac
+	if frac <= 0 {
+		x, y, z, angle = mo.X, mo.Y, mo.Z, mo.Angle
+	} else {
+		x, y, z = mo.prevX+dx*frac, mo.prevY+dy*frac, mo.prevZ+dz*frac
+		angle = mo.prevAngle + shortestAngleDelta(mo.prevAngle, mo.Angle)*frac
+	}
+	if mo.glideTics > 0 {
+		if k := 1 - (float64(mo.glideAge)+frac)/float64(mo.glideTics); k > 0 {
+			x += mo.glideX * k
+			y += mo.glideY * k
+			z += mo.glideZ * k
+			angle += mo.glideAng * k
+		}
+	}
+	return x, y, z, angle
+}
+
+// --- walking-monster step glide ----------------------------------------
+//
+// The per-tic lerp above can't smooth a walking monster. id's A_Chase moves
+// it its whole Speed (8-20 units) in ONE tic and then leaves it standing for
+// the rest of its walk frame (3-4 tics), so even fully interpolated it goes
+// step-pause-step — the familiar Doom "hop". ZDoom's renderer has the same
+// limit: its interpolation (Prev -> current by the tic fraction) is also
+// one tic wide, and the smoothness people know from GZDoom mods (Smooth
+// Doom) comes from re-timing the actor so A_Chase runs every tic with a
+// fraction of the speed.
+//
+// Re-timing changes the simulation (collision, door pushes, attack odds per
+// tic), so this engine does the presentation-side equivalent: when the AI
+// takes a step, the step is folded into the start-of-tic snapshot and kept
+// as an offset (glideX..) that decays linearly to zero over the frame's
+// tics. The sprite therefore walks continuously and arrives where the
+// simulation put it exactly as the next A_Chase fires; it trails the real
+// position by at most one step meanwhile. The 45° chase turn glides the same
+// way. Gated by config smoothMonsterMovement.
+
+// maxStepGlideTics caps the glide so a long-tic walk frame (a slow DEHACKED
+// state) doesn't leave the sprite visibly far behind the real monster.
+const maxStepGlideTics = 8
+
+// beginStepGlide spreads an instant move of (dx, dy, dz) and turn of dang —
+// which the simulation has ALREADY applied to mo this tic — over the tics
+// until mo's next state action, i.e. its next A_Chase step. Any glide still
+// in progress carries over, so back-to-back steps stay continuous.
+func (g *Game) beginStepGlide(mo *Mobj, dx, dy, dz, dang float64) {
+	if !g.smoothMonsterMovement {
+		return
+	}
+	n := mo.Tics
+	if mo.hact != nil {
+		n = mo.hFrameTic
+	}
+	if n <= 1 {
+		return // a 1-tic frame: the ordinary per-tic lerp already covers it
+	}
+	n = min(n, maxStepGlideTics)
+	rem := 0.0 // unshown fraction of the previous glide, as of this tic's start
+	if mo.glideTics > 0 {
+		rem = 1 - float64(mo.glideAge)/float64(mo.glideTics)
+	}
+	mo.glideX = mo.glideX*rem - dx
+	mo.glideY = mo.glideY*rem - dy
+	mo.glideZ = mo.glideZ*rem - dz
+	mo.glideAng = mo.glideAng*rem - dang
+	mo.glideTics, mo.glideAge = n, 0
+	// The step is now the glide's to show; keep the per-tic lerp from also
+	// showing it.
+	mo.prevX += dx
+	mo.prevY += dy
+	mo.prevZ += dz
+	mo.prevAngle += dang
+}
+
+// ageStepGlide advances mo's glide by one tic; called with the start-of-tic
+// snapshot in mobjTick.
+func (mo *Mobj) ageStepGlide() {
+	if mo.glideTics == 0 {
+		return
+	}
+	if mo.glideAge++; mo.glideAge >= mo.glideTics {
+		mo.clearStepGlide()
+	}
+}
+
+// clearStepGlide drops any in-progress glide so mo is drawn exactly where it
+// is — after a teleport, or when its facing snaps (aFaceTarget).
+func (mo *Mobj) clearStepGlide() {
+	mo.glideX, mo.glideY, mo.glideZ, mo.glideAng = 0, 0, 0, 0
+	mo.glideTics, mo.glideAge = 0, 0
+}
+
+// chaseTurn is turnToMoveDir with the 45° turn glided over the walk frame
+// rather than snapped in a single tic.
+func (g *Game) chaseTurn(mo *Mobj) {
+	a0 := mo.Angle
+	turnToMoveDir(mo)
+	if d := shortestAngleDelta(a0, mo.Angle); d != 0 {
+		g.beginStepGlide(mo, 0, 0, 0, d)
+	}
 }
 
 // --- hardware-path sector-motion interpolation -------------------------
@@ -61,7 +158,8 @@ type savedSecH struct {
 }
 
 // snapshotSectorHeights records every sector's current floor/ceiling into
-// g.prevSectorH at the top of a tic, before tickSpecials moves any of them.
+// g.prevSectorH (and light into prevSectorLight, for trackLiveSectors) at
+// the top of a tic, before tickSpecials changes any of them.
 func (g *Game) snapshotSectorHeights() {
 	if g.Level == nil {
 		return
@@ -69,9 +167,11 @@ func (g *Game) snapshotSectorHeights() {
 	secs := g.Level.Sectors
 	if len(g.prevSectorH) != len(secs)*2 {
 		g.prevSectorH = make([]int16, len(secs)*2)
+		g.prevSectorLight = make([]int16, len(secs))
 	}
 	for i := range secs {
 		g.prevSectorH[i*2], g.prevSectorH[i*2+1] = secs[i].FloorHeight, secs[i].CeilingHeight
+		g.prevSectorLight[i] = secs[i].LightLevel
 	}
 }
 
@@ -85,9 +185,8 @@ const secInterpSnapThreshold = 48
 // with their start-of-last-tic value advanced toward the current value by
 // renderLerp(), for THIS frame's geometry build only. It returns a closure
 // that puts the authoritative heights back; call it as soon as the static
-// geometry has been (re)built. Sets g.sectorInterpActive if anything moved.
+// geometry has been built (Build emits the moving sectors from them).
 func (g *Game) applySectorInterp() func() {
-	g.sectorInterpActive = false
 	frac := g.renderLerp()
 	if g.Level == nil {
 		return func() {}
@@ -117,7 +216,6 @@ func (g *Game) applySectorInterp() func() {
 		}
 		saved = append(saved, savedSecH{i, cf, cc})
 		secs[i].FloorHeight, secs[i].CeilingHeight = nf, nc
-		g.sectorInterpActive = true
 	}
 	g.secInterpSaved = saved
 	return func() {
@@ -126,51 +224,6 @@ func (g *Game) applySectorInterp() func() {
 			g.Level.Sectors[s.idx].CeilingHeight = s.ceil
 		}
 	}
-}
-
-// renderedSectorHeightsChanged reports whether any sector's height this
-// frame — already interpolated by applySectorInterp, if a mover is
-// mid-glide — differs from what the static geometry was last built from,
-// and updates that snapshot (g.lastRenderedSecH) to match as a side effect.
-// Call once per frame, right after applySectorInterp and before deciding
-// whether to rebuild.
-//
-// applySectorInterp already skips a sector whose interpolated height comes
-// out equal to the CURRENT tic's authoritative one (see its own nf==cf &&
-// nc==cc check), but that alone doesn't catch the much more common case at
-// a high render frame rate: a door/lift/crusher moving a handful of map
-// units over one 1/35s tic subdivides into several render frames, and an
-// int16 height often rounds to the exact same value across two or more
-// consecutive ones. Without this second check, renderFrame/
-// SyncIsoWorldGeometry's caller would still see sectorInterpActive == true
-// on every one of those frames and pay for a full-level worldgeo.Invalidate
-// (walks every subsector) plus a synchronous, blocking GPU re-upload of the
-// entire static vertex buffer (render/vulkan's uploadStaticWorld) — for a
-// frame that looks pixel-identical to the one before. That per-frame stall,
-// for as long as any mover anywhere in the level is active, is what made
-// the hardware path's frame rate track sector-mover activity far more than
-// raw GPU throughput; skipping it here is a pure no-visual-difference
-// optimisation, not a behaviour change (geomChanged/animChanged, both far
-// less frequent, still force a rebuild unconditionally at their own call
-// sites — see renderFrame's and SyncIsoWorldGeometry's own comments).
-func (g *Game) renderedSectorHeightsChanged() bool {
-	secs := g.Level.Sectors
-	if len(g.lastRenderedSecH) != len(secs)*2 {
-		g.lastRenderedSecH = make([]int16, len(secs)*2)
-		for i := range secs {
-			g.lastRenderedSecH[i*2], g.lastRenderedSecH[i*2+1] = secs[i].FloorHeight, secs[i].CeilingHeight
-		}
-		return true // first call: force a build
-	}
-	changed := false
-	for i := range secs {
-		f, c := secs[i].FloorHeight, secs[i].CeilingHeight
-		if g.lastRenderedSecH[i*2] != f || g.lastRenderedSecH[i*2+1] != c {
-			g.lastRenderedSecH[i*2], g.lastRenderedSecH[i*2+1] = f, c
-			changed = true
-		}
-	}
-	return changed
 }
 
 func absInt(v int) int {

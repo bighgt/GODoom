@@ -59,11 +59,6 @@ func firstN(s []string, n int) []string {
 	return s
 }
 
-func loadMap(t testing.TB) (*wad.Level, bsp.Node) {
-	m := testMaps(t)[0]
-	return m.lvl, m.shipped
-}
-
 func TestBuildLeavesAreConvexSingleSector(t *testing.T) {
 	for _, tm := range testMaps(t) {
 		t.Run(tm.name, func(t *testing.T) { checkSingleSector(t, tm.lvl) })
@@ -199,14 +194,3 @@ func itoaf(f float64) string {
 	return string(b)
 }
 
-func bounds(vs []wad.Vertex) (minX, minY, maxX, maxY int) {
-	minX, minY = 1<<30, 1<<30
-	maxX, maxY = -(1 << 30), -(1 << 30)
-	for _, v := range vs {
-		minX = min(minX, int(v.X))
-		minY = min(minY, int(v.Y))
-		maxX = max(maxX, int(v.X))
-		maxY = max(maxY, int(v.Y))
-	}
-	return
-}

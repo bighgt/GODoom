@@ -9,7 +9,7 @@ import (
 
 // TestCullLightsToViewDropsOutOfViewPreservesOrder pins the two properties
 // DrawWorld's own light-shading loop and shadowBudget both depend on: lights
-// outside worldgeo.LightVisible's cone are dropped (so dynamicDiffuse and
+// outside worldgeo.ViewCone's cone are dropped (so dynamicDiffuse and
 // the shadow-map budget never see them), and the survivors keep their
 // original relative order (so "the leading lights" — collectLights' own
 // gameplay-critical-first ordering — still means the same thing afterward).

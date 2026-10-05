@@ -2,6 +2,7 @@ package launcher
 
 import (
 	"path/filepath"
+	"strings"
 
 	"twopointfive/config"
 	"twopointfive/window"
@@ -55,9 +56,9 @@ const (
 
 func drawTopBar(ui *UI, m *Model) {
 	c := ui.C
-	bar := Rect{0, 0, windowW, topBarH}
+	bar := Rect{X: 0, Y: 0, W: windowW, H: topBarH}
 	c.FillRect(bar, theme.Panel)
-	c.FillRect(Rect{0, topBarH - 1, windowW, 1}, theme.Border)
+	c.FillRect(Rect{X: 0, Y: topBarH - 1, W: windowW, H: 1}, theme.Border)
 	c.Text(16, 16, "TWOPOINTFIVE", theme.Accent)
 
 	// WAD quick-pick chips + Browse…
@@ -70,13 +71,13 @@ func drawTopBar(ui *UI, m *Model) {
 		if path == m.WADPath {
 			style = ButtonSelected
 		}
-		r := Rect{x, y, chipW, chipH}
+		r := Rect{X: x, Y: y, W: chipW, H: chipH}
 		if ui.Button(r, filepath.Base(path), style) {
 			m.PickWAD(path)
 		}
 		x += chipW + chipGap
 	}
-	browseR := Rect{windowW - 140 - 16, y, 140, chipH}
+	browseR := Rect{X: windowW - 140 - 16, Y: y, W: 140, H: chipH}
 	if ui.Button(browseR, "Browse...", ButtonNormal) {
 		m.BrowseRequested = true
 	}
@@ -88,9 +89,12 @@ func drawTopBar(ui *UI, m *Model) {
 		if m.IWADPath != "" {
 			label += "  [+ " + filepath.Base(m.IWADPath) + "]"
 		}
+		if m.Is3D {
+			label += "  [3D]"
+		}
 	}
 	labelY := y + chipH + 6
-	ui.Label(Rect{16, labelY, windowW - 32, 16}, label, true)
+	ui.Label(Rect{X: 16, Y: labelY, W: windowW - 32, H: 16}, label, true)
 
 	mapOptions := m.Maps
 	mapCurrent := m.MapName
@@ -99,7 +103,7 @@ func drawTopBar(ui *UI, m *Model) {
 		mapCurrent = mapOptions[0]
 	}
 	mapY := labelY + 16 + 8
-	mapRow := Rect{16, mapY, windowW - 32, rowHeight}
+	mapRow := Rect{X: 16, Y: mapY, W: windowW - 32, H: rowHeight}
 	ui.Options("mapSelect", mapRow, "Level", mapCurrent, choices(mapOptions), func(sel string) {
 		if len(m.Maps) > 0 {
 			m.MapName = sel
@@ -110,27 +114,38 @@ func drawTopBar(ui *UI, m *Model) {
 	// the scrollable settings list below: it's a whole-scene visual style
 	// switch (see render/vulkan/shaders/worldblit.frag's outline pass), the
 	// kind of choice worth seeing before you scroll past it, not after.
-	cartoonRow := Rect{16, mapY + rowHeight + 8, windowW - 32, rowHeight}
+	cartoonRow := Rect{X: 16, Y: mapY + rowHeight + 8, W: windowW - 32, H: rowHeight}
 	ui.Checkbox("cartoonShading", cartoonRow, "Cartoon Shading", &m.Cfg.CartoonShading)
 }
 
 func drawBottomBar(ui *UI, m *Model) {
 	c := ui.C
-	bar := Rect{0, windowH - bottomBarH, windowW, bottomBarH}
+	bar := Rect{X: 0, Y: windowH - bottomBarH, W: windowW, H: bottomBarH}
 	c.FillRect(bar, theme.Panel)
-	c.FillRect(Rect{0, windowH - bottomBarH, windowW, 1}, theme.Border)
+	c.FillRect(Rect{X: 0, Y: windowH - bottomBarH, W: windowW, H: 1}, theme.Border)
 
 	statusCol := theme.TextDim
 	if m.StatusErr {
 		statusCol = theme.Error
 	}
-	c.TextLeft(Rect{16, windowH - bottomBarH, windowW - 320, bottomBarH}, m.Status, statusCol)
+	// The status line gets everything left of the QUIT button, wrapped onto
+	// up to statusMaxLines lines (and clipped there), so a long message —
+	// a WAD load error, say — never runs underneath QUIT / PLAY.
+	statusR := Rect{X: 16, Y: windowH - bottomBarH, W: windowW - 260 - 16 - 16, H: bottomBarH}
+	lines := wrapStatus(m.Status, (statusR.W-16)/glyphAdvance)
+	prev := c.Clip(statusR)
+	lineH := glyphHeight + 3
+	y0 := statusR.Y + statusR.H/2 - (len(lines)-1)*lineH/2
+	for i, l := range lines {
+		c.Text(statusR.X+8, y0+i*lineH, l, statusCol)
+	}
+	c.SetClip(prev)
 
-	quitR := Rect{windowW - 260, windowH - bottomBarH + 12, 100, 32}
+	quitR := Rect{X: windowW - 260, Y: windowH - bottomBarH + 12, W: 100, H: 32}
 	if ui.Button(quitR, "QUIT", ButtonNormal) {
 		m.Done, m.Ok = true, false
 	}
-	playR := Rect{windowW - 150, windowH - bottomBarH + 12, 134, 32}
+	playR := Rect{X: windowW - 150, Y: windowH - bottomBarH + 12, W: 134, H: 32}
 	if ui.Button(playR, "PLAY", ButtonPrimary) {
 		tryPlay(m)
 	}
@@ -160,7 +175,7 @@ func layoutTab(y0 int, section string, draw func(y int, f *field)) int {
 func drawTabStrip(ui *UI, m *Model, r Rect) {
 	c := ui.C
 	c.FillRect(r, theme.Panel)
-	c.FillRect(Rect{r.X, r.Y + r.H - 1, r.W, 1}, theme.Border)
+	c.FillRect(Rect{X: r.X, Y: r.Y + r.H - 1, W: r.W, H: 1}, theme.Border)
 
 	n := len(sectionOrder)
 	const gap = 4
@@ -173,7 +188,7 @@ func drawTabStrip(ui *UI, m *Model, r Rect) {
 		if i == m.ActiveTab {
 			style = ButtonSelected
 		}
-		if ui.Button(Rect{x, y, tabW, h}, tabTitles[sec], style) && m.ActiveTab != i {
+		if ui.Button(Rect{X: x, Y: y, W: tabW, H: h}, tabTitles[sec], style) && m.ActiveTab != i {
 			m.ActiveTab = i
 			m.ScrollY = 0
 		}
@@ -182,16 +197,16 @@ func drawTabStrip(ui *UI, m *Model, r Rect) {
 }
 
 func drawSettingsPanel(ui *UI, m *Model) {
-	panel := Rect{0, topBarH, windowW, windowH - topBarH - bottomBarH}
+	panel := Rect{X: 0, Y: topBarH, W: windowW, H: windowH - topBarH - bottomBarH}
 
-	drawTabStrip(ui, m, Rect{panel.X, panel.Y, panel.W, tabBarH})
+	drawTabStrip(ui, m, Rect{X: panel.X, Y: panel.Y, W: panel.W, H: tabBarH})
 
 	if m.ActiveTab < 0 || m.ActiveTab >= len(sectionOrder) {
 		m.ActiveTab = 0
 	}
 	section := sectionOrder[m.ActiveTab]
 
-	viewport := Rect{panel.X, panel.Y + tabBarH, panel.W, panel.H - tabBarH}
+	viewport := Rect{X: panel.X, Y: panel.Y + tabBarH, W: panel.W, H: panel.H - tabBarH}
 	total := layoutTab(0, section, nil)
 
 	maxScroll := float64(max(total-(viewport.H-rowGap), 0))
@@ -207,7 +222,7 @@ func drawSettingsPanel(ui *UI, m *Model) {
 
 	prevClip := ui.C.Clip(viewport)
 	layoutTab(viewport.Y+rowGap-int(m.ScrollY), section, func(y int, f *field) {
-		r := Rect{panelPad, y, viewport.W - 2*panelPad - scrollbarW, rowHeight}
+		r := Rect{X: panelPad, Y: y, W: viewport.W - 2*panelPad - scrollbarW, H: rowHeight}
 		drawField(ui, r, *f, &m.Cfg)
 		// Only offer the hint for a row actually inside the viewport — a row
 		// scrolled up under the tab strip mustn't tooltip on a tab-strip hover.
@@ -221,8 +236,8 @@ func drawSettingsPanel(ui *UI, m *Model) {
 		trackH := viewport.H
 		thumbH := max(int(float64(trackH)*float64(viewport.H)/float64(total)), 20)
 		thumbY := viewport.Y + int(m.ScrollY/maxScroll*float64(trackH-thumbH))
-		ui.C.FillRect(Rect{windowW - scrollbarW, viewport.Y, scrollbarW, trackH}, theme.Panel)
-		ui.C.FillRect(Rect{windowW - scrollbarW + 2, thumbY, scrollbarW - 4, thumbH}, theme.ScrollThumb)
+		ui.C.FillRect(Rect{X: windowW - scrollbarW, Y: viewport.Y, W: scrollbarW, H: trackH}, theme.Panel)
+		ui.C.FillRect(Rect{X: windowW - scrollbarW + 2, Y: thumbY, W: scrollbarW - 4, H: thumbH}, theme.ScrollThumb)
 	}
 }
 
@@ -242,4 +257,53 @@ func drawField(ui *UI, r Rect, f field, cfg *config.Config) {
 	case kindTextField:
 		ui.TextField(f.id, r, f.label, f.stringAt(cfg))
 	}
+}
+
+// statusMaxLines is how many wrapped lines of status text fit the bottom
+// bar (bottomBarH) — anything longer ends in "...".
+const statusMaxLines = 3
+
+// wrapStatus word-wraps s to at most width characters per line (the font
+// is monospace), at most statusMaxLines lines, the last one truncated with
+// "..." if the text doesn't fit. A single word longer than width is broken.
+func wrapStatus(s string, width int) []string {
+	if s == "" || width < 4 {
+		return nil
+	}
+	// The launcher's bitmap font has no em/en dash (it draws a placeholder
+	// box), and several engine errors use them.
+	s = strings.NewReplacer("—", "-", "–", "-").Replace(s)
+	var lines []string
+	line := ""
+	for _, w := range strings.Fields(s) {
+		for len([]rune(w)) > width { // an over-long word: hard-break it
+			if line != "" {
+				lines = append(lines, line)
+				line = ""
+			}
+			r := []rune(w)
+			lines = append(lines, string(r[:width]))
+			w = string(r[width:])
+		}
+		switch {
+		case line == "":
+			line = w
+		case len([]rune(line))+1+len([]rune(w)) <= width:
+			line += " " + w
+		default:
+			lines = append(lines, line)
+			line = w
+		}
+	}
+	if line != "" {
+		lines = append(lines, line)
+	}
+	if len(lines) > statusMaxLines {
+		last := []rune(lines[statusMaxLines-1])
+		if len(last) > width-3 {
+			last = last[:width-3]
+		}
+		lines = append(lines[:statusMaxLines-1], string(last)+"...")
+	}
+	return lines
 }

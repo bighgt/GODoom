@@ -12,16 +12,13 @@ package engine
 // separately by every single query that tic) without the complexity of
 // incrementally tracking which cell every moving mobj currently belongs to.
 //
-// One tic of staleness is accepted, same tradeoff blockGrid's own
-// forEachNear/forEachAlongSegment already make ("a superset, not an exact
-// query — callers do their own precise check"): a mobj that moves earlier
-// in this SAME tic's g.mobjs loop is still bucketed at its pre-tic
-// position for the rest of this tic's queries. Every caller still does its
-// own precise distance/overlap check against the mobj's real, current X/Y
-// on every candidate the grid hands back, so this can never produce a
-// false positive — only a rare false negative (a query misses a mobj that
-// moved out of the query's search box specifically because the grid hadn't
-// caught up yet), which resolves itself on the very next tic's rebuild.
+// A mobj that moves mid-tic is re-bucketed on the spot (relinkMobj, from
+// pTryMove and teleports — id's P_UnsetThingPosition/P_SetThingPosition),
+// so a query never misses a thing that moved into its search box earlier
+// in the same tic. That used to be accepted as a rare false negative, until
+// roaming (roam.go) had whole levels of monsters moving at once: two
+// converging on one doorway could step into each other's space, and two
+// overlapping solid monsters block each other in every direction for good.
 
 // rebuildMobjGrid re-buckets every live mobj (plus the player, who isn't
 // in g.mobjs) by blockGrid's own cell geometry, reusing g.mobjGridCells'
@@ -85,5 +82,32 @@ func (g *Game) forEachMobjNear(x, y, radius float64, fn func(*Mobj) bool) {
 				}
 			}
 		}
+	}
+}
+
+// relinkMobj moves mo's grid entry from the cell of (oldX, oldY) to the
+// cell of its current position, after mo moved mid-tic. A mobj spawned
+// since the last rebuild (so not in the grid yet) is simply added.
+func (g *Game) relinkMobj(mo *Mobj, oldX, oldY float64) {
+	bg := g.blockGrid
+	if bg == nil || g.mobjGridCells == nil {
+		return
+	}
+	from := bg.cellY(oldY)*bg.cols + bg.cellX(oldX)
+	to := bg.cellY(mo.Y)*bg.cols + bg.cellX(mo.X)
+	if from == to {
+		return
+	}
+	cell := g.mobjGridCells[from]
+	for i, m := range cell {
+		if m == mo {
+			cell[i] = cell[len(cell)-1]
+			g.mobjGridCells[from] = cell[:len(cell)-1]
+			break
+		}
+	}
+	g.mobjGridCells[to] = append(g.mobjGridCells[to], mo)
+	if mo.Radius > g.mobjGridMaxR {
+		g.mobjGridMaxR = mo.Radius
 	}
 }

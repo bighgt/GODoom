@@ -2,6 +2,7 @@ package vulkan
 
 import (
 	"fmt"
+	"slices"
 
 	vk "github.com/goki/vulkan"
 
@@ -75,22 +76,123 @@ func (r *Renderer) submitOneShot(fn func(cmd vk.CommandBuffer)) error {
 	return nil
 }
 
-// syncWorldTextures uploads any bitmap in g (wall/flat textures + the sky)
-// that isn't resident yet. Drains the device first, but only when there's
-// actually something new — so it's free once a level is warm.
-func (r *Renderer) syncWorldTextures(g *worldgeo.Geometry) error {
-	wr := r.wr
-	missing := func(t *assets.RGBA) bool { return t != nil && wr.texCache[t] == nil }
+// texResidency is the per-texture (and per-voxel-model) GPU state both the
+// FPS hardware path (worldResources) and the isometric path (isoResources)
+// keep — embedded in each, so wr.texCache / ir.texCache etc. read as plain
+// fields. hw and iso are mutually exclusive per Renderer instance, so each
+// owns its own copy rather than sharing one.
+type texResidency struct {
+	texSampler vk.Sampler // wall/flat/sprite textures: linear + mip + anisotropic, REPEAT
+	dummyTex   litImage   // 1x1 black — set-0 binding 1 for textures with no brightmap
 
-	pending := missing(g.Sky)
-	if !pending {
-		for _, t := range g.Textures {
-			if missing(t) {
-				pending = true
-				break
-			}
-		}
+	dsl0    vk.DescriptorSetLayout // set 0: per-texture (tex, brightmap)
+	texPool vk.DescriptorPool      // per-texture set0, grows over a session
+
+	texCache map[*assets.RGBA]*worldTex // keyed by the shared bitmap pointer
+	voxCache map[*assets.VoxelModel]*voxelMesh
+}
+
+// maxResidentTextures sizes texPool: many level loads' worth of unique
+// wall/flat/sprite names (the cache never evicts within a session).
+const maxResidentTextures = 1024
+
+// initTexResidency creates tr's sampler, black dummy brightmap, set-0
+// layout and descriptor pool, and its empty caches. what ("world" / "iso")
+// only labels error messages. Needs the command pool (the dummy upload is
+// a one-shot submit).
+func (r *Renderer) initTexResidency(tr *texResidency, what string) error {
+	tr.texCache = make(map[*assets.RGBA]*worldTex)
+	tr.voxCache = make(map[*assets.VoxelModel]*voxelMesh)
+
+	texInfo := vk.SamplerCreateInfo{
+		SType:        vk.StructureTypeSamplerCreateInfo,
+		MagFilter:    vk.FilterLinear,
+		MinFilter:    vk.FilterLinear,
+		MipmapMode:   vk.SamplerMipmapModeLinear,
+		AddressModeU: vk.SamplerAddressModeRepeat,
+		AddressModeV: vk.SamplerAddressModeRepeat,
+		AddressModeW: vk.SamplerAddressModeRepeat,
+		MinLod:       0,
+		MaxLod:       vk.LodClampNone,
 	}
+	if r.maxAnisotropy >= 2 {
+		texInfo.AnisotropyEnable = vk.True
+		texInfo.MaxAnisotropy = min(r.maxAnisotropy, 16)
+	}
+	var texSamp vk.Sampler
+	if res := vk.CreateSampler(r.device, &texInfo, nil, &texSamp); res != vk.Success {
+		return fmt.Errorf("vulkan: %s texture sampler: %s", what, vk.Error(res))
+	}
+	tr.texSampler = texSamp
+
+	// 1x1 black dummy — bound to set-0 binding 1 for any texture that has no
+	// brightmap, so the fragment shader can sample it unconditionally.
+	dummy, err := r.wMakeImage(1, 1, vk.FormatR8g8b8a8Unorm,
+		vk.ImageUsageFlags(vk.ImageUsageTransferDstBit)|vk.ImageUsageFlags(vk.ImageUsageSampledBit),
+		vk.ImageAspectFlags(vk.ImageAspectColorBit), 1)
+	if err != nil {
+		return err
+	}
+	tr.dummyTex = dummy
+	if err := r.uploadImagePixels(dummy.image, 1, 1, []byte{0, 0, 0, 255}, vk.ImageLayoutShaderReadOnlyOptimal); err != nil {
+		return err
+	}
+
+	if tr.dsl0, err = r.newDescriptorSetLayout(what+" texture", samplerBinding(0), samplerBinding(1)); err != nil {
+		return err
+	}
+
+	// Each set-0 has 2 combined-image-samplers (base + brightmap).
+	poolInfo := vk.DescriptorPoolCreateInfo{
+		SType:         vk.StructureTypeDescriptorPoolCreateInfo,
+		MaxSets:       maxResidentTextures,
+		PoolSizeCount: 1,
+		PPoolSizes:    []vk.DescriptorPoolSize{{Type: vk.DescriptorTypeCombinedImageSampler, DescriptorCount: 2 * maxResidentTextures}},
+	}
+	var pool vk.DescriptorPool
+	if res := vk.CreateDescriptorPool(r.device, &poolInfo, nil, &pool); res != vk.Success {
+		return fmt.Errorf("vulkan: %s texture descriptor pool: %s", what, vk.Error(res))
+	}
+	tr.texPool = pool
+	return nil
+}
+
+// destroy frees everything initTexResidency and the sync/upload methods
+// below created. Safe on a partially initialized tr.
+func (tr *texResidency) destroy(dev vk.Device) {
+	for _, vm := range tr.voxCache {
+		vm.free(dev)
+	}
+	tr.voxCache = nil
+	for _, wt := range tr.texCache {
+		freeLitImage(dev, wt.img)
+		freeLitImage(dev, wt.bright)
+		// wt.set is freed implicitly by destroying texPool below.
+	}
+	tr.texCache = nil
+	if tr.texPool != nil {
+		vk.DestroyDescriptorPool(dev, tr.texPool, nil)
+		tr.texPool = nil
+	}
+	if tr.dsl0 != nil {
+		vk.DestroyDescriptorSetLayout(dev, tr.dsl0, nil)
+		tr.dsl0 = nil
+	}
+	freeLitImage(dev, tr.dummyTex)
+	tr.dummyTex = litImage{}
+	if tr.texSampler != nil {
+		vk.DestroySampler(dev, tr.texSampler, nil)
+		tr.texSampler = nil
+	}
+}
+
+// syncTextures uploads any bitmap in g (wall/flat/sprite textures + the
+// sky) that isn't resident in tr yet. Drains the device first, but only
+// when there's actually something new — so it's free once a level is warm.
+func (r *Renderer) syncTextures(tr *texResidency, g *worldgeo.Geometry) error {
+	missing := func(t *assets.RGBA) bool { return t != nil && tr.texCache[t] == nil }
+
+	pending := missing(g.Sky) || slices.ContainsFunc(g.Textures, missing)
 	if !pending {
 		return nil
 	}
@@ -104,33 +206,30 @@ func (r *Renderer) syncWorldTextures(g *worldgeo.Geometry) error {
 		if i < len(g.Brightmaps) {
 			bright = g.Brightmaps[i]
 		}
-		if err := r.uploadWorldTexture(t, bright); err != nil {
+		if err := r.uploadTexture(tr, t, bright); err != nil {
 			return err
 		}
 	}
 	if missing(g.Sky) {
-		if err := r.uploadWorldTexture(g.Sky, nil); err != nil {
+		if err := r.uploadTexture(tr, g.Sky, nil); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// uploadWorldTexture makes t resident: a device-local RGBA8 image with a
+// uploadTexture makes t resident in tr: a device-local RGBA8 image with a
 // full mip chain and its set-0 descriptor, cached by the bitmap pointer.
-func (r *Renderer) uploadWorldTexture(t, bright *assets.RGBA) error {
-	wr := r.wr
-
+func (r *Renderer) uploadTexture(tr *texResidency, t, bright *assets.RGBA) error {
 	img, mips, err := r.makeResidentImage(t)
 	if err != nil {
 		return err
 	}
 
 	// The brightmap (if any) becomes its own resident image; its view feeds
-	// set-0 binding 1. No brightmap -> the shared black dummy, so world.frag
-	// can sample binding 1 unconditionally.
+	// set-0 binding 1. No brightmap -> the shared black dummy.
 	var bimg litImage
-	brightView := wr.dummyTex.view
+	brightView := tr.dummyTex.view
 	if bright != nil {
 		bimg, _, err = r.makeResidentImage(bright)
 		if err != nil {
@@ -140,13 +239,13 @@ func (r *Renderer) uploadWorldTexture(t, bright *assets.RGBA) error {
 		brightView = bimg.view
 	}
 
-	set, err := r.allocTexSet(img.view, brightView)
+	set, err := r.allocTexSet(tr, img.view, brightView)
 	if err != nil {
 		freeLitImage(r.device, img)
 		freeLitImage(r.device, bimg)
 		return err
 	}
-	wr.texCache[t] = &worldTex{img: img, bright: bimg, set: set, mips: mips}
+	tr.texCache[t] = &worldTex{img: img, bright: bimg, set: set, mips: mips}
 	return nil
 }
 
@@ -272,34 +371,16 @@ func (r *Renderer) uploadImagePixels(img vk.Image, w, h int, pix []byte, finalLa
 
 // allocTexSet allocates and writes one set-0 descriptor for a resident
 // texture: binding 0 = the base texture, binding 1 = its brightmap mask
-// (the shared black dummy view when it has none). Both use the shared
+// (the shared black dummy view when it has none). Both use tr's
 // anisotropic sampler.
-func (r *Renderer) allocTexSet(baseView, brightView vk.ImageView) (vk.DescriptorSet, error) {
-	wr := r.wr
-	info := vk.DescriptorSetAllocateInfo{
-		SType:              vk.StructureTypeDescriptorSetAllocateInfo,
-		DescriptorPool:     wr.texPool,
-		DescriptorSetCount: 1,
-		PSetLayouts:        []vk.DescriptorSetLayout{wr.dsl0},
-	}
-	var s vk.DescriptorSet
-	if res := vk.AllocateDescriptorSets(r.device, &info, &s); res != vk.Success {
-		return nil, fmt.Errorf("vulkan: world texture descriptor set (%d resident): %s", len(wr.texCache), vk.Error(res))
-	}
-	imgW := func(binding uint32, view vk.ImageView) vk.WriteDescriptorSet {
-		return vk.WriteDescriptorSet{
-			SType:           vk.StructureTypeWriteDescriptorSet,
-			DstSet:          s,
-			DstBinding:      binding,
-			DescriptorCount: 1,
-			DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
-			PImageInfo: []vk.DescriptorImageInfo{{
-				Sampler: wr.texSampler, ImageView: view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-			}},
-		}
+func (r *Renderer) allocTexSet(tr *texResidency, baseView, brightView vk.ImageView) (vk.DescriptorSet, error) {
+	s, err := r.allocDescriptorSet(tr.texPool, tr.dsl0, fmt.Sprintf("texture (%d resident)", len(tr.texCache)))
+	if err != nil {
+		return nil, err
 	}
 	vk.UpdateDescriptorSets(r.device, 2, []vk.WriteDescriptorSet{
-		imgW(0, baseView), imgW(1, brightView),
+		imageWrite(s, 0, tr.texSampler, baseView),
+		imageWrite(s, 1, tr.texSampler, brightView),
 	}, 0, nil)
 	return s, nil
 }

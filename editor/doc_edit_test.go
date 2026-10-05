@@ -384,7 +384,7 @@ func TestDeleteSectorCleansUpExtraFloors(t *testing.T) {
 }
 
 // TestSlopesRoundTrip checks that a tilted sector and a room-over-room
-// link survive encodeSlopes -> slopes.Parse -> applySlopePlane exactly —
+// link survive encodeSlopes -> slopes.Parse -> slopes.Def.Apply exactly —
 // the save/load symmetry the whole SLOPES feature depends on.
 func TestSlopesRoundTrip(t *testing.T) {
 	d := newTestDoc()
@@ -410,7 +410,7 @@ func TestSlopesRoundTrip(t *testing.T) {
 	if len(defs) != 1 {
 		t.Fatalf("got %d plane defs, want 1: %+v", len(defs), defs)
 	}
-	tiltX, tiltY, ok := planeTilt(defs[0].P1, defs[0].P2, defs[0].P3)
+	tiltX, tiltY, ok := slopes.PlaneTilt(defs[0].P1, defs[0].P2, defs[0].P3)
 	if !ok {
 		t.Fatal("re-parsed plane is degenerate")
 	}

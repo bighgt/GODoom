@@ -110,6 +110,20 @@ func (d *vldoor) tick(g *Game) bool {
 	case -1:
 		h := float64(s.CeilingHeight) - d.speed
 		floor := float64(s.FloorHeight)
+		// id's T_VerticalDoor closes with crush off: a door coming down on
+		// a live thing (the player, a monster, a barrel) doesn't grind it —
+		// a normal door goes back up, a plain "close" door just holds. With
+		// monsters roaming through doorways (roam.go) this is what stops
+		// every door from killing whoever is passing under it.
+		if g.doorPinsLiveThing(d.sec, math.Max(h, floor)) {
+			switch d.kind {
+			case dkClose, dkBlazeClose:
+			default:
+				d.dir = 1
+				g.playWorldSound(d.openSnd)
+			}
+			return false
+		}
 		if h <= floor {
 			s.CeilingHeight = int16(math.Round(floor))
 			if d.kind == dkCloseWaitOpen {
@@ -589,7 +603,9 @@ type scroller struct {
 func (s *scroller) sectorIndex() int { return -1 }
 
 func (s *scroller) tick(g *Game) bool {
-	g.Level.Sidedefs[s.side].XOffset += s.dx
+	sd := &g.Level.Sidedefs[s.side]
+	sd.XOffset += s.dx
+	g.markLive(int(sd.Sector)) // its offset is baked into the wall; draw it per frame
 	return false
 }
 
@@ -843,4 +859,35 @@ func (g *Game) findSectorsFromTag(tag uint16) []int {
 		}
 	}
 	return out
+}
+
+// doorPinsLiveThing reports whether lowering door sector sec's ceiling to
+// ceil would come down on a live shootable thing — the player, a monster,
+// a barrel — anywhere in the doorway (any corner of its footprint inside
+// the sector, not just its centre: a monster standing across the door line
+// counts). Corpses and items don't hold a door; a descending ceiling
+// flattens / shoves those as before (crushMobj).
+func (g *Game) doorPinsLiveThing(sec int, ceil float64) bool {
+	inSector := func(x, y, r float64) bool {
+		for _, p := range [5][2]float64{{x, y}, {x - r, y - r}, {x + r, y - r}, {x - r, y + r}, {x + r, y + r}} {
+			if bsp.PointSectorIndex(g.BSP, g.Level, float32(p[0]), float32(p[1])) == sec {
+				return true
+			}
+		}
+		return false
+	}
+	if p := g.playerMobj; p != nil && !g.playerDead && g.Player.Health > 0 {
+		if g.PlayerZ+playerHeight > ceil && inSector(g.Camera.X, g.Camera.Y, playerRadius) {
+			return true
+		}
+	}
+	for _, mo := range g.mobjs {
+		if mo.removed || mo.Health <= 0 || mo.Flags&MF_SHOOTABLE == 0 || mo.Flags&MF_SOLID == 0 {
+			continue
+		}
+		if mo.Z+mo.Height > ceil && inSector(mo.X, mo.Y, mo.Radius) {
+			return true
+		}
+	}
+	return false
 }

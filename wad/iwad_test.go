@@ -1,6 +1,8 @@
 package wad
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -89,3 +91,61 @@ func TestLoadWithIWADExplicitOverride(t *testing.T) {
 // repo's own wad/ package directory — go test's cwd for this package —
 // holds real IWADs (Doom2.wad) for other tests, so "nowhere on this
 // machine" isn't a hermetic condition to construct here.
+
+// writeTPF3DPWAD writes a minimal real-3D PWAD into dir whose manifest
+// records iwadPath/iwadSHA1 as its base IWAD.
+func writeTPF3DPWAD(t *testing.T, dir, iwadPath, iwadSHA1 string) string {
+	t.Helper()
+	p := filepath.Join(dir, "conv_3d.wad")
+	info := TPF3DInfo{Format: TPF3DFormat, Tool: "test", IWADPath: iwadPath, IWADSHA1: iwadSHA1}
+	if err := WritePWAD(p, []NamedLump{{Name: TPF3DLump, Data: EncodeTPF3D(info)}}); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// TestLoadWithIWADUsesRecordedIWAD: a real-3D WAD is merged over exactly
+// the IWAD its manifest records — not whatever the usual search finds
+// first. (The bug this guards: a converted Doom II WAD saved in wad/ got
+// merged over shareware DOOM1.WAD from testdata/, losing its music.)
+func TestLoadWithIWADUsesRecordedIWAD(t *testing.T) {
+	shareware, err := filepath.Abs("../testdata/DOOM1.WAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(shareware)
+	if err != nil {
+		t.Skip("DOOM1.WAD not available")
+	}
+	sum := sha1.Sum(data)
+	sha := hex.EncodeToString(sum[:])
+
+	// Recorded path still valid: used even though the WAD has no maps to
+	// hint a format, and config's "iwad" names something else.
+	pw := writeTPF3DPWAD(t, t.TempDir(), shareware, sha)
+	res, err := LoadWithIWAD(pw, "/definitely/not/an/iwad.wad")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IWADPath != shareware {
+		t.Errorf("merged over %q, want the recorded %q", res.IWADPath, shareware)
+	}
+	if _, ok := res.WAD.Find("E1M1"); !ok {
+		t.Error("merged WAD lacks the recorded IWAD's maps")
+	}
+
+	// Recorded path gone (files moved): found by name next to the WAD.
+	dir := t.TempDir()
+	moved := filepath.Join(dir, "DOOM1.WAD")
+	if err := os.WriteFile(moved, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pw = writeTPF3DPWAD(t, dir, "/gone/elsewhere/DOOM1.WAD", sha)
+	res, err = LoadWithIWAD(pw, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IWADPath != moved {
+		t.Errorf("merged over %q, want the same-named copy %q", res.IWADPath, moved)
+	}
+}

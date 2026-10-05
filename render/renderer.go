@@ -31,10 +31,15 @@ type Renderer interface {
 // map units. Colour components are 0..1 (linear); Intensity scales the
 // whole contribution; Radius is the distance at which it falls to zero
 // (smooth (1 - d/Radius)^2 attenuation, no light beyond it).
+//
+// Reach, when set, is a bitset over the level's sector indices (bit s of
+// word s/32) of the sectors this light may light — the ones it can reach
+// through open two-sided lines within its radius — so a light doesn't
+// shine through walls or a closed door. nil lights everything in range.
 type Light struct {
 	X, Y, Z   float32
 	Radius    float32
 	R, G, B   float32
 	Intensity float32
+	Reach     []uint32
 }
-

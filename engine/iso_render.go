@@ -14,34 +14,13 @@ import (
 // would pick, regardless of the thing's own position.
 const isoViewerDist = 1 << 20
 
-// SyncIsoWorldGeometry rebuilds Game.WorldBuilder's static geometry (walls/
-// flats) if anything that would invalidate it changed since the last call
-// — a sector height moved (a door/lift/floor mover), one is mid-glide this
-// frame, or an animated flat/wall texture stepped a frame — mirroring
-// HardwareMode's own per-frame rebuild-on-change check in renderFrame (see
-// game.go's geomChanged/animChanged/restoreSecH). An isometric front end
-// (cmd/isoengine) calls this once per frame in renderFrame's place, since
-// it doesn't go through renderFrame (a CPU-rasterize-then-present method)
-// at all. Call WorldBuilder.Build, then this frame's world objects/sprites,
-// then the returned restore func — the same order renderFrame's own
-// geomChanged/restoreSecH pair requires, so authoritative (non-interpolated)
-// sector heights are back before anything else reads them.
-func (g *Game) SyncIsoWorldGeometry() (restore func()) {
-	geomChanged := g.worldGeomChanged()
-	animChanged := g.animFrameChanged()
-	restoreSecH := g.applySectorInterp()
-	// See renderFrame's identical gating (game.go) and
-	// renderedSectorHeightsChanged's own doc comment (interp.go): a mover
-	// mid-glide reinterpolates every render frame, but most of those round
-	// to the same int16 height as the one before, so sectorInterpActive
-	// alone would force a needless full-level Invalidate + blocking GPU
-	// re-upload far more often than the geometry actually looks different.
-	heightsChanged := g.renderedSectorHeightsChanged()
-	if geomChanged || animChanged || (g.sectorInterpActive && heightsChanged) {
-		g.WorldBuilder.Invalidate()
-	}
-	return restoreSecH
-}
+// SyncIsoWorldGeometry is the isometric front end's (cmd/isoengine) per-
+// frame static-mesh sync — the same syncWorldGeometry buildWorldFrame runs
+// for the first-person view. Call WorldBuilder.Build, then this frame's
+// world objects/sprites, then the returned restore func, so authoritative
+// (non-interpolated) sector heights are back before anything else reads
+// them.
+func (g *Game) SyncIsoWorldGeometry() (restore func()) { return g.syncWorldGeometry() }
 
 // AimTarget is one live, shootable mobj's world position — see
 // Game.AimTargetPositions.
@@ -81,7 +60,7 @@ func (g *Game) CollectIsoWorldObjects(camAzimuth float64) ([]worldgeo.Sprite, []
 	sprites := g.hwSprites[:0]
 	voxels := g.hwVoxels[:0]
 	frac := g.renderLerp()
-	vscale := g.VoxelScale
+	vscale := g.ModelScale
 	if vscale <= 0 {
 		vscale = 1
 	}
@@ -96,26 +75,8 @@ func (g *Game) CollectIsoWorldObjects(camAzimuth float64) ([]worldgeo.Sprite, []
 		}
 		name := mobjSpriteName(mo)
 		ix, iy, iz, iang := mo.renderState(frac)
-		if g.Voxels != nil {
-			if model, angOff, mscale, ok := g.Voxels.Model(name, mo.Frame); ok && model != nil {
-				if mscale <= 0 {
-					mscale = 1
-				}
-				voxels = append(voxels, worldgeo.VoxelInstance{
-					Model: model,
-					X:     float32(ix), Y: float32(iy), Z: float32(iz),
-					Yaw:        float32(iang + angOff*math.Pi/180 + voxelKVXFrontBias),
-					Scale:      float32(vscale * mscale),
-					Light:      float32(g.spriteSectorLight(ix, iy)) / 255,
-					FullBright: mo.Fullbright,
-				})
-				if g.heretic {
-					if f, ok := g.hereticFlameFor(name, model, ix, iy, iz, vscale*mscale, g.renderClock); ok {
-						voxels = append(voxels, f)
-					}
-				}
-				continue // the voxel model replaces the billboard
-			}
+		if g.appendMobjVoxel(mo, name, ix, iy, iz, iang, vscale, &voxels, false) {
+			continue // a voxel model, or a voxel-only map object with none — never a billboard
 		}
 		sp, flip, lift, ok := g.Raster.ThingSprite(viewCam, ix, iy, iang, name, mo.Frame)
 		if !ok {

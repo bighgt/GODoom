@@ -33,6 +33,7 @@ func (s *switchBack) sectorIndex() int { return -1 }
 func (s *switchBack) tick(g *Game) bool {
 	if s.count--; s.count <= 0 {
 		*s.tex = s.orig
+		g.geomDirty = true // baked into the static mesh
 		g.playWorldSound("DSSWTCHN")
 		return true
 	}
@@ -55,6 +56,7 @@ func (g *Game) changeSwitchTexture(lineIdx int, useAgain bool) {
 		}
 		orig := *tex
 		*tex = flipped
+		g.geomDirty = true // baked into the static mesh
 		g.playWorldSound("DSSWTCHN")
 		if useAgain {
 			g.thinkers = append(g.thinkers, &switchBack{tex: tex, orig: orig, count: switchBackTics})

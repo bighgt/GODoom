@@ -1,7 +1,10 @@
 package wad
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,13 +59,59 @@ func LoadWithIWAD(path, explicitIWAD string) (LoadResult, error) {
 	if picked.Header.Magic != "PWAD" && hasLump(picked, "PLAYPAL") {
 		return res, nil // self-contained — an IWAD, or a WAD carrying its own palette
 	}
-	iwad, iwadPath, err := resolveIWAD(path, picked, explicitIWAD)
-	if err != nil {
-		return LoadResult{}, err
+	// A real-3D WAD knows exactly which IWAD it was built against — that
+	// wins even over config's "iwad", since the wrong game's IWAD (say
+	// shareware Doom under a converted Doom II) loads but silently loses
+	// the music, monsters and everything else the WAD itself doesn't carry.
+	iwad, iwadPath, ok := recordedIWAD(path, picked)
+	if !ok {
+		iwad, iwadPath, err = resolveIWAD(path, picked, explicitIWAD)
+		if err != nil {
+			return LoadResult{}, err
+		}
 	}
 	res.WAD = Merge(iwad, picked)
 	res.IWADPath = iwadPath
 	return res, nil
+}
+
+// recordedIWAD resolves the base IWAD a cmd/wad3d real-3D WAD records in
+// its TPF3D manifest (TPF3DInfo.IWADPath): that exact file if it's still
+// there, else a file of the same name in the usual IWAD search
+// directories. A SHA-1 mismatch (a different release of the same IWAD) is
+// logged but accepted. ok is false when the WAD records none or it can't
+// be found — the caller then falls back to the normal search.
+func recordedIWAD(pickedPath string, picked *WAD) (*WAD, string, bool) {
+	info, ok := picked.TPF3D()
+	if !ok || info.IWADPath == "" {
+		return nil, "", false
+	}
+	try := func(p string) (*WAD, bool) {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil, false
+		}
+		iw, err := Parse(data)
+		if err != nil || iw.Header.Magic != "IWAD" || !hasLump(iw, "PLAYPAL") {
+			return nil, false
+		}
+		if sum := sha1.Sum(data); info.IWADSHA1 != "" && hex.EncodeToString(sum[:]) != info.IWADSHA1 {
+			log.Printf("wad: %s differs from the IWAD %s was converted against — using it anyway", p, filepath.Base(pickedPath))
+		}
+		return iw, true
+	}
+	if iw, ok := try(info.IWADPath); ok {
+		return iw, info.IWADPath, true
+	}
+	name := filepath.Base(filepath.FromSlash(info.IWADPath))
+	for _, d := range iwadSearchDirs(pickedPath) {
+		p := filepath.Join(d, name)
+		if iw, ok := try(p); ok {
+			return iw, p, true
+		}
+	}
+	log.Printf("wad: %s was converted against %s, which wasn't found — searching for an IWAD as usual", filepath.Base(pickedPath), info.IWADPath)
+	return nil, "", false
 }
 
 // resolveIWAD finds the base IWAD a patch WAD needs. An explicit path (from
@@ -130,7 +179,8 @@ func resolveIWAD(pickedPath string, picked *WAD, explicit string) (*WAD, string,
 // iwadSearchDirs is the ordered list of directories an IWAD might live in,
 // relative to the WAD at pickedPath: the WAD's own directory and up to five
 // parents of it, the working directory, and the executable's directory —
-// each also probed with wad/ wads/ IWADs/ iwads/ testdata/ subdirs.
+// each also probed with wad/ wads/ IWADs/ iwads/ "Game WADs"/ wad/"Game
+// WADs"/ testdata/ subdirs.
 func iwadSearchDirs(pickedPath string) []string {
 	var dirs []string
 	seen := map[string]bool{}
@@ -138,7 +188,7 @@ func iwadSearchDirs(pickedPath string) []string {
 		if d == "" {
 			return
 		}
-		for _, sub := range []string{"", "wad", "wads", "IWADs", "iwads", "testdata"} {
+		for _, sub := range []string{"", "wad", "wads", "IWADs", "iwads", "Game WADs", filepath.Join("wad", "Game WADs"), "testdata"} {
 			p := filepath.Join(d, sub)
 			if !seen[p] {
 				seen[p] = true
@@ -190,6 +240,36 @@ func OtherGameIWAD(playedPath string, played *WAD) (iwad *WAD, path string, ok b
 			if abs, _ := filepath.Abs(p); abs != "" && abs == playedAbs {
 				continue // that's the file we're already playing
 			}
+			iw, err := Load(p)
+			if err != nil || iw.Header.Magic != "IWAD" || !hasLump(iw, "PLAYPAL") {
+				continue
+			}
+			return iw, p, true
+		}
+	}
+	return nil, "", false
+}
+
+// FindGameIWAD finds a specific game's IWAD near the WAD at nearPath (the
+// same directories LoadWithIWAD / OtherGameIWAD search): game "doom2" is
+// the Doom II family (DOOM2, TNT, PLUTONIA, Freedoom 2 — each carries
+// every Doom weapon including the Super Shotgun), "doom" the Doom 1 family,
+// "heretic" Heretic. ok is false when none is found.
+func FindGameIWAD(nearPath, game string) (iwad *WAD, path string, ok bool) {
+	var names []string
+	switch game {
+	case "doom2":
+		names = iwadNames["doom2"]
+	case "doom":
+		names = iwadNames["doom1"]
+	case "heretic":
+		names = hereticIWADNames
+	default:
+		return nil, "", false
+	}
+	for _, name := range names {
+		for _, d := range iwadSearchDirs(nearPath) {
+			p := filepath.Join(d, name)
 			iw, err := Load(p)
 			if err != nil || iw.Header.Magic != "IWAD" || !hasLump(iw, "PLAYPAL") {
 				continue

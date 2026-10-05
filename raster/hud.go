@@ -11,10 +11,9 @@ import (
 
 // hudFace is a small, fixed bitmap font (7x13 pixels/glyph) from the Go
 // standard extended library — no font file to ship, no license to track.
-// Its glyphs are drawn sharp/unantialiased into the 320x200 overlay buffer;
-// CompositeOverlay then scales that up onto the frame with nearest
-// sampling, so the debug text stays crisp and chunky at any render
-// resolution (matching the 3D view's deliberate pixel look).
+// Its glyphs are drawn sharp/unantialiased into the overlay buffer at a
+// small whole-number scale (debugTextScale), so the debug text stays crisp
+// at any render resolution (matching the 3D view's deliberate pixel look).
 var hudFace = basicfont.Face7x13
 
 // DrawHUD renders each of lines into the top-left corner of the overlay
@@ -22,28 +21,36 @@ var hudFace = basicfont.Face7x13
 // caller to omit a line some frames without renumbering the rest). Call
 // after Render so the text draws on top of the 3D view.
 func (r *Renderer) DrawHUD(lines []string) {
-	const marginX, marginY = 4, 4
-	lineHeight := hudFace.Metrics().Height.Ceil() + 2
-	ascent := hudFace.Metrics().Ascent.Ceil()
+	k := r.debugTextScale()
+	marginX, marginY := 4*k, 4*k
+	lineHeight := (hudFace.Metrics().Height.Ceil() + 1) * k
 
 	row := 0
 	for _, line := range lines {
 		if line == "" {
 			continue
 		}
-		r.drawHUDLine(line, marginX, marginY+row*lineHeight+ascent)
+		r.drawHUDLine(line, marginX, marginY+row*lineHeight, k)
 		row++
 	}
 }
 
+// debugTextScale is the whole-number pixel scale the debug text is drawn
+// at: 1 below 1080 rows, then one more step per 540 rows (2 at 1080p and
+// 1440p, 4 at 2160p). The text used to ride the status bar's 320x200 fit
+// (~5x at 1080p), which made the overlay's many rows huge; its own small
+// integer scale keeps it compact and the bitmap font crisp.
+func (r *Renderer) debugTextScale() int {
+	return max(1, r.Height/540)
+}
+
 // drawHUDLine rasterizes one line of text into a just-large-enough
 // temporary image (via golang.org/x/image/font's glyph-by-glyph drawer)
-// then nearest-scales its opaque pixels into the overlay buffer. It maps
-// (logicalX, logicalBaselineY) from the HUD's 320x200 space to render
-// pixels at r.hudScale (so the debug overlay halves above 720p with the
-// rest of the HUD) but anchors to the framebuffer's own top-left corner,
-// not the bottom-anchored / centered plane the status bar and weapon use.
-func (r *Renderer) drawHUDLine(line string, logicalX, logicalBaselineY int) {
+// then scales its opaque pixels by the integer k into the overlay buffer,
+// with the line's top-left at render pixel (x, y) — anchored to the
+// framebuffer's own top-left corner, not the bottom-anchored / centered
+// plane the status bar and weapon use.
+func (r *Renderer) drawHUDLine(line string, x, y, k int) {
 	width := font.MeasureString(hudFace, line).Ceil()
 	height := hudFace.Metrics().Height.Ceil()
 	if width <= 0 || height <= 0 {
@@ -60,14 +67,8 @@ func (r *Renderer) drawHUDLine(line string, logicalX, logicalBaselineY int) {
 	}
 	d.DrawString(line)
 
-	s := r.hudScale
-	dx0 := int(float64(logicalX)*s + 0.5)
-	dy0 := int(float64(logicalBaselineY-ascent)*s + 0.5)
-	dw := int(float64(width)*s + 0.5)
-	dh := int(float64(height)*s + 0.5)
-	if dw < 1 || dh < 1 {
-		return
-	}
+	dx0, dy0 := x, y
+	dw, dh := width*k, height*k
 	r.markOverlay(dy0, dy0+dh)
 	for dy := 0; dy < dh; dy++ {
 		py := dy0 + dy

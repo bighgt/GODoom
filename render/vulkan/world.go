@@ -11,6 +11,7 @@ import (
 	vk "github.com/goki/vulkan"
 
 	"twopointfive/assets"
+	"twopointfive/assets/models"
 	"twopointfive/raster"
 	"twopointfive/render"
 	"twopointfive/render/worldgeo"
@@ -75,6 +76,12 @@ var testLightEnabled = os.Getenv("TPF_TESTLIGHT") != ""
 // worldMaxLights is the dynamic point-light cap the World UBO carries —
 // keep == render.MaxLights and MAX_LIGHTS in world.frag.
 const worldMaxLights = 64
+
+// lightReachStride is how many uint32 words of sector-reach bitset each
+// light slot has in worldSlot.reach: 8192 sectors' worth. A sector past
+// that is always lit (the shaders skip the test). Keep == REACH_STRIDE in
+// world.frag / voxel.frag / waterrefract.frag.
+const lightReachStride = 256
 
 // shadowCasterMax is the ground-shadow caster cap the World UBO carries —
 // keep == SHADOW_MAX in world.frag and hwGroundShadowCap in engine.
@@ -172,6 +179,14 @@ type worldSlot struct {
 	uboMem    vk.DeviceMemory
 	uboMapped unsafe.Pointer
 
+	// reach is the per-light sector-reach bitsets (render.Light.Reach),
+	// lightReachStride words per light slot — set 1 binding 3, a storage
+	// buffer the light loops in world.frag / voxel.frag / waterrefract.frag
+	// test before lighting a surface.
+	reach       vk.Buffer
+	reachMem    vk.DeviceMemory
+	reachMapped unsafe.Pointer
+
 	vbuf       vk.Buffer
 	vbufMem    vk.DeviceMemory
 	vbufMapped unsafe.Pointer
@@ -251,14 +266,13 @@ type worldResources struct {
 	rpWater  vk.RenderPass // water (real refraction) + sprites/voxels/particles — only built when waterRefraction
 	rpShadow vk.RenderPass // depth-only cube shadow-map face pass — only built when realShadows
 
-	texSampler   vk.Sampler // wall/flat: linear + mip + anisotropic, REPEAT
+	texResidency // texSampler, dummyTex, dsl0, texPool, texCache, voxCache (worldtex.go)
+
 	clampSampler vk.Sampler // LUT / scene / overlay: linear, clamp-to-edge
 	depthSampler vk.Sampler // world-pass depth for the blit's water SSR, and shadow cube sampling: nearest, clamp
 
-	dummyTex        litImage         // 1x1 black — set-0 binding 1 for textures with no brightmap
 	dummyShadowCube shadowCubeTarget // always-built 1x1 cube — set-1 bindings 0/1 fallback when unused
 
-	dsl0            vk.DescriptorSetLayout // set 0: per-texture sampler2D
 	dsl1            vk.DescriptorSetLayout // set 1: uShadowCube0/1, World UBO
 	dslBlit         vk.DescriptorSetLayout // present: uScene, uOverlay
 	dslWaterCapture vk.DescriptorSetLayout // waterrefract.frag set 2: uPreWaterColor, uPreWaterDepth — only when waterRefraction
@@ -276,18 +290,27 @@ type worldResources struct {
 	pipeBlit          vk.Pipeline
 
 	framePool vk.DescriptorPool // set1 + setBlit, one pair per slot
-	texPool   vk.DescriptorPool // per-texture set0, grows over a session
 
 	// Voxel models: a dedicated pipeline (vertex colour, no texture) reusing
 	// set 1 (LUT + World UBO), and one static device-local mesh per KVX model.
-	plVoxel   vk.PipelineLayout
-	pipeVoxel vk.Pipeline
-	voxCache  map[*assets.VoxelModel]*voxelMesh
-	voxDbg    int // 0 until recordVoxels has logged its one-shot "drew N models" line
+	plVoxel        vk.PipelineLayout
+	pipeVoxel      vk.Pipeline
+	pipeVoxelDepth vk.Pipeline // translucent-glass depth prepass (no colour writes) — see worldCreateVoxelPipeline
+	pipeVoxelGlass vk.Pipeline // translucent-glass blended pass
+	glassScratch   []int       // reused recordVoxels glass-instance list
+	voxDbg         int         // 0 until recordVoxels has logged its one-shot "drew N models" line
+
+	// Textured 3D models (worldmodel.go): pipeline, per-frame-mesh vertex
+	// buffers (keyed by the models.FrameMesh), one-shot debug-log flag.
+	plModel           vk.PipelineLayout
+	pipeModel         vk.Pipeline
+	pipeModelAdd      vk.Pipeline // additive variant (ModelInstance.Additive) — see worldCreateModelPipeline
+	pipeModelGlass    vk.Pipeline // translucent-glass variant (ModelInstance.Alpha)
+	modelOrderScratch []int       // reused recordModels draw order
+	modelCache        map[*models.FrameMesh]*voxelMesh
+	modelDbg          int
 
 	slots [maxFramesInFlight]worldSlot
-
-	texCache map[*assets.RGBA]*worldTex // keyed by the shared bitmap pointer
 
 	bloom   worldBloom   // HDR bright-pass + blur (worldbloom.go)
 	ambient worldAmbient // quarter-res shadow/AO/god-ray term (worldambient.go)
@@ -297,14 +320,10 @@ type worldResources struct {
 	// buffer, re-uploaded only when the builder bumps StaticVersion (a door
 	// / lift moved). The per-frame path only streams the small dynamic
 	// (sprite / voxel-billboard) list into slots[*].vbuf.
-	staticVBO     vk.Buffer
-	staticVBOMem  vk.DeviceMemory
-	staticVBOCap  int
-	staticVersion uint32
+	staticGeom
 
-	packBuf       []byte         // reused dynamic Geometry.Pack scratch
-	staticPackBuf []byte         // reused static-geometry pack scratch
-	lightCullBuf  []render.Light // reused cullLightsToView scratch
+	packBuf      []byte         // reused dynamic Geometry.Pack scratch
+	lightCullBuf []render.Light // reused cullLightsToView scratch
 
 	dbgLightLog int // rate-limits the one-off dynamic-light diagnostic
 
@@ -347,8 +366,7 @@ func NewWorld(win *window.Window, srcW, srcH int, vsync, debug, waterRefraction,
 		w: srcW, h: srcH,
 		waterRefraction: waterRefraction,
 		realShadows:     realShadows,
-		texCache:        make(map[*assets.RGBA]*worldTex),
-		voxCache:        make(map[*assets.VoxelModel]*voxelMesh),
+		modelCache:      make(map[*models.FrameMesh]*voxelMesh),
 		lightScaleRef:   float32(raster.LightScaleRef),
 	}
 
@@ -370,7 +388,7 @@ func NewWorld(win *window.Window, srcW, srcH int, vsync, debug, waterRefraction,
 		r.worldCreateShadowRenderPass, // no-op when !realShadows
 		r.worldCreateOffscreen,
 		r.worldCreateBloom, // before descriptors — setBlit samples bloom mip 0
-		r.worldCreateDummyTex,
+		func() error { return r.initTexResidency(&r.wr.texResidency, "world") },
 		r.worldCreateShadowTargets, // dummy cube always; per-slot real cubes when realShadows — before descriptors (their views get bound)
 		r.worldCreateBuffers,
 		r.worldCreateAmbientPass, // needs sl.depth/sl.scene (offscreen) + sl.ubo (buffers); before worldCreateResolvePass (samples wr.ambient.imgBlur)
@@ -380,6 +398,7 @@ func NewWorld(win *window.Window, srcW, srcH int, vsync, debug, waterRefraction,
 		r.worldCreatePipelines,
 		r.worldCreateShadowPipeline, // no-op when !realShadows
 		r.worldCreateVoxelPipeline,
+		r.worldCreateModelPipeline,
 	}
 	for _, step := range steps {
 		if err := step(); err != nil {
@@ -418,16 +437,17 @@ func (r *Renderer) DrawWorld(g *worldgeo.Geometry, cam worldgeo.Camera, w, h int
 
 	// New wall/flat/sky bitmaps this level — one-time GPU upload + mipmaps.
 	// Blocks (drains the device) only when there's actually something new.
-	if err := r.syncWorldTextures(g); err != nil {
+	if err := r.syncTextures(&r.wr.texResidency, g); err != nil {
 		return err
 	}
-	if err := r.syncVoxelMeshes(g); err != nil {
+	if err := r.syncVoxelMeshes(&r.wr.texResidency, g); err != nil {
 		return err
 	}
-	if g.StaticVersion != r.wr.staticVersion {
-		if err := r.uploadStaticWorld(g); err != nil {
-			return err
-		}
+	if err := r.syncModels(g); err != nil {
+		return err
+	}
+	if err := r.uploadStatic(&r.wr.staticGeom, g); err != nil {
+		return err
 	}
 
 	// Drop lights that can't possibly light anything on screen before they
@@ -507,57 +527,60 @@ func (r *Renderer) DrawWorld(g *worldgeo.Geometry, cam worldgeo.Camera, w, h int
 	return nil
 }
 
-// uploadStaticWorld packs g.StaticTris and copies it into the device-local
-// static vertex buffer (grown / created as needed). Runs only when the
-// builder bumps StaticVersion — at level load and after a door/lift moves —
-// so the blocking one-shot copy is off the per-frame path.
-func (r *Renderer) uploadStaticWorld(g *worldgeo.Geometry) error {
-	wr := r.wr
-	wr.staticPackBuf = worldgeo.PackVerts(g.StaticTris, wr.staticPackBuf)
-	n := len(wr.staticPackBuf)
+// staticGeom is the static level geometry (all walls + flats) both the hw
+// and iso paths keep in one device-local vertex buffer, re-uploaded only
+// when the builder bumps StaticVersion (a door / lift moved). Embedded in
+// worldResources / isoResources. The per-frame path only streams the small
+// dynamic (sprite / voxel-billboard) list separately.
+type staticGeom struct {
+	staticVBO     vk.Buffer
+	staticVBOMem  vk.DeviceMemory
+	staticVBOCap  int
+	staticVersion uint32
+	staticPackBuf []byte // reused static-geometry pack scratch
+}
+
+// uploadStatic packs g.StaticTris and copies it into sg's device-local
+// vertex buffer (grown / created as needed) when g.StaticVersion moved on
+// since the last upload — at level load and after a door/lift moves — so
+// the blocking one-shot copy is off the per-frame path.
+func (r *Renderer) uploadStatic(sg *staticGeom, g *worldgeo.Geometry) error {
+	if g.StaticVersion == sg.staticVersion && sg.staticVBO != nil {
+		return nil
+	}
+	sg.staticPackBuf = worldgeo.PackVerts(g.StaticTris, sg.staticPackBuf)
+	n := len(sg.staticPackBuf)
 	if n == 0 {
-		wr.staticVersion = g.StaticVersion
+		sg.staticVersion = g.StaticVersion
 		return nil
 	}
 
-	if n > wr.staticVBOCap {
-		grown := wr.staticVBOCap
-		if grown == 0 {
-			grown = 1 << 16
-		}
+	if n > sg.staticVBOCap {
+		grown := max(sg.staticVBOCap, 1<<16)
 		for grown < n {
 			grown *= 2
 		}
 		vk.DeviceWaitIdle(r.device) // no frame may still reference the old buffer
-		if wr.staticVBO != nil {
-			vk.DestroyBuffer(r.device, wr.staticVBO, nil)
-			vk.FreeMemory(r.device, wr.staticVBOMem, nil)
-		}
+		sg.destroy(r.device)
 		b, m, err := r.deviceLocalVertexBuffer(grown)
 		if err != nil {
-			wr.staticVBO, wr.staticVBOMem, wr.staticVBOCap = nil, nil, 0
 			return err
 		}
-		wr.staticVBO, wr.staticVBOMem, wr.staticVBOCap = b, m, grown
+		sg.staticVBO, sg.staticVBOMem, sg.staticVBOCap = b, m, grown
 	}
-
-	stage, stageMem, mapped, err := r.wHostBuffer(n, vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit))
-	if err != nil {
+	if err := r.copyToDeviceBuffer(sg.staticVBO, sg.staticPackBuf); err != nil {
 		return err
 	}
-	vk.Memcopy(mapped, wr.staticPackBuf)
-	defer func() {
-		vk.UnmapMemory(r.device, stageMem)
-		vk.DestroyBuffer(r.device, stage, nil)
-		vk.FreeMemory(r.device, stageMem, nil)
-	}()
-	if err := r.submitOneShot(func(cmd vk.CommandBuffer) {
-		vk.CmdCopyBuffer(cmd, stage, wr.staticVBO, 1, []vk.BufferCopy{{Size: vk.DeviceSize(n)}})
-	}); err != nil {
-		return err
-	}
-	wr.staticVersion = g.StaticVersion
+	sg.staticVersion = g.StaticVersion
 	return nil
+}
+
+func (sg *staticGeom) destroy(dev vk.Device) {
+	if sg.staticVBO != nil {
+		vk.DestroyBuffer(dev, sg.staticVBO, nil)
+		vk.FreeMemory(dev, sg.staticVBOMem, nil)
+	}
+	sg.staticVBO, sg.staticVBOMem, sg.staticVBOCap = nil, nil, 0
 }
 
 // hemisphereAmbient returns the faint fill world.frag settles a fully
@@ -600,7 +623,7 @@ func (r *Renderer) hemisphereAmbient(sky *assets.RGBA) (rr, gg, bb, strength flo
 }
 
 // cullLightsToView drops lights whose reach can't overlap anything on
-// screen from cam (worldgeo.LightVisible — the same cone test
+// screen from cam (worldgeo.ViewCone — the same cone test
 // UpdateVisibility uses for geometry cells), compacting the survivors into
 // a reused buffer so this costs no allocation on a warm frame. Order is
 // preserved: shadowBudget's "the leading survivors get a real shadow map"
@@ -610,8 +633,9 @@ func (r *Renderer) hemisphereAmbient(sky *assets.RGBA) (rr, gg, bb, strength flo
 func (r *Renderer) cullLightsToView(cam worldgeo.Camera, lights []render.Light) []render.Light {
 	wr := r.wr
 	out := wr.lightCullBuf[:0]
+	cone := worldgeo.NewViewCone(cam)
 	for _, l := range lights {
-		if worldgeo.LightVisible(cam, float64(l.X), float64(l.Y), float64(l.Radius)) {
+		if cone.Visible(float64(l.X), float64(l.Y), float64(l.Radius)) {
 			out = append(out, l)
 		}
 	}
@@ -729,6 +753,14 @@ func (r *Renderer) uploadWorldFrame(sl *worldSlot, g *worldgeo.Geometry, cam wor
 		ubo[o], ubo[o+1], ubo[o+2], ubo[o+3] = l.X, l.Y, l.Z, 1.0/(rad*rad)
 		c := colBase + i*4
 		ubo[c], ubo[c+1], ubo[c+2], ubo[c+3] = l.R*l.Intensity, l.G*l.Intensity, l.B*l.Intensity, 0
+		if len(l.Reach) > 0 {
+			// lightColor.w = 1 flags "test reach"; the words go to this
+			// light's slot in the reach buffer (only the level's own
+			// sectors' words — stale words past them are never indexed).
+			ubo[c+3] = 1
+			dst := unsafe.Slice((*uint32)(unsafe.Add(sl.reachMapped, i*lightReachStride*4)), lightReachStride)
+			copy(dst, l.Reach)
+		}
 	}
 	// Diagnostic: TPF_TESTLIGHT forces one bright magenta light at the
 	// camera. If the world near you turns magenta, the shader / UBO / light
@@ -860,7 +892,6 @@ func drawTextureRuns(cmd vk.CommandBuffer, plWorld vk.PipelineLayout, texCache m
 	}
 	vk.CmdBindVertexBuffers(cmd, 0, 1, []vk.Buffer{buf}, []vk.DeviceSize{0})
 	var lastTex *assets.RGBA
-	var lastWT *worldTex
 	haveLast := false
 	for i, d := range runs {
 		if d.Count == 0 {
@@ -873,14 +904,13 @@ func drawTextureRuns(cmd vk.CommandBuffer, plWorld vk.PipelineLayout, texCache m
 		if tex == nil { // sky run
 			tex = sky
 		}
-		wt := lastWT
 		if !haveLast || tex != lastTex {
-			wt = texCache[tex]
+			wt := texCache[tex]
 			if wt == nil {
 				continue // texture unresolved / not uploaded — skip the run
 			}
 			vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, plWorld, 0, 1, []vk.DescriptorSet{wt.set}, 0, nil)
-			lastTex, lastWT, haveLast = tex, wt, true
+			lastTex, haveLast = tex, true
 		}
 		vk.CmdDraw(cmd, uint32(d.Count), 1, uint32(d.First), 0)
 	}
@@ -1079,6 +1109,7 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 		drawTextureRuns(cmd, wr.plWorld, wr.texCache, g.Sky, buf, runs, visible)
 	}
 	drawRuns(wr.staticVBO, g.StaticDraws, g.StaticDrawVisible) // level walls + flats (device-local), visibility-culled
+	drawRuns(sl.vbuf, g.LiveDraws, nil)                        // live sectors: moving doors / lifts, flickering lights, scrollers
 
 	if !wr.waterRefraction {
 		// Fallback: water draws right here with the plain pipeline, same as
@@ -1131,6 +1162,7 @@ func (r *Renderer) recordWorldCommandBuffer(cmd vk.CommandBuffer, imageIndex uin
 	// painted every voxel monster back over the smoke/fire meant to be
 	// hiding it, regardless of how opaque the smoke actually was.
 	r.recordVoxels(cmd, sl, g, cam)
+	r.recordModels(cmd, sl, g, cam) // same layer as voxels; the rebinds below restore what both overwrite
 	// recordVoxels binds sl.set1 at set 0 under plVoxel's layout, which
 	// isn't compatible with plWorld's own completely different set-0 schema
 	// (a per-texture sampler, not the world UBO) — per Vulkan's pipeline
@@ -1279,6 +1311,7 @@ func (r *Renderer) destroyWorldResources() {
 	r.destroyAmbientPass()
 	r.destroyResolvePass()
 	r.destroyVoxelResources()
+	r.destroyModelResources()
 
 	for _, p := range []vk.Pipeline{wr.pipeWorld, wr.pipeDepth, wr.pipeParticleAdd, wr.pipeParticleTrans, wr.pipeWorldLiquid, wr.pipeShadow, wr.pipeBlit} {
 		if p != nil {
@@ -1290,23 +1323,15 @@ func (r *Renderer) destroyWorldResources() {
 			vk.DestroyPipelineLayout(dev, l, nil)
 		}
 	}
-	if wr.texPool != nil {
-		vk.DestroyDescriptorPool(dev, wr.texPool, nil)
-	}
+	wr.texResidency.destroy(dev)
 	if wr.framePool != nil {
 		vk.DestroyDescriptorPool(dev, wr.framePool, nil)
 	}
-	for _, l := range []vk.DescriptorSetLayout{wr.dsl0, wr.dsl1, wr.dslBlit, wr.dslWaterCapture} {
+	for _, l := range []vk.DescriptorSetLayout{wr.dsl1, wr.dslBlit, wr.dslWaterCapture} {
 		if l != nil {
 			vk.DestroyDescriptorSetLayout(dev, l, nil)
 		}
 	}
-	for _, wt := range wr.texCache {
-		freeLitImage(dev, wt.img)
-		freeLitImage(dev, wt.bright)
-	}
-	wr.texCache = nil
-	freeLitImage(dev, wr.dummyTex)
 	freeShadowCube(dev, wr.dummyShadowCube)
 	for i := range wr.slots {
 		sl := &wr.slots[i]
@@ -1322,14 +1347,11 @@ func (r *Renderer) destroyWorldResources() {
 			freeShadowCube(dev, sl.shadowCube[s])
 		}
 		freeHostBuffer(dev, sl.ubo, sl.uboMem, sl.uboMapped)
+		freeHostBuffer(dev, sl.reach, sl.reachMem, sl.reachMapped)
 		freeHostBuffer(dev, sl.vbuf, sl.vbufMem, sl.vbufMapped)
 		freeHostBuffer(dev, sl.ovStage, sl.ovStageMem, sl.ovStageMapped)
 	}
-	if wr.staticVBO != nil {
-		vk.DestroyBuffer(dev, wr.staticVBO, nil)
-		vk.FreeMemory(dev, wr.staticVBOMem, nil)
-		wr.staticVBO, wr.staticVBOMem = nil, nil
-	}
+	wr.staticGeom.destroy(dev)
 	if wr.rpOpaque != nil {
 		vk.DestroyRenderPass(dev, wr.rpOpaque, nil)
 	}
@@ -1339,7 +1361,7 @@ func (r *Renderer) destroyWorldResources() {
 	if wr.rpShadow != nil {
 		vk.DestroyRenderPass(dev, wr.rpShadow, nil)
 	}
-	for _, s := range []vk.Sampler{wr.texSampler, wr.clampSampler, wr.depthSampler} {
+	for _, s := range []vk.Sampler{wr.clampSampler, wr.depthSampler} {
 		if s != nil {
 			vk.DestroySampler(dev, s, nil)
 		}

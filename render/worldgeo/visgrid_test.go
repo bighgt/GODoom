@@ -1,6 +1,20 @@
 package worldgeo
 
-import "testing"
+import (
+	"math"
+	"math/rand"
+	"testing"
+)
+
+func boxVis(cam Camera, minX, minY, maxX, maxY float32) bool {
+	c := NewViewCone(cam)
+	return c.boxVisible(minX, minY, maxX, maxY)
+}
+
+func lightVis(cam Camera, x, y, r float64) bool {
+	c := NewViewCone(cam)
+	return c.Visible(x, y, r)
+}
 
 func TestVisGridCellOfAndBoundsRoundTrip(t *testing.T) {
 	g := newVisGrid(0, 0, 2000, 1000)
@@ -29,7 +43,7 @@ func TestVisGridCellOfAndBoundsRoundTrip(t *testing.T) {
 
 func TestCellVisibleCameraInsideCell(t *testing.T) {
 	cam := Camera{X: 50, Y: 50, Angle: 0, FOVDeg: 90}
-	if !cellVisible(cam, 0, 0, 100, 100) {
+	if !boxVis(cam, 0, 0, 100, 100) {
 		t.Error("camera standing inside the cell should always be visible")
 	}
 }
@@ -39,19 +53,19 @@ func TestCellVisibleForwardVsBehind(t *testing.T) {
 	cam := Camera{X: 0, Y: 0, Angle: 0, FOVDeg: 90}
 
 	// A cell straight ahead must read visible.
-	if !cellVisible(cam, 500, -50, 600, 50) {
+	if !boxVis(cam, 500, -50, 600, 50) {
 		t.Error("a cell directly ahead of the camera should be visible")
 	}
 
 	// A cell directly behind the camera, well outside FOV+margin, must not.
-	if cellVisible(cam, -600, -50, -500, 50) {
+	if boxVis(cam, -600, -50, -500, 50) {
 		t.Error("a cell directly behind the camera should not be visible")
 	}
 }
 
 func TestLightVisibleCameraInsideRadius(t *testing.T) {
 	cam := Camera{X: 50, Y: 50, Angle: 0, FOVDeg: 90}
-	if !LightVisible(cam, 0, 0, 200) {
+	if !lightVis(cam, 0, 0, 200) {
 		t.Error("camera standing inside the light's radius should always be visible")
 	}
 }
@@ -61,21 +75,21 @@ func TestLightVisibleForwardVsBehind(t *testing.T) {
 	cam := Camera{X: 0, Y: 0, Angle: 0, FOVDeg: 90}
 
 	// A light straight ahead, well within reach of the view cone, must read visible.
-	if !LightVisible(cam, 500, 0, 200) {
+	if !lightVis(cam, 500, 0, 200) {
 		t.Error("a light directly ahead of the camera should be visible")
 	}
 
 	// A light directly behind the camera, far enough that its radius can't
 	// reach around into the FOV+margin cone, must not.
-	if LightVisible(cam, -600, 0, 100) {
+	if lightVis(cam, -600, 0, 100) {
 		t.Error("a light directly behind the camera, out of reach, should not be visible")
 	}
 
 	// A light behind the camera but with a radius large enough to spill into
 	// the view cone must still read visible — this is exactly why the test
-	// is a proper angular-span-vs-cone check (matching cellVisible), not a
+	// is a proper angular-span-vs-cone check (matching boxVisible), not a
 	// same-side-of-the-camera check.
-	if !LightVisible(cam, -50, 0, 200) {
+	if !lightVis(cam, -50, 0, 200) {
 		t.Error("a light just behind the camera whose radius reaches into view should be visible")
 	}
 }
@@ -102,7 +116,7 @@ func TestUpdateVisibilityUsesDrawBoundsNotNominalCell(t *testing.T) {
 	// Sanity: the draw's nominal cell (what the old, buggy code tested) is
 	// indeed out of view — otherwise this test isn't isolating the fix.
 	nomMinX, nomMinY, nomMaxX, nomMaxY := b.grid.bounds(awayCell)
-	if cellVisible(cam, nomMinX, nomMinY, nomMaxX, nomMaxY) {
+	if boxVis(cam, nomMinX, nomMinY, nomMaxX, nomMaxY) {
 		t.Fatal("test setup invalid: the nominal cell is visible too, doesn't isolate the fix")
 	}
 
@@ -151,4 +165,35 @@ func TestUpdateVisibilityStatsAndArrayAgree(t *testing.T) {
 	}
 
 	t.Logf("visibility: draws %d/%d visible, verts %d/%d visible", visD, totD, visV, totV)
+}
+
+// TestViewConeMatchesAngularTest: the trig-free cone test agrees with the
+// original angular-span form (circleVisible) everywhere except within a
+// hair of the cone's edge, over random cameras, FOVs (including ones wide
+// enough to take the fallback) and circles.
+func TestViewConeMatchesAngularTest(t *testing.T) {
+	rng := rand.New(rand.NewSource(7))
+	disagree := 0
+	for range 200000 {
+		cam := Camera{
+			X: rng.Float64()*4000 - 2000, Y: rng.Float64()*4000 - 2000,
+			Angle: rng.Float64()*8 - 4, FOVDeg: 40 + rng.Float64()*140,
+		}
+		cx, cy := rng.Float64()*4000-2000, rng.Float64()*4000-2000
+		r := rng.Float64() * 400
+		c := NewViewCone(cam)
+		if c.Visible(cx, cy, r) == circleVisible(cam, cx, cy, r) {
+			continue
+		}
+		// Only acceptable on the boundary itself (float rounding).
+		dx, dy := cx-cam.X, cy-cam.Y
+		d := math.Hypot(dx, dy)
+		ang := math.Abs(math.Remainder(math.Atan2(dy, dx)-cam.Angle, 2*math.Pi))
+		half := (cam.FOVDeg/2 + cullMarginDeg) * math.Pi / 180
+		if math.Abs(ang-math.Asin(math.Min(1, r/d))-half) > 1e-9 {
+			t.Fatalf("cam %+v circle (%.1f,%.1f) r %.1f: cone %v, angular %v", cam, cx, cy, r, c.Visible(cx, cy, r), circleVisible(cam, cx, cy, r))
+		}
+		disagree++
+	}
+	t.Logf("%d boundary-rounding disagreements in 200000", disagree)
 }

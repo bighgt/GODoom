@@ -201,21 +201,7 @@ func clipHalfPlane(poly []pt64, node *InnerNode, keepFront bool) []pt64 {
 	// (see the doc comment). tiny: the divide-by-zero guard for the edge
 	// intersection.
 	const partEps, tiny = 4.0, 1e-9
-	res := make([]pt64, 0, len(poly)+2)
-	for i := range poly {
-		cur := poly[i]
-		prev := poly[(i+len(poly)-1)%len(poly)]
-		sc, sp := side(cur), side(prev)
-		curIn, prevIn := sc >= -partEps, sp >= -partEps
-		if curIn != prevIn && math.Abs(sp-sc) > tiny {
-			t := sp / (sp - sc)
-			res = append(res, pt64{prev.x + t*(cur.x-prev.x), prev.y + t*(cur.y-prev.y)})
-		}
-		if curIn {
-			res = append(res, cur)
-		}
-	}
-	return res
+	return clipBySide(poly, side, partEps, tiny)
 }
 
 // clipToLine clips poly to the half-plane of the line through (ax,ay)->
@@ -232,13 +218,21 @@ func clipToLine(poly []pt64, ax, ay, bx, by, kx, ky float64) []pt64 {
 		return s
 	}
 	const eps = 1e-6
+	return clipBySide(poly, side, eps, eps)
+}
+
+// clipBySide is the Sutherland–Hodgman pass both clippers share: keep the
+// points with side(p) >= -inEps, inserting an intersection wherever an
+// edge crosses in/out (skipped when its two side values are within tiny of
+// each other, the divide-by-zero guard). Returns a new slice.
+func clipBySide(poly []pt64, side func(pt64) float64, inEps, tiny float64) []pt64 {
 	res := make([]pt64, 0, len(poly)+2)
 	for i := range poly {
 		cur := poly[i]
 		prev := poly[(i+len(poly)-1)%len(poly)]
 		sc, sp := side(cur), side(prev)
-		curIn, prevIn := sc >= -eps, sp >= -eps
-		if curIn != prevIn && math.Abs(sp-sc) > eps {
+		curIn, prevIn := sc >= -inEps, sp >= -inEps
+		if curIn != prevIn && math.Abs(sp-sc) > tiny {
 			t := sp / (sp - sc)
 			res = append(res, pt64{prev.x + t*(cur.x-prev.x), prev.y + t*(cur.y-prev.y)})
 		}

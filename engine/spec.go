@@ -492,9 +492,12 @@ func (g *Game) evTeleport(lineIdx int, mo *Mobj, monsterOnly bool) bool {
 			}
 			g.groundPlayer(g.Camera.Z - EyeHeight)
 		} else {
+			ox, oy := mo.X, mo.Y
 			mo.X, mo.Y, mo.Angle = dest.X, dest.Y, dest.Angle
+			g.relinkMobj(mo, ox, oy)
 			mo.Z = ds.FloorZAt(dest.X, dest.Y)
 			mo.MomX, mo.MomY, mo.MomZ = 0, 0, 0
+			mo.clearStepGlide()
 		}
 		g.P_SpawnMobj(dest.X, dest.Y, ds.FloorZAt(dest.X, dest.Y), MT_TFOG)
 		g.playWorldSound("DSTELEPT")

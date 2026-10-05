@@ -1,6 +1,7 @@
 package assets
 
 import (
+	"sort"
 	"strings"
 
 	"twopointfive/wad"
@@ -27,6 +28,28 @@ type spriteDef struct {
 // buildSpriteIndex scans the WAD's S_START..S_END (and SS_START..SS_END)
 // namespace once and returns prefix -> spriteDef.
 func buildSpriteIndex(w *wad.WAD) map[string]*spriteDef {
+	var names []string
+	inSprites := false
+	for _, e := range w.Entries {
+		switch e.Name {
+		case "S_START", "SS_START":
+			inSprites = true
+			continue
+		case "S_END", "SS_END":
+			inSprites = false
+			continue
+		}
+		if inSprites && e.Size > 0 {
+			names = append(names, e.Name)
+		}
+	}
+	return spriteIndexFromNames(names)
+}
+
+// spriteIndexFromNames builds the prefix -> spriteDef index from a list of
+// sprite lump names (a WAD's sprite namespace, or a TPFWEAPN container's
+// embedded set), in order — a later name for the same frame/rotation wins.
+func spriteIndexFromNames(names []string) map[string]*spriteDef {
 	defs := map[string]*spriteDef{}
 
 	install := func(prefix string, frame, rot int, lump string, flip bool) {
@@ -55,20 +78,7 @@ func buildSpriteIndex(w *wad.WAD) map[string]*spriteDef {
 		f.flip[rot-1] = flip
 	}
 
-	inSprites := false
-	for _, e := range w.Entries {
-		switch e.Name {
-		case "S_START", "SS_START":
-			inSprites = true
-			continue
-		case "S_END", "SS_END":
-			inSprites = false
-			continue
-		}
-		if !inSprites || e.Size == 0 {
-			continue
-		}
-		n := e.Name
+	for _, n := range names {
 		if len(n) != 6 && len(n) != 8 {
 			continue
 		}
@@ -111,6 +121,20 @@ func (t *Textures) SpriteFrame(prefix string, frame, rot int) (im *RGBA, flip, o
 	}
 	up := strings.ToUpper(prefix)
 	d := t.spriteIndex[up]
+	if d == nil && len(t.embeddedSprites) > 0 {
+		// A real-3D WAD's embedded weapon set: the other game's weapon /
+		// ammo pickups a switchWeapons session re-skins to, or a gun's
+		// projectile this WAD's own game never shipped.
+		if t.embeddedSpriteIndex == nil {
+			names := make([]string, 0, len(t.embeddedSprites))
+			for n := range t.embeddedSprites {
+				names = append(names, n)
+			}
+			sort.Strings(names)
+			t.embeddedSpriteIndex = spriteIndexFromNames(names)
+		}
+		d = t.embeddedSpriteIndex[up]
+	}
 	if d == nil && t.fallbackW != nil {
 		// switchWeapons: a weapon/ammo pickup re-skinned to the other game's
 		// sprite — that game's IWAD has the frames (decoded through its

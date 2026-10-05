@@ -431,49 +431,9 @@ func (d *Doc) loadSlopes() {
 	}
 	mapName := strings.ToUpper(d.MapName)
 	for _, def := range planes[mapName] {
-		applySlopePlane(d.Level, def)
+		def.Apply(d.Level) // a bad def is skipped; the engine logs it on load
 	}
 	d.extraFloors = append([]slopes.ExtraFloorDef(nil), floors[mapName]...)
-}
-
-// applySlopePlane mutates sec's tilt fields from def — the same math as
-// engine/slopes_load.go's applySlopes/planeTilt, duplicated here (not
-// imported: that lives in package engine, which the editor doesn't
-// otherwise depend on) following this codebase's own established
-// convention of each package keeping its own tiny copy of a small, stable
-// helper like this rather than pulling in a whole unrelated package for it.
-func applySlopePlane(lvl *wad.Level, def slopes.Def) {
-	if def.SectorIndex < 0 || def.SectorIndex >= len(lvl.Sectors) {
-		return
-	}
-	sec := &lvl.Sectors[def.SectorIndex]
-	tiltX, tiltY, ok := planeTilt(def.P1, def.P2, def.P3)
-	if !ok {
-		return
-	}
-	sec.SlopePivotX, sec.SlopePivotY = def.P1[0], def.P1[1]
-	if def.Ceiling {
-		sec.CeilingHeight = int16(math.Round(def.P1[2]))
-		sec.CeilTiltX, sec.CeilTiltY = tiltX, tiltY
-	} else {
-		sec.FloorHeight = int16(math.Round(def.P1[2]))
-		sec.FloorTiltX, sec.FloorTiltY = tiltX, tiltY
-	}
-}
-
-// planeTilt solves for the (tiltX, tiltY) of the plane through p1, p2, p3
-// that passes through p1 at that exact height — see
-// engine/slopes_load.go's own copy of this for the full derivation.
-func planeTilt(p1, p2, p3 [3]float64) (tiltX, tiltY float64, ok bool) {
-	dx2, dy2, dz2 := p2[0]-p1[0], p2[1]-p1[1], p2[2]-p1[2]
-	dx3, dy3, dz3 := p3[0]-p1[0], p3[1]-p1[1], p3[2]-p1[2]
-	det := dx2*dy3 - dx3*dy2
-	if det == 0 {
-		return 0, 0, false
-	}
-	tiltX = (dz2*dy3 - dz3*dy2) / det
-	tiltY = (dx2*dz3 - dx3*dz2) / det
-	return tiltX, tiltY, true
 }
 
 // SetSectorTilt sets sector idx's floor/ceiling plane tilt directly — the

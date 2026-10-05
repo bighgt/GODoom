@@ -204,19 +204,32 @@ last good 3D view until you fix the geometry.
 
 8. SAVING AND PLAYTESTING
 ---------------------------
-    File -> Save map as PWAD    Ctrl+S
+    File -> Save map as 3D WAD  Ctrl+S
     File -> Play this map       F5
 
-Save writes a single-map PWAD next to the source WAD, named
-"<wad>_<map>.wad" (e.g. doom2_MAP01.wad) — the raw geometry lumps plus a
-freshly built BSP (SEGS/SSECTORS/NODES), a generated BLOCKMAP, and an
-empty REJECT (valid — it just means no sight-check shortcuts). This loads
-directly in this project's engine (cmd/engine). It has not been tested
-against other source ports or Doom editors, and the node builder doesn't
-try to match any particular vanilla tool's output — see LIMITATIONS.
+Save writes a real-3D WAD — the only kind of WAD the editor saves, and
+the only kind the game plays. It's the same file the wad3d converter
+makes: the map (with a freshly built BSP, BLOCKMAP and REJECT), stairs
+rebuilt as ramps, the hi-res textures the map uses, the Doom, Doom II and
+Heretic weapons, and the voxel models every monster and item is drawn
+with. It goes to the launcher's wad/ folder, named
+"<wad>_<map>_3d.wad" (e.g. doom2_MAP01_3d.wad; "newlevel_MAP01_3d.wad"
+for a New Level), so it shows up in the game's WAD list straight away.
 
-Play saves to a temporary PWAD the same way and launches the engine
-binary on it directly, so you can playtest without leaving the editor.
+Building the textures, weapons and voxels takes several seconds, so Save
+runs in the background: the status bar says "saving 3D WAD ..." and you
+can keep editing; it reports "saved 3D WAD <path> (N MB, ...)" or why it
+failed when it's done. Save is greyed out until then. It needs the Doom II
+and Heretic IWADs (for the weapons) and assets/voxel/ (for the models)
+where the converter would find them, and never overwrites the source WAD.
+
+The editor still OPENS ordinary WADs — that's how you edit a level —
+it just never saves one.
+
+Play saves to a temporary 3D WAD the same way — but skips embedding the
+textures and weapons so F5 stays quick (the game uses the on-disk
+hi-res set and the other IWAD instead) — and launches the engine binary
+on it directly, so you can playtest without leaving the editor.
 It looks for the engine binary at bin/linux_engine (bin/windows_engine.exe
 on Windows) relative to the working directory, or "engine" on your PATH;
 build it first with `go build -o bin/linux_engine ./cmd/engine` (adjust

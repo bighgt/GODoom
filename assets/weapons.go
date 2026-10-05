@@ -80,7 +80,7 @@ func weaponOverrideRGBA(img image.Image, patch *wad.Patch, wf weaponFrame) *RGBA
 	if wf.scale > 0 {
 		tpu = wf.scale
 	}
-	out := imageToRGBA(img, tpu)
+	out := ImageToRGBA(img, tpu)
 	switch {
 	case wf.hasOffset:
 		out.OffsetX = wf.offX
@@ -284,22 +284,32 @@ func addWeaponPack(pk3Path string, out map[string]weaponFrame) {
 		}
 	}
 
+	// Decode every PNG across the cores, then merge in zip order (so the
+	// shadowing and its log lines are as if read one by one).
+	var pngs []*zip.File
 	for _, f := range zr.File {
-		if f.FileInfo().IsDir() || !strings.EqualFold(path.Ext(f.Name), ".png") {
-			continue
+		if !f.FileInfo().IsDir() && strings.EqualFold(path.Ext(f.Name), ".png") {
+			pngs = append(pngs, f)
 		}
-		name := strings.ToUpper(strings.TrimSuffix(path.Base(f.Name), path.Ext(f.Name)))
-		rc, err := f.Open()
+	}
+	imgs := make([]image.Image, len(pngs))
+	errs := make([]error, len(pngs))
+	ParallelFor(len(pngs), func(i int) {
+		rc, err := pngs[i].Open()
 		if err != nil {
-			log.Printf("assets: %s: open %s: %v", filepath.Base(pk3Path), f.Name, err)
-			continue
+			errs[i] = err
+			return
 		}
-		img, err := png.Decode(rc)
+		imgs[i], errs[i] = png.Decode(rc)
 		rc.Close()
-		if err != nil {
-			log.Printf("assets: %s: decode %s: %v", filepath.Base(pk3Path), f.Name, err)
+	})
+	for i, f := range pngs {
+		if errs[i] != nil {
+			log.Printf("assets: %s: decode %s: %v", filepath.Base(pk3Path), f.Name, errs[i])
 			continue
 		}
+		img := imgs[i]
+		name := strings.ToUpper(strings.TrimSuffix(path.Base(f.Name), path.Ext(f.Name)))
 		if _, dup := out[name]; dup {
 			log.Printf("assets: HD weapon frame %q in %s shadows an earlier pack", name, filepath.Base(pk3Path))
 		}

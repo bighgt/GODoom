@@ -7,17 +7,13 @@ import (
 
 	vk "github.com/goki/vulkan"
 
-	"twopointfive/assets"
 	"twopointfive/render/worldgeo"
 )
 
 // This file is the one-time resource build for the isometric-viewer path
 // (see isoworld.go): a fixed-size offscreen colour+depth scene target, the
-// per-texture descriptor cache (mirroring worldtex.go's worldTex/allocTexSet
-// shape, but its own pool/sampler/cache rather than sharing worldResources' —
-// hw and iso are mutually exclusive per Renderer instance, so nothing is
-// saved by sharing, and keeping them separate means neither path's teardown
-// has to reason about the other's fields), the world-geometry pipeline, and
+// per-texture descriptor cache (its own texResidency — see worldtex.go),
+// the world-geometry pipeline, and
 // the present stage that blits the finished scene to the swapchain via the
 // ordinary blit.vert/blit.frag pipeline shape (see pipeline.go) — its own
 // pipeline/descriptor set here rather than reusing r.pipeline/r.pipelineLayout,
@@ -88,13 +84,7 @@ type isoResources struct {
 	colorImg litImage
 	depthImg litImage
 
-	texSampler vk.Sampler // wall/flat/sprite textures: linear + mip, REPEAT
-	dummyTex   litImage   // 1x1 black — set-0 binding 1 for textures with no brightmap
-
-	dsl0    vk.DescriptorSetLayout // set 0: per-texture (tex, brightmap)
-	texPool vk.DescriptorPool      // per-texture set0, grows over a session
-
-	texCache map[*assets.RGBA]*worldTex // keyed by the shared bitmap pointer
+	texResidency // texSampler, dummyTex, dsl0, texPool, texCache, voxCache (worldtex.go)
 
 	plWorld   vk.PipelineLayout
 	pipeWorld vk.Pipeline
@@ -122,37 +112,25 @@ type isoResources struct {
 	revealSet       [maxFramesInFlight]vk.DescriptorSet
 
 	// Voxel models — a dedicated pipeline (vertex colour, no texture,
-	// isovoxel.vert/frag's own simpler shading), reusing the FPS hardware
-	// path's mesh format/cache shape (worldgeo.BuildVoxelMesh, the
-	// package-level voxelMesh type — see worldvoxel.go) but its own
-	// isolated cache/pipeline: hw and iso are mutually exclusive per
-	// Renderer instance, so nothing is saved by sharing wr's, and keeping
-	// them separate means neither path's teardown has to reason about the
-	// other's fields (the same rationale as texCache/dsl0 above).
+	// isovoxel.vert/frag's own simpler shading) over the FPS hardware
+	// path's mesh format (worldgeo.BuildVoxelMesh, voxelMesh — see
+	// worldvoxel.go), cached in texResidency.voxCache.
 	plVoxel         vk.PipelineLayout
 	pipeVoxel       vk.Pipeline
 	pipeVoxelReveal vk.Pipeline // occluded-silhouette variant, see pipeSpriteReveal
-	voxCache        map[*assets.VoxelModel]*voxelMesh
 
-	// Static (walls/flats) + dynamic (sprite billboard) geometry, one
-	// device-local vertex buffer each. Not double-buffered per frame in
-	// flight like worldResources' — this is a static viewer, not a
-	// real-time game: Invalidate/AddSprites only rerun when the level or
-	// the camera's azimuth changes enough to matter, not on every frame's
-	// critical path, so the simpler single-buffer-plus-DeviceWaitIdle-on-
-	// upload shape (matching uploadStaticWorld's own occasional-update
-	// assumption) is enough.
-	staticVBO     vk.Buffer
-	staticVBOMem  vk.DeviceMemory
-	staticVBOCap  int
-	staticVersion uint32
+	// Static walls/flats: one device-local vertex buffer, re-uploaded
+	// (with a DeviceWaitIdle) only when StaticVersion moves — see
+	// uploadStatic.
+	staticGeom
 
-	dynVBO    vk.Buffer
-	dynVBOMem vk.DeviceMemory
-	dynVBOCap int
+	// dyn is the per-frame vertex stream (sprites, live sectors —
+	// worldgeo.Geometry.Tris): one host-visible buffer per frame in
+	// flight, written right after that frame's fence wait, like the FPS
+	// path's worldSlot.vbuf.
+	dyn [maxFramesInFlight]isoDynBuf
 
-	packBuf       []byte
-	staticPackBuf []byte
+	packBuf []byte
 
 	// Present stage: samples colorImg through the ordinary blit shader into
 	// r.renderPass/r.framebuffers (the shared swapchain bootstrap) — no
@@ -193,33 +171,10 @@ type isoResources struct {
 	overlayPipeline   vk.Pipeline
 }
 
+// isoCreateSamplers builds the present sampler; the texture sampler
+// belongs to texResidency (initTexResidency).
 func (r *Renderer) isoCreateSamplers() error {
 	ir := r.ir
-	texInfo := vk.SamplerCreateInfo{
-		SType:        vk.StructureTypeSamplerCreateInfo,
-		MagFilter:    vk.FilterLinear,
-		MinFilter:    vk.FilterLinear,
-		MipmapMode:   vk.SamplerMipmapModeLinear,
-		AddressModeU: vk.SamplerAddressModeRepeat,
-		AddressModeV: vk.SamplerAddressModeRepeat,
-		AddressModeW: vk.SamplerAddressModeRepeat,
-		MinLod:       0,
-		MaxLod:       vk.LodClampNone,
-	}
-	if r.maxAnisotropy >= 2 {
-		a := r.maxAnisotropy
-		if a > 16 {
-			a = 16
-		}
-		texInfo.AnisotropyEnable = vk.True
-		texInfo.MaxAnisotropy = a
-	}
-	var texSamp vk.Sampler
-	if res := vk.CreateSampler(r.device, &texInfo, nil, &texSamp); res != vk.Success {
-		return fmt.Errorf("vulkan: iso texture sampler: %s", vk.Error(res))
-	}
-	ir.texSampler = texSamp
-
 	presentInfo := vk.SamplerCreateInfo{
 		SType:        vk.StructureTypeSamplerCreateInfo,
 		MagFilter:    vk.FilterLinear,
@@ -236,18 +191,6 @@ func (r *Renderer) isoCreateSamplers() error {
 	}
 	ir.presentSampler = presentSamp
 	return nil
-}
-
-func (r *Renderer) isoCreateDummyTex() error {
-	ir := r.ir
-	dummy, err := r.wMakeImage(1, 1, vk.FormatR8g8b8a8Unorm,
-		vk.ImageUsageFlags(vk.ImageUsageTransferDstBit)|vk.ImageUsageFlags(vk.ImageUsageSampledBit),
-		vk.ImageAspectFlags(vk.ImageAspectColorBit), 1)
-	if err != nil {
-		return err
-	}
-	ir.dummyTex = dummy
-	return r.uploadImagePixels(dummy.image, 1, 1, []byte{0, 0, 0, 255}, vk.ImageLayoutShaderReadOnlyOptimal)
 }
 
 // isoCreateSceneRenderPass builds the offscreen colour+depth render pass the
@@ -356,26 +299,11 @@ func (r *Renderer) isoCreateOffscreen() error {
 }
 
 func (r *Renderer) isoCreateDescriptorLayouts() error {
-	ir := r.ir
-	mk := func(b []vk.DescriptorSetLayoutBinding) (vk.DescriptorSetLayout, error) {
-		info := vk.DescriptorSetLayoutCreateInfo{
-			SType:        vk.StructureTypeDescriptorSetLayoutCreateInfo,
-			BindingCount: uint32(len(b)),
-			PBindings:    b,
-		}
-		var l vk.DescriptorSetLayout
-		if res := vk.CreateDescriptorSetLayout(r.device, &info, nil, &l); res != vk.Success {
-			return nil, fmt.Errorf("vulkan: iso dsl: %s", vk.Error(res))
-		}
-		return l, nil
-	}
-	var err error
-	if ir.dsl0, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0), samplerBinding(1)}); err != nil {
+	l, err := r.newDescriptorSetLayout("iso present", samplerBinding(0))
+	if err != nil {
 		return err
 	}
-	if ir.presentSetLayout, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0)}); err != nil {
-		return err
-	}
+	r.ir.presentSetLayout = l
 	return nil
 }
 
@@ -390,16 +318,12 @@ func (r *Renderer) isoCreateRevealResources() error {
 	ir := r.ir
 	size := int(unsafe.Sizeof(isoRevealUBO{}))
 
-	dslInfo := vk.DescriptorSetLayoutCreateInfo{
-		SType: vk.StructureTypeDescriptorSetLayoutCreateInfo, BindingCount: 1,
-		PBindings: []vk.DescriptorSetLayoutBinding{{
-			Binding: 0, DescriptorType: vk.DescriptorTypeUniformBuffer, DescriptorCount: 1,
-			StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
-		}},
-	}
-	var dsl vk.DescriptorSetLayout
-	if res := vk.CreateDescriptorSetLayout(r.device, &dslInfo, nil, &dsl); res != vk.Success {
-		return fmt.Errorf("vulkan: iso reveal dsl: %s", vk.Error(res))
+	dsl, err := r.newDescriptorSetLayout("iso reveal", vk.DescriptorSetLayoutBinding{
+		Binding: 0, DescriptorType: vk.DescriptorTypeUniformBuffer, DescriptorCount: 1,
+		StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+	})
+	if err != nil {
+		return err
 	}
 	ir.revealSetLayout = dsl
 
@@ -420,13 +344,9 @@ func (r *Renderer) isoCreateRevealResources() error {
 		}
 		ir.revealBuf[i], ir.revealMem[i], ir.revealMapped[i] = buf, mem, mapped
 
-		allocInfo := vk.DescriptorSetAllocateInfo{
-			SType: vk.StructureTypeDescriptorSetAllocateInfo, DescriptorPool: pool, DescriptorSetCount: 1,
-			PSetLayouts: []vk.DescriptorSetLayout{dsl},
-		}
-		var set vk.DescriptorSet
-		if res := vk.AllocateDescriptorSets(r.device, &allocInfo, &set); res != vk.Success {
-			return fmt.Errorf("vulkan: iso reveal descriptor set %d: %s", i, vk.Error(res))
+		set, err := r.allocDescriptorSet(pool, dsl, fmt.Sprintf("iso reveal %d", i))
+		if err != nil {
+			return err
 		}
 		ir.revealSet[i] = set
 
@@ -437,26 +357,6 @@ func (r *Renderer) isoCreateRevealResources() error {
 		}
 		vk.UpdateDescriptorSets(r.device, 1, []vk.WriteDescriptorSet{write}, 0, nil)
 	}
-	return nil
-}
-
-// isoCreateTexPool sizes the per-texture descriptor pool generously for a
-// whole session's worth of unique wall/flat/sprite names — mirrors
-// worldsetup.go's own texPool (see allocTexSet there for the pattern this
-// file's isoAllocTexSet follows).
-func (r *Renderer) isoCreateTexPool() error {
-	const maxTextures = 1024
-	info := vk.DescriptorPoolCreateInfo{
-		SType:         vk.StructureTypeDescriptorPoolCreateInfo,
-		MaxSets:       maxTextures,
-		PoolSizeCount: 1,
-		PPoolSizes:    []vk.DescriptorPoolSize{{Type: vk.DescriptorTypeCombinedImageSampler, DescriptorCount: 2 * maxTextures}},
-	}
-	var pool vk.DescriptorPool
-	if res := vk.CreateDescriptorPool(r.device, &info, nil, &pool); res != vk.Success {
-		return fmt.Errorf("vulkan: iso texture descriptor pool: %s", vk.Error(res))
-	}
-	r.ir.texPool = pool
 	return nil
 }
 
@@ -475,28 +375,12 @@ func (r *Renderer) isoCreatePresentDescriptor() error {
 		return fmt.Errorf("vulkan: iso present descriptor pool: %s", vk.Error(res))
 	}
 	ir.presentPool = pool
-	allocInfo := vk.DescriptorSetAllocateInfo{
-		SType:              vk.StructureTypeDescriptorSetAllocateInfo,
-		DescriptorPool:     ir.presentPool,
-		DescriptorSetCount: 1,
-		PSetLayouts:        []vk.DescriptorSetLayout{ir.presentSetLayout},
-	}
-	var set vk.DescriptorSet
-	if res := vk.AllocateDescriptorSets(r.device, &allocInfo, &set); res != vk.Success {
-		return fmt.Errorf("vulkan: iso present descriptor set: %s", vk.Error(res))
+	set, err := r.allocDescriptorSet(ir.presentPool, ir.presentSetLayout, "iso present")
+	if err != nil {
+		return err
 	}
 	ir.presentSet = set
-	write := vk.WriteDescriptorSet{
-		SType:           vk.StructureTypeWriteDescriptorSet,
-		DstSet:          ir.presentSet,
-		DstBinding:      0,
-		DescriptorCount: 1,
-		DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
-		PImageInfo: []vk.DescriptorImageInfo{{
-			Sampler: ir.presentSampler, ImageView: ir.colorImg.view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-		}},
-	}
-	vk.UpdateDescriptorSets(r.device, 1, []vk.WriteDescriptorSet{write}, 0, nil)
+	vk.UpdateDescriptorSets(r.device, 1, []vk.WriteDescriptorSet{imageWrite(set, 0, ir.presentSampler, ir.colorImg.view)}, 0, nil)
 	return nil
 }
 

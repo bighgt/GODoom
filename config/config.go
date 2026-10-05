@@ -144,19 +144,27 @@ type Config struct {
 	//             overlay are unaffected)
 	// F1 cycles doom -> quake2 -> none -> doom at runtime. Case-insensitive.
 	HUDStyle string `json:"hudStyle"`
-	// Voxels replaces map-object sprites (monsters, items, ammo, keys, ...)
-	// with voxel models from assets/voxel/Doom{1,2}_Voxel.pk3 when a model
-	// exists for the current frame. Default true; harmless if the pack is
-	// absent (falls back to sprites).
-	Voxels bool `json:"voxels"`
 	// Flashlight enables the F-key head-mounted flashlight — a forward beam
 	// with a hotspot-to-spill falloff (see engine/flashlight.go). Default
 	// true; false disables the toggle entirely.
 	Flashlight bool `json:"flashlight"`
-	// VoxelScale is map units per voxel for the models above. Cheello's
-	// Voxel Doom is authored at 1.0 (the default); raise/lower to fit a pack
-	// whose proportions differ. Clamped to [0.25, 4.0].
-	VoxelScale float64 `json:"voxelScale"`
+	// ModelScale sizes every map object's model — the textured 3D models
+	// and the voxel models alike (it was "voxelScale" before 3D models
+	// existed; an old config's voxelScale is still honoured when
+	// modelScale is absent). 1.0 draws both at their packs' authored size
+	// (Cheello's Voxel Doom is 1:1; MODELDEF packs carry their own Scale,
+	// which this multiplies). Clamped to [0.25, 4.0].
+	ModelScale float64 `json:"modelScale"`
+	// ObjectStyle picks how monsters, items, decorations and projectiles
+	// are drawn when the real-3D WAD carries both kinds of model:
+	//   "models" (default) — its textured 3D models (a MODELDEF pack baked
+	//            in as TPFMODEL), a voxel model for any sprite frame the
+	//            pack has no model for;
+	//   "voxels" — voxel models, except the weapon pickups (shotgun,
+	//            chaingun, BFG, ...), which keep their 3D models.
+	// A WAD without 3D models draws voxels either way, and the isometric
+	// view always does (it has no 3D-model renderer).
+	ObjectStyle string `json:"objectStyle"`
 	// Quake1Textures, when true, layers a Quake 1 texture pack over the
 	// hi-res override set: for every Doom wall/flat name the curated table in
 	// tools/importquake covers, the Quake texture in assets/textures/quake1/
@@ -203,6 +211,36 @@ type Config struct {
 	// silently does nothing even when true if the spark art isn't present
 	// locally. Default true.
 	ExplosionParticles bool `json:"explosionParticles"`
+	// SmoothMonsterMovement draws a walking monster's A_Chase step spread
+	// over its whole walk frame instead of popping forward once every 3-4
+	// tics — see engine/interp.go's step glide. Purely visual: AI,
+	// collision and hit detection use the real position. Default true.
+	SmoothMonsterMovement bool `json:"smoothMonsterMovement"`
+	// ImpFireballs draws the imp's fireball as a rendered (procedural) ball
+	// of fire with an ember trail instead of the BAL1 sprite / pack model,
+	// and gives it a fire burst with splash damage on impact — see
+	// engine/impfireball.go. Default true; false is vanilla.
+	ImpFireballs bool `json:"impFireballs"`
+	// CacoFireballs is ImpFireballs for the cacodemon: a slightly larger
+	// rendered ball — a red-hot core in blue flames — with an ember trail
+	// and a bigger splash on impact, instead of the BAL2 sprite / pack
+	// model. Default true; false is vanilla.
+	CacoFireballs bool `json:"cacoFireballs"`
+	// MonsterBehavior picks what an idle monster does before it notices
+	// the player:
+	//   "roaming" (default) — walks about the level, room to room, opening
+	//             normal doors on the way, pausing between trips (see
+	//             engine/roam.go); it still wakes the moment it sees or
+	//             hears the player;
+	//   "classic" — vanilla Doom: stands where it was placed until it sees
+	//             or hears the player.
+	// Either way an alerted monster chases and opens normal doors in its
+	// path, as in vanilla.
+	MonsterBehavior string `json:"monsterBehavior"`
+	// LostSoulFire trails rendered flames (the imp fireball's fire) off the
+	// back of every living lost soul and gives it a flickering fire light —
+	// see engine/lostsoulfire.go. Purely cosmetic. Default true.
+	LostSoulFire bool `json:"lostSoulFire"`
 	// LiquidAmbience turns on cosmetic particles around water/lava/nukage
 	// sectors — steam off lava, mist over water, bubbles in acid — plus the
 	// particle burst (not the sound, which always plays) when something
@@ -326,10 +364,10 @@ const (
 	MaxSkill = 5
 )
 
-// VoxelScale bounds (map units per voxel).
+// ModelScale bounds (a multiplier on 3D-model and voxel-model size).
 const (
-	MinVoxelScale = 0.25
-	MaxVoxelScale = 4.0
+	MinModelScale = 0.25
+	MaxModelScale = 4.0
 )
 
 // Lighting bounds.
@@ -377,48 +415,53 @@ const fileName = "config.json"
 // source of per-field fallbacks when it's present but a value is bad.
 func Default() Config {
 	return Config{
-		Resolution:           "720p",
-		RenderScale:          1.0,
-		Windowed:             false,
-		WindowWidth:          1280,
-		WindowHeight:         720,
-		FOVDegrees:           100,
-		HUDScale:             1.0,
-		WeaponScale:          1.0,
-		VSync:                true,
-		SwitchWeaponOnPickup: true,
-		InvertMouseY:         false,
-		MouseSensitivity:     0.0022,
-		TurnSpeed:            2.5,
-		AlwaysRun:            false,
-		Skill:                3,
-		DamageScale:          100,
-		Music:                true,
-		MusicVolume:          1.0,
-		WeaponVolume:         1.0,
-		WorldVolume:          0.5,
-		ShowDebugInfo:        true,
-		ShowStatusBar:        true,
-		HUDStyle:             HUDStyleDoom,
-		Voxels:               true,
-		Flashlight:           true,
-		VoxelScale:           1.0,
-		Quake1Textures:       false,
-		MaxFPS:               0,
-		LightScale:           0.75,
-		AmbientLight:         0.2,
-		Exposure:             1.0,
-		CartoonShading:       false,
-		ExplosionParticles:   true,
-		LiquidAmbience:       true,
-		WaterRefraction:      false,
-		RealShadows:          false,
-		SwitchWeapons:        false,
-		FogColor:             "",
-		FogDensity:           0,
-		Crosshair:            CrosshairDot,
-		CrosshairSize:        CrosshairMedium,
-		WADPath:              "",
+		Resolution:            "720p",
+		RenderScale:           1.0,
+		Windowed:              false,
+		WindowWidth:           1280,
+		WindowHeight:          720,
+		FOVDegrees:            100,
+		HUDScale:              1.0,
+		WeaponScale:           1.0,
+		VSync:                 true,
+		SwitchWeaponOnPickup:  true,
+		InvertMouseY:          false,
+		MouseSensitivity:      0.0022,
+		TurnSpeed:             2.5,
+		AlwaysRun:             false,
+		Skill:                 3,
+		DamageScale:           100,
+		Music:                 true,
+		MusicVolume:           1.0,
+		WeaponVolume:          1.0,
+		WorldVolume:           0.5,
+		ShowDebugInfo:         true,
+		ShowStatusBar:         true,
+		HUDStyle:              HUDStyleDoom,
+		Flashlight:            true,
+		ModelScale:            1.0,
+		ObjectStyle:           ObjectStyleModels,
+		Quake1Textures:        false,
+		MaxFPS:                0,
+		LightScale:            0.75,
+		AmbientLight:          0.2,
+		Exposure:              1.0,
+		CartoonShading:        false,
+		ExplosionParticles:    true,
+		SmoothMonsterMovement: true,
+		ImpFireballs:          true,
+		CacoFireballs:         true,
+		MonsterBehavior:       MonsterBehaviorRoaming,
+		LostSoulFire:          true,
+		LiquidAmbience:        true,
+		WaterRefraction:       false,
+		RealShadows:           false,
+		SwitchWeapons:         false,
+		FogColor:              "",
+		FogDensity:            0,
+		Crosshair:             CrosshairDot,
+		CrosshairSize:         CrosshairMedium,
+		WADPath:               "",
 	}
 }
 
@@ -449,6 +492,18 @@ const (
 	CrosshairLarge  = "large"
 )
 
+// Monster-behaviour keywords (Config.MonsterBehavior).
+const (
+	MonsterBehaviorRoaming = "roaming"
+	MonsterBehaviorClassic = "classic"
+)
+
+// Object-style keywords (Config.ObjectStyle).
+const (
+	ObjectStyleModels = "models"
+	ObjectStyleVoxels = "voxels"
+)
+
 // HUD-style keywords (Config.HUDStyle).
 const (
 	HUDStyleDoom   = "doom"
@@ -468,6 +523,13 @@ func Load() Config {
 		log.Printf("config: no %s in %s or next to the executable — using built-in defaults", fileName, wd)
 		return cfg.repaired()
 	}
+	return loadFile(path)
+}
+
+// loadFile is Load's body once the file is found: decode path over the
+// defaults, apply the back-compat key mappings, repair.
+func loadFile(path string) Config {
+	cfg := Default()
 	if raw, err := os.ReadFile(path); err != nil {
 		log.Printf("config: %v (using defaults)", err)
 	} else if err := json.Unmarshal(raw, &cfg); err != nil {
@@ -485,6 +547,17 @@ func Load() Config {
 			log.Printf("config: ignoring retired key(s) %s — run `go run ./tools/genconfig -f` for a config.json with only the current options",
 				strings.Join(dep, " "))
 		}
+		// Back-compat: "voxelScale" was renamed "modelScale" when 3D models
+		// started sharing it — an old file's value still applies.
+		if !keyPresent(raw, "modelScale") && keyPresent(raw, "voxelScale") {
+			var old struct {
+				V float64 `json:"voxelScale"`
+			}
+			if json.Unmarshal(raw, &old) == nil {
+				cfg.ModelScale = old.V
+				log.Printf("config: voxelScale is now modelScale (it sizes 3D models too) — using %.2f", old.V)
+			}
+		}
 		// Back-compat: an old config that set "showStatusBar": false and has
 		// no "hudStyle" key means "no HUD" — map it to hudStyle "none".
 		if keyPresent(raw, "showStatusBar") && !keyPresent(raw, "hudStyle") && !cfg.ShowStatusBar {
@@ -498,7 +571,8 @@ func Load() Config {
 // deprecatedKeys reports which retired config keys appear in the file, so a
 // user editing an old config.json is told their setting is being ignored
 // rather than silently having no effect. spriteFilter/voxelFilter were
-// superseded by textureQuality; renderer/lightingMode/textureQuality/
+// superseded by textureQuality; voxels (the sprites-or-voxels switch) was
+// retired when map objects became voxel-only; renderer/lightingMode/textureQuality/
 // shadows/groundShadows were the software (CPU) rasterizer's own settings,
 // retired along with it — hardware (GPU-geometry) rendering is the only
 // renderer now, so there is nothing left for any of them to configure.
@@ -509,7 +583,7 @@ func deprecatedKeys(raw []byte) []string {
 	}
 	var dep []string
 	for _, k := range []string{
-		"spriteFilter", "voxelFilter",
+		"spriteFilter", "voxelFilter", "voxels",
 		"renderer", "lightingMode", "textureQuality", "shadows", "groundShadows",
 	} {
 		if _, ok := present[k]; ok {
@@ -690,13 +764,13 @@ func (c Config) repaired() Config {
 		c.WorldVolume = d.WorldVolume
 	}
 
-	if c.VoxelScale == 0 {
-		c.VoxelScale = d.VoxelScale
+	if c.ModelScale == 0 {
+		c.ModelScale = d.ModelScale
 	}
-	if c.VoxelScale < MinVoxelScale || c.VoxelScale > MaxVoxelScale {
-		log.Printf("config: voxelScale %.2f out of [%.2f, %.2f], using %.2f",
-			c.VoxelScale, MinVoxelScale, MaxVoxelScale, d.VoxelScale)
-		c.VoxelScale = d.VoxelScale
+	if c.ModelScale < MinModelScale || c.ModelScale > MaxModelScale {
+		log.Printf("config: modelScale %.2f out of [%.2f, %.2f], using %.2f",
+			c.ModelScale, MinModelScale, MaxModelScale, d.ModelScale)
+		c.ModelScale = d.ModelScale
 	}
 
 	if c.LightScale == 0 {
@@ -745,6 +819,26 @@ func (c Config) repaired() Config {
 	default:
 		log.Printf("config: unknown crosshairSize %q, using %q", c.CrosshairSize, d.CrosshairSize)
 		c.CrosshairSize = d.CrosshairSize
+	}
+
+	switch st := strings.ToLower(strings.TrimSpace(c.ObjectStyle)); st {
+	case ObjectStyleModels, ObjectStyleVoxels:
+		c.ObjectStyle = st
+	case "":
+		c.ObjectStyle = d.ObjectStyle
+	default:
+		log.Printf("config: unknown objectStyle %q, using %q", c.ObjectStyle, d.ObjectStyle)
+		c.ObjectStyle = d.ObjectStyle
+	}
+
+	switch mb := strings.ToLower(strings.TrimSpace(c.MonsterBehavior)); mb {
+	case MonsterBehaviorRoaming, MonsterBehaviorClassic:
+		c.MonsterBehavior = mb
+	case "":
+		c.MonsterBehavior = d.MonsterBehavior
+	default:
+		log.Printf("config: unknown monsterBehavior %q, using %q", c.MonsterBehavior, d.MonsterBehavior)
+		c.MonsterBehavior = d.MonsterBehavior
 	}
 
 	switch hs := strings.ToLower(strings.TrimSpace(c.HUDStyle)); hs {

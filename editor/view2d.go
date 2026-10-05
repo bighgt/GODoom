@@ -259,52 +259,40 @@ func (v *view2d) handleSelect(ui *imkit.UI, d *Doc) {
 // so handleSelect's own click-to-select doesn't also fire on the same
 // click.
 func (v *view2d) handleVertexDrag(ui *imkit.UI, d *Doc) bool {
-	if v.draggingVert >= 0 {
-		if ui.In.LeftDown {
-			wx, wy := v.s2w(ui.In.MouseX, ui.In.MouseY)
-			sx, sy := v.snap(d, wx, wy)
-			d.MoveVertex(v.draggingVert, int16(sx), int16(sy))
-			return true
-		}
-		v.draggingVert = -1
-		return true
-	}
-	if !ui.In.LeftClicked || int(ui.In.MouseY) < v.rect.Y+34 {
-		return false
-	}
-	wx, wy := v.s2w(ui.In.MouseX, ui.In.MouseY)
-	idx := v.nearestVert(d, wx, wy, 8)
-	if idx < 0 {
-		return false
-	}
-	v.draggingVert = idx
-	d.Sel.selectOne(modeVerts, idx)
-	return true
+	return v.handleDrag(ui, d, &v.draggingVert, modeVerts,
+		func(wx, wy float64) int { return v.nearestVert(d, wx, wy, 8) }, d.MoveVertex)
 }
 
-// handleThingDrag is handleVertexDrag's counterpart for a placed Thing —
-// same grid-snapped drag-while-held shape, moving it via Doc.MoveThing.
+// handleThingDrag is handleVertexDrag's counterpart for a placed Thing.
 func (v *view2d) handleThingDrag(ui *imkit.UI, d *Doc) bool {
-	if v.draggingThing >= 0 {
+	return v.handleDrag(ui, d, &v.draggingThing, modeThings,
+		func(wx, wy float64) int { return v.nearestThing(d, wx, wy, 12) }, d.MoveThing)
+}
+
+// handleDrag is the shared grid-snapped drag-while-held body: *dragging is
+// the index being dragged (-1 = none), pick finds the item under a world
+// point (-1 = none), move applies a new position.
+func (v *view2d) handleDrag(ui *imkit.UI, d *Doc, dragging *int, mode editMode,
+	pick func(wx, wy float64) int, move func(idx int, x, y int16) bool) bool {
+	if *dragging >= 0 {
 		if ui.In.LeftDown {
 			wx, wy := v.s2w(ui.In.MouseX, ui.In.MouseY)
 			sx, sy := v.snap(d, wx, wy)
-			d.MoveThing(v.draggingThing, int16(sx), int16(sy))
+			move(*dragging, int16(sx), int16(sy))
 			return true
 		}
-		v.draggingThing = -1
+		*dragging = -1
 		return true
 	}
 	if !ui.In.LeftClicked || int(ui.In.MouseY) < v.rect.Y+34 {
 		return false
 	}
-	wx, wy := v.s2w(ui.In.MouseX, ui.In.MouseY)
-	idx := v.nearestThing(d, wx, wy, 12)
+	idx := pick(v.s2w(ui.In.MouseX, ui.In.MouseY))
 	if idx < 0 {
 		return false
 	}
-	v.draggingThing = idx
-	d.Sel.selectOne(modeThings, idx)
+	*dragging = idx
+	d.Sel.selectOne(mode, idx)
 	return true
 }
 
@@ -497,9 +485,7 @@ func (v *view2d) commitRoom(d *Doc, bank *Bank, pnl *panelState) {
 	})
 
 	vbase := len(lvl.Vertexes)
-	for _, p := range v.draft {
-		lvl.Vertexes = append(lvl.Vertexes, p)
-	}
+	lvl.Vertexes = append(lvl.Vertexes, v.draft...)
 	for i := 0; i < n; i++ {
 		a := vbase + i
 		b := vbase + (i+1)%n

@@ -19,9 +19,15 @@ type VoxelInstance struct {
 	Model      *assets.VoxelModel
 	X, Y, Z    float32 // thing centre (X,Y) and feet (Z), map units
 	Yaw        float32 // radians — thing facing + VOXELDEF AngleOffset + KVX front bias
-	Scale      float32 // map units per voxel (config voxelScale * VOXELDEF Scale)
+	Scale      float32 // map units per voxel (config modelScale * VOXELDEF Scale)
 	Light      float32 // sector light 0..1 (sprite shading)
 	FullBright bool
+	// Alpha in (0,1) draws the model as translucent glass at that opacity
+	// (the powerup spheres — engine/renderstyle.go); 0 = solid.
+	Alpha float32
+	// Sector is the sector the thing stands in, plus one (0 = unknown) —
+	// Vert.Sector's meaning, so dynamic lights that can't reach it skip it.
+	Sector uint16
 }
 
 // VoxelPackedVertexSize is one voxel-mesh vertex: vec3 position + vec3
@@ -67,7 +73,7 @@ var voxFaceNeighbour = [6][3]int{{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {
 // visible surface (little-endian: 3 float32 position, 3 float32 normal, 4
 // bytes RGBA). Model space: 1 unit = 1 voxel, X/Y offset by the KVX pivot,
 // Z = (ZPivot-(z+0.5)) so it grows up from the thing's feet — the exact
-// frame raster/voxel.go's localX/localY/hz use before scaling by voxelScale
+// frame raster/voxel.go's localX/localY/hz use before scaling by modelScale
 // (the backend's model matrix applies that scale).
 //
 // KVX stores only the model's shell (fully-interior voxels are omitted), so

@@ -136,7 +136,6 @@ func parseHFrames(spec string) []hFrame {
 // hereticActorDef is one monster's full behaviour + data.
 type hereticActorDef struct {
 	name           string
-	doomednum      int
 	sprite         string
 	health         int
 	radius, height float64

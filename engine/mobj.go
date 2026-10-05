@@ -24,6 +24,24 @@ type Mobj struct {
 	// only; nothing in the simulation reads them.
 	prevX, prevY, prevZ, prevAngle float64
 
+	// glideX..glideAng is the part of a walking monster's last A_Chase step
+	// not yet shown on screen, spread over glideTics tics (glideAge of them
+	// gone) — see beginStepGlide in interp.go. Presentation only.
+	glideX, glideY, glideZ, glideAng float64
+	glideTics, glideAge              int
+
+	// Rendered imp / cacodemon fireball (impfireball.go): fxTimer paces its ember
+	// trail, fxPhase desyncs its flicker from other balls', directHit is
+	// the thing it struck squarely (spared the splash).
+	fxTimer   float64
+	fxPhase   int
+	directHit *Mobj
+
+	// mobjFloorCeil's cache: the sector at (zcX, zcY), valid while zcValid.
+	zcX, zcY float64
+	zcSec    int32
+	zcValid  bool
+
 	Type     mobjType
 	Info     *MobjInfo
 	Health   int
@@ -36,6 +54,7 @@ type Mobj struct {
 	State      stateNum
 	stateDef   *State
 	Tics       int
+	stateTics  int // what Tics started at in this state (a death's random trim included) — model frame blending
 	Sprite     spriteNum
 	Frame      int
 	Fullbright bool
@@ -70,6 +89,13 @@ type Mobj struct {
 	MoveCount    int
 	ReactionTime int
 	Threshold    int
+
+	// Roaming (roam.go): roaming is set while an unalerted monster walks a
+	// trip (its see state, no Target); roam is that trip's route; roamReadyAt
+	// is the levelTime its idle pause ends (0 = not yet scheduled).
+	roaming     bool
+	roam        *roamRoute
+	roamReadyAt int
 
 	// TeleportFreeze counts down from teleportFreezeTics after this mobj
 	// lands on a teleporter (evTeleport), ticking to 0 in mobjTick. While
@@ -141,6 +167,23 @@ func (g *Game) sectorFloorCeil(x, y float64) (floor, ceil float64) {
 	return -32768, 32768
 }
 
+// mobjFloorCeil is sectorFloorCeil at mo's position, remembering which
+// sector that is (mo.zcSec) until mo moves — most grounded things (items,
+// decorations, corpses) never do, so their per-tic z-clip skips the BSP
+// walk. The heights themselves are read fresh: the sector's floor may be
+// moving under a still thing.
+func (g *Game) mobjFloorCeil(mo *Mobj) (floor, ceil float64) {
+	if !mo.zcValid || mo.zcX != mo.X || mo.zcY != mo.Y {
+		mo.zcSec = int32(bsp.PointSectorIndex(g.BSP, g.Level, float32(mo.X), float32(mo.Y)))
+		mo.zcX, mo.zcY, mo.zcValid = mo.X, mo.Y, true
+	}
+	if mo.zcSec < 0 || int(mo.zcSec) >= len(g.Level.Sectors) {
+		return -32768, 32768
+	}
+	sec := &g.Level.Sectors[mo.zcSec]
+	return sec.FloorZAt(mo.X, mo.Y), sec.CeilZAt(mo.X, mo.Y)
+}
+
 // P_SpawnMobj creates a mobj of type typ at (x, y, z). z may be onFloorZ or
 // onCeilingZ. The mobj is appended to g.mobjs and returned.
 func (g *Game) P_SpawnMobj(x, y, z float64, typ mobjType) *Mobj {
@@ -167,6 +210,9 @@ func (g *Game) P_SpawnMobj(x, y, z float64, typ mobjType) *Mobj {
 	// Seed the interpolation snapshot so the first frame draws it where it
 	// spawned, not lerping in from the origin.
 	mo.prevX, mo.prevY, mo.prevZ, mo.prevAngle = mo.X, mo.Y, mo.Z, mo.Angle
+	if typ == MT_SKULL {
+		mo.fxPhase = fxRand.Intn(64) // desync its fire light's flicker (lostsoulfire.go)
+	}
 
 	// Enter the spawn state (runs its action, if any). A type with no spawn
 	// state (S_NULL) is an inert position marker — e.g. a teleport landing
@@ -205,6 +251,7 @@ func (g *Game) setMobjState(mo *Mobj, st stateNum) bool {
 		mo.State = st
 		mo.stateDef = sd
 		mo.Tics = sd.Tics
+		mo.stateTics = sd.Tics
 		mo.Sprite = sd.Sprite
 		mo.Frame = sd.Frame
 		mo.Fullbright = sd.fullbright
@@ -233,6 +280,7 @@ func (g *Game) mobjTick(mo *Mobj) {
 	// Snapshot the pre-move state for this tic so the renderer can draw
 	// between it and wherever this tic leaves the mobj (see interp.go).
 	mo.prevX, mo.prevY, mo.prevZ, mo.prevAngle = mo.X, mo.Y, mo.Z, mo.Angle
+	mo.ageStepGlide()
 
 	if mo.TeleportFreeze > 0 {
 		mo.TeleportFreeze--
@@ -296,7 +344,7 @@ func (g *Game) mobjZClip(mo *Mobj) {
 	if mo.Flags&(MF_NOGRAVITY|MF_SPAWNCEILING) != 0 {
 		return
 	}
-	floor, ceil := g.sectorFloorCeil(mo.X, mo.Y)
+	floor, ceil := g.mobjFloorCeil(mo)
 	mo.FloorZ, mo.CeilingZ = floor, ceil
 	mo.Z = floor
 	// A ceiling that has dropped below the thing's head (a crusher, or a
@@ -360,6 +408,7 @@ func (g *Game) moveMissile(mo *Mobj) {
 			base = mo.hDamage
 		}
 		g.pDamageMobj(hit, mo, mo.Target, (pRandom()%8+1)*base)
+		mo.directHit = hit
 		g.explodeMissile(mo)
 		return
 	}
@@ -410,6 +459,9 @@ func (g *Game) explodeMissile(mo *Mobj) {
 	}
 	mo.MomX, mo.MomY, mo.MomZ = 0, 0, 0
 	mo.Flags &^= MF_MISSILE
+	if fb := g.renderedFireball(mo); fb != nil {
+		g.fireballImpact(mo, fb) // burst + splash damage
+	}
 	if mo.Info.DeathSound != "" {
 		g.playSound(mo.Info.DeathSound)
 	}
@@ -543,37 +595,12 @@ func (g *Game) runTic() {
 		}
 	}
 	g.mobjs = alive
+	g.trackLiveSectors()
 }
 
 // voxelKVXFrontBias backs a KVX model's built-in "front" a quarter turn to
 // line up with a Doom thing's facing.
 const voxelKVXFrontBias = -math.Pi / 2
-
-// worldGeomChanged reports whether any sector's floor or ceiling height has
-// moved since the last call, refreshing the snapshot. HardwareMode uses it
-// to decide when the cached static level geometry needs rebuilding — a rare
-// event (a door/lift mid-travel), so the rest of the time the GPU just
-// re-draws the unchanged device-local buffer. Returns false on the first
-// call / after a level change (WorldBuilder was just built fresh).
-func (g *Game) worldGeomChanged() bool {
-	secs := g.Level.Sectors
-	if len(g.geomHeights) != len(secs)*2 {
-		g.geomHeights = make([]int16, len(secs)*2)
-		for i := range secs {
-			g.geomHeights[i*2], g.geomHeights[i*2+1] = secs[i].FloorHeight, secs[i].CeilingHeight
-		}
-		return false
-	}
-	changed := false
-	for i := range secs {
-		f, c := secs[i].FloorHeight, secs[i].CeilingHeight
-		if g.geomHeights[i*2] != f || g.geomHeights[i*2+1] != c {
-			g.geomHeights[i*2], g.geomHeights[i*2+1] = f, c
-			changed = true
-		}
-	}
-	return changed
-}
 
 // collectWorldObjects resolves every live map object and in-flight
 // projectile for the hardware-geometry path: a voxel-model instance where
@@ -586,12 +613,14 @@ func (g *Game) worldGeomChanged() bool {
 func (g *Game) collectWorldObjects() ([]worldgeo.Sprite, []worldgeo.VoxelInstance) {
 	sprites := g.hwSprites[:0]
 	voxels := g.hwVoxels[:0]
+	g.hwModels = g.hwModels[:0]
+	g.hwAddSprites = g.hwAddSprites[:0]
 	cx, cy := g.Camera.X, g.Camera.Y
 	fov := g.Camera.FOVDeg
 	if fov <= 0 {
 		fov = 90
 	}
-	// viewCam feeds worldgeo.LightVisible's same generous cone test
+	// cone is the same generous view-cone test
 	// UpdateVisibility uses to cull geometry cells and DrawWorld uses to
 	// cull lights — reused here for things/projectiles rather than
 	// inventing a third culling test. mobjSightRadius covers the largest
@@ -599,9 +628,9 @@ func (g *Game) collectWorldObjects() ([]worldgeo.Sprite, []worldgeo.VoxelInstanc
 	// 160u margin), wide enough that nothing actually on screen is at risk
 	// of being cut.
 	const mobjSightRadius = 160.0
-	viewCam := worldgeo.Camera{X: cx, Y: cy, Angle: g.Camera.Angle, FOVDeg: fov}
+	cone := worldgeo.NewViewCone(worldgeo.Camera{X: cx, Y: cy, Angle: g.Camera.Angle, FOVDeg: fov})
 	frac := g.renderLerp()
-	vscale := g.VoxelScale
+	vscale := g.ModelScale
 	if vscale <= 0 {
 		vscale = 1
 	}
@@ -610,7 +639,7 @@ func (g *Game) collectWorldObjects() ([]worldgeo.Sprite, []worldgeo.VoxelInstanc
 		if mo.State == S_NULL {
 			continue
 		}
-		if !worldgeo.LightVisible(viewCam, mo.X, mo.Y, mobjSightRadius) {
+		if !cone.Visible(mo.X, mo.Y, mobjSightRadius) {
 			continue // outside the (widened) view cone
 		}
 		if g.explosionParticles && mo.Type == MT_BARREL && mo.State >= S_BEXP1 && mo.State <= S_BEXP5 {
@@ -622,32 +651,22 @@ func (g *Game) collectWorldObjects() ([]worldgeo.Sprite, []worldgeo.VoxelInstanc
 		}
 		name := mobjSpriteName(mo)
 		ix, iy, iz, iang := mo.renderState(frac)
-		if g.Voxels != nil {
-			if model, angOff, mscale, ok := g.Voxels.Model(name, mo.Frame); ok && model != nil {
-				if mscale <= 0 {
-					mscale = 1
-				}
-				voxels = append(voxels, worldgeo.VoxelInstance{
-					Model: model,
-					X:     float32(ix), Y: float32(iy), Z: float32(iz),
-					Yaw:        float32(iang + angOff*math.Pi/180 + voxelKVXFrontBias),
-					Scale:      float32(vscale * mscale),
-					Light:      float32(g.spriteSectorLight(ix, iy)) / 255,
-					FullBright: mo.Fullbright,
-				})
-				if g.heretic {
-					if f, ok := g.hereticFlameFor(name, model, ix, iy, iz, vscale*mscale, g.renderClock); ok {
-						voxels = append(voxels, f)
-					}
-				}
-				continue // the voxel model replaces the billboard
-			}
+		if fb := g.renderedFireball(mo); fb != nil {
+			g.appendFireballSprites(mo, fb, ix, iy, iz) // procedural, not BAL1/BAL2 (impfireball.go)
+			continue
+		}
+		if g.appendMobjVoxel(mo, name, ix, iy, iz, iang, vscale, &voxels, true) {
+			continue // a voxel model, or a voxel-only map object with none — never a billboard
 		}
 		sp, flip, lift, ok := g.Raster.ThingSprite(g.Camera, ix, iy, iang, name, mo.Frame)
 		if !ok {
 			continue
 		}
-		sprites = append(sprites, worldgeo.Sprite{
+		dst := &sprites
+		if mobjAddAlpha(mo) > 0 {
+			dst = &g.hwAddSprites // the additive billboard pass (renderstyle.go)
+		}
+		*dst = append(*dst, worldgeo.Sprite{
 			X: float32(ix), Y: float32(iy), Z: float32(iz),
 			Lift: float32(lift), SizeMul: 1,
 			Tex:        sp,
@@ -657,7 +676,7 @@ func (g *Game) collectWorldObjects() ([]worldgeo.Sprite, []worldgeo.VoxelInstanc
 		})
 	}
 	for _, p := range g.projectiles {
-		if !worldgeo.LightVisible(viewCam, p.X, p.Y, mobjSightRadius) {
+		if !cone.Visible(p.X, p.Y, mobjSightRadius) {
 			continue // outside the (widened) view cone — this loop had no cull at all before
 		}
 		if p.exploding && g.explosionParticles {
@@ -671,12 +690,19 @@ func (g *Game) collectWorldObjects() ([]worldgeo.Sprite, []worldgeo.VoxelInstanc
 		if !ok {
 			continue
 		}
+		if g.appendProjectileModel(p, name) {
+			continue // drawn as its 3D model
+		}
 		sp, ok := g.Raster.Textures().Sprite(name)
 		if !ok || sp == nil {
 			continue
 		}
 		// Projectiles / explosions glow — emissive, full bright, no rotations.
-		sprites = append(sprites, worldgeo.Sprite{
+		dst := &sprites
+		if projectileAddAlpha(p) > 0 {
+			dst = &g.hwAddSprites
+		}
+		*dst = append(*dst, worldgeo.Sprite{
 			X: float32(p.X), Y: float32(p.Y), Z: float32(p.Z),
 			Lift: 0, SizeMul: float32(p.SizeMultiplier()),
 			Tex:        sp,

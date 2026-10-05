@@ -51,6 +51,16 @@ type App struct {
 	// mid-draw — includes toggling fullscreen, which tears down and
 	// recreates the window/renderer)
 	pending func()
+
+	// saving is non-nil while a Save's real-3D conversion runs in the
+	// background (textures, weapons and voxels take several seconds); the
+	// frame loop picks up its result (see pollSave).
+	saving chan saveResult
+}
+
+type saveResult struct {
+	msg string
+	err error
 }
 
 // emptyWorldGeom is fed to DrawWorld while no WAD is loaded (a.doc == nil).
@@ -258,6 +268,7 @@ func (a *App) toggleFullscreen() {
 }
 
 func (a *App) frame(dt float64) {
+	a.pollSave()
 	c := a.cv
 	c.Fill(imkit.Theme.Background)
 	full := imkit.Rect{X: 0, Y: 0, W: c.W, H: c.H}
@@ -320,7 +331,7 @@ func (a *App) drawMenus() {
 		{Label: "New level", Shortcut: "Ctrl+N", Disabled: a.bank == nil},
 		{Label: "Reload map", Shortcut: "Ctrl+R", Disabled: a.doc == nil || a.doc.WAD == nil},
 		{Label: ""},
-		{Label: "Save map as PWAD", Shortcut: "Ctrl+S", Disabled: a.doc == nil},
+		{Label: "Save map as 3D WAD", Shortcut: "Ctrl+S", Disabled: a.doc == nil || a.saving != nil},
 		{Label: "Play this map", Shortcut: "F5", Disabled: a.doc == nil},
 		{Label: ""},
 		{Label: "Quit", Shortcut: "Ctrl+Q"},
@@ -438,14 +449,47 @@ func (a *App) setDoc(d *Doc) {
 	a.v3.reset()
 }
 
+// saveMap saves the map as a real-3D WAD — the only thing the editor
+// saves. The map is written out immediately; the conversion (ramps,
+// embedded textures, all three arsenals, baked voxels) then runs in the
+// background so editing carries on, and pollSave reports the result.
 func (a *App) saveMap() {
+	if a.saving != nil {
+		return // one save at a time
+	}
 	p := a.doc.DefaultSavePath()
-	if err := a.doc.SavePWAD(p); err != nil {
+	finish, err := a.doc.BeginSave(p)
+	if err != nil {
 		a.status = "save failed: " + err.Error()
 		return
 	}
-	a.status = "saved  " + p
-	log.Printf("editor: saved %s", p)
+	done := make(chan saveResult, 1)
+	a.saving = done
+	a.status = "saving 3D WAD " + p + " — building ramps, textures, weapons and voxels..."
+	go func() {
+		msg, err := finish()
+		done <- saveResult{msg, err}
+	}()
+}
+
+// pollSave collects a finished background save's result into the status
+// bar. Called once per frame.
+func (a *App) pollSave() {
+	if a.saving == nil {
+		return
+	}
+	select {
+	case r := <-a.saving:
+		a.saving = nil
+		if r.err != nil {
+			a.status = "save failed: " + r.err.Error()
+			log.Printf("editor: save failed: %v", r.err)
+			return
+		}
+		a.status = r.msg
+		log.Printf("editor: %s", r.msg)
+	default:
+	}
 }
 
 func (a *App) playMap() {

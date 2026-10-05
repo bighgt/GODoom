@@ -50,6 +50,7 @@ func (combatSystem) Update(g *Game, dt float32) {
 		// (hidden) viewmodel animation settle.
 		g.updateWeapon(float64(dt))
 		g.updateProjectiles(float64(dt))
+		g.updateMobjFire(float64(dt))
 		g.updateParticles(float64(dt))
 		g.updateLiquidAmbience(float64(dt))
 		g.updateTeleportAmbience(float64(dt))
@@ -91,6 +92,7 @@ func (combatSystem) Update(g *Game, dt float32) {
 	}
 	g.updateWeapon(float64(dt))
 	g.updateProjectiles(float64(dt))
+	g.updateMobjFire(float64(dt))
 	g.updateParticles(float64(dt))
 	g.updateLiquidAmbience(float64(dt))
 	g.updateTeleportAmbience(float64(dt))

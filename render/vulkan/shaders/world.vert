@@ -14,7 +14,8 @@
 layout(location = 0) in vec3 inPos;    // world, map units, Z up
 layout(location = 1) in vec2 inUV;     // texture tiles (REPEAT sampler)
 layout(location = 2) in float inLight; // sector light 0..1 (fake contrast folded in for walls)
-layout(location = 3) in uint inKind;   // 0 wall, 1 masked, 2 flat, 3 sky, 4 sprite, 5 sprite-full
+layout(location = 3) in uint inKind;   // low 16 bits: kind (0 wall, 1 masked, 2 flat, 3 sky, 4 sprite, ...);
+                                       // high 16 bits: the surface's sector + 1 (0 = none), see vSector
 layout(location = 4) in vec3 inNormal; // unit world-space surface normal (dynamic-light Lambert)
 layout(location = 5) in float inAlpha; // KindSpriteTrans's real blend weight; ignored by every other kind
 
@@ -29,13 +30,15 @@ layout(location = 3) out float vDepth;
 layout(location = 4) out vec3 vWorldPos; // for per-fragment dynamic point lights
 layout(location = 5) out vec3 vNormal;
 layout(location = 6) out float vAlpha;
+layout(location = 7) out flat uint vSector; // sector + 1 (0 = none) — which dynamic lights may reach it
 
 void main() {
     vec4 clip = pc.viewProj * vec4(inPos, 1.0);
     gl_Position = clip;
     vUV = inUV;
     vLight = inLight;
-    vKind = inKind;
+    vKind = inKind & 0xFFFFu;
+    vSector = inKind >> 16;
     vDepth = clip.w;
     vWorldPos = inPos;
     vNormal = inNormal;

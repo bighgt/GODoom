@@ -124,6 +124,9 @@ func runHeadless(path, cameraMode string) error {
 		log.Printf("isoengine: %s is a patch WAD — merging base IWAD %s", filepath.Base(path), loaded.IWADPath)
 	}
 	w := loaded.WAD
+	if err := wad.CheckPlayable(w, filepath.Base(path)); err != nil {
+		return err
+	}
 
 	maps := w.ListMaps()
 	if len(maps) == 0 {
@@ -153,6 +156,10 @@ func runHeadless(path, cameraMode string) error {
 // track — mirrors cmd/engine's own playSession exactly (see its doc
 // comment).
 func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio.Device, music *audio.MusicPlayer, cameraMode string) error {
+	// Only real-3D WADs (cmd/wad3d output, with baked voxels) are playable.
+	if err := wad.CheckPlayable(w, filepath.Base(path)); err != nil {
+		return err
+	}
 	level, err := w.LoadLevel(mapName)
 	if err != nil {
 		return fmt.Errorf("load level %s: %w", mapName, err)
@@ -165,6 +172,9 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 	if err != nil {
 		return fmt.Errorf("index textures: %w", err)
 	}
+	if d := w.DescribeTPF3D(); d != "" {
+		log.Printf("isoengine: %s", d)
+	}
 
 	// config's switchWeapons: play with the other game's arsenal — see
 	// engine.NewGame for the table swap; here for the cross-game sprites.
@@ -174,6 +184,8 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 			altWAD = ow
 			textures.SetSpriteFallback(ow)
 			log.Printf("isoengine: switchWeapons — weapon art/sounds from %s", filepath.Base(op))
+		} else if textures.EmbeddedSpriteCount() > 0 {
+			log.Printf("isoengine: switchWeapons — weapon art/sounds from this WAD's embedded weapon set")
 		} else {
 			log.Printf("isoengine: switchWeapons on, but the other game's IWAD wasn't found — the arsenal still swaps, art may be blank")
 		}
@@ -232,7 +244,9 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 		music.SetVolume(cfg.MusicVolume)
 		audio.PlayLevelMusic(w, music, game.MapMusicLump(mapName), mapName, "isoengine")
 	}
-	loadVoxels(game, mapName, cfg)
+	if err := loadVoxels(game, cfg); err != nil {
+		return err
+	}
 
 	ctl := newCameraController(worldgeo.IsoCamera{
 		TargetX: cam.X, TargetY: cam.Y, TargetZ: cam.Z,
@@ -331,34 +345,21 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 	return nil
 }
 
-// loadVoxels mirrors cmd/engine/main.go's own voxel-pack loading (cfg.Voxels
-// gate, Doom1_Voxel.pk3 vs Doom2_Voxel.pk3 picked by map name): when active,
-// engine.CollectIsoWorldObjects already prefers a voxel model over a sprite
-// billboard for any thing that has one (see its own doc comment) — nothing
-// else about the iso game loop needs to know voxels are in play. Meshing/
-// GPU upload happens lazily, the first time a given model comes into view
-// (render/vulkan's isoworld.go syncIsoVoxelMeshes), rather than warmed up
-// front the way cmd/engine's hardware path does — see that function's doc
-// comment on the trade-off.
-func loadVoxels(game *engine.Game, mapName string, cfg config.Config) {
-	if !cfg.Voxels {
-		return
-	}
-	pk3 := "Doom1_Voxel.pk3"
-	switch {
-	case game.WAD.IsHeretic():
-		pk3 = "reikallhereticvoxels.pk3"
-	case strings.HasPrefix(mapName, "MAP"):
-		pk3 = "Doom2_Voxel.pk3"
-	}
-	vs, err := assets.LoadVoxelPackDir(pk3)
+// loadVoxels loads the voxel models baked into the real-3D WAD (TPFVOXEL —
+// see assets.LoadVoxelsFromWAD; map objects are voxel-only, and never read
+// from disk). engine.CollectIsoWorldObjects draws every map object from
+// them. Meshing/GPU upload happens lazily, the first time a given model
+// comes into view (render/vulkan's isoworld.go syncIsoVoxelMeshes), rather
+// than warmed up front the way cmd/engine's hardware path does.
+func loadVoxels(game *engine.Game, cfg config.Config) error {
+	vs, packs, err := assets.LoadVoxelsFromWAD(game.WAD)
 	if err != nil {
-		log.Printf("isoengine: voxel models unavailable (%v) — using sprites", err)
-		return
+		return fmt.Errorf("isoengine: voxel models: %w — convert the original WAD again with %s", err, wad.ConvertTool)
 	}
 	game.Voxels = vs
-	game.VoxelScale = cfg.VoxelScale
-	log.Printf("isoengine: voxel models active — %s, %d sprite frames", pk3, vs.Frames())
+	game.ModelScale = cfg.ModelScale
+	log.Printf("isoengine: voxel models — %s, %d sprite frames (map objects are voxel-only)", strings.Join(packs, " + "), vs.Frames())
+	return nil
 }
 
 // playerViewerDist mirrors engine.isoViewerDist: how far along -camAzimuth

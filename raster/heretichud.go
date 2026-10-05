@@ -62,9 +62,6 @@ func (r *Renderer) DrawHereticStatusBar(ps HUDStats) {
 	}
 }
 
-// heretic key icon names, exposed for tests.
-var hereticKeyIcons = [3]string{"BKEYICON", "YKEYICON", "GKEYICON"}
-
 // hereticAmmoIcons is the pickup sprite shown next to the ready-ammo count,
 // indexed by Heretic ammo type (see engine hgAmmo*): 0 wand crystals,
 // 1 ethereal arrows, 2 claw orbs, 3 hellstaff runes, 4 flame orbs,

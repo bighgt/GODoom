@@ -7,9 +7,10 @@ import (
 	"strings"
 
 	"twopointfive/assets"
+	"twopointfive/wad"
 )
 
-// ListWADs returns every *.wad/*.WAD file directly inside the discovered
+// ListWADs returns every real-3D *.wad/*.WAD file directly inside the discovered
 // wad/ directory (non-recursive — a mods/ or import/ subfolder under it
 // isn't meant to be picked directly), sorted case-insensitively, for the
 // launcher's quick-pick list. Never an error: nothing found just means an
@@ -33,7 +34,14 @@ func ListWADs() []string {
 		if e.IsDir() || !strings.EqualFold(filepath.Ext(e.Name()), ".wad") {
 			continue
 		}
-		out = append(out, filepath.Join(dir, e.Name()))
+		// Only real-3D WADs are playable (wad.CheckPlayable) — list just
+		// those. PeekTPF3D reads the directory alone, so a folder of large
+		// converted WADs stays cheap to scan.
+		p := filepath.Join(dir, e.Name())
+		if ok, _ := wad.PeekTPF3D(p); !ok {
+			continue
+		}
+		out = append(out, p)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return strings.ToLower(filepath.Base(out[i])) < strings.ToLower(filepath.Base(out[j]))

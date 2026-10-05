@@ -32,6 +32,8 @@ import (
 	"strings"
 
 	xdraw "golang.org/x/image/draw"
+
+	"twopointfive/assets/imgdec"
 )
 
 //go:embed mapping.txt
@@ -182,7 +184,7 @@ func readTGAFromZip(f *zip.File) (*image.NRGBA, error) {
 		return nil, err
 	}
 	defer rc.Close()
-	return decodeTGA(rc)
+	return imgdec.DecodeTGA(rc)
 }
 
 // capLongestEdge returns src unchanged if it already fits within max on

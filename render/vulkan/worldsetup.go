@@ -113,33 +113,10 @@ func (r *Renderer) wHostBuffer(size int, usage vk.BufferUsageFlags) (vk.Buffer, 
 	return buf, mem, p, nil
 }
 
+// worldCreateSamplers builds the clamp and depth samplers; the texture
+// sampler belongs to texResidency (initTexResidency).
 func (r *Renderer) worldCreateSamplers() error {
 	wr := r.wr
-
-	texInfo := vk.SamplerCreateInfo{
-		SType:        vk.StructureTypeSamplerCreateInfo,
-		MagFilter:    vk.FilterLinear,
-		MinFilter:    vk.FilterLinear,
-		MipmapMode:   vk.SamplerMipmapModeLinear,
-		AddressModeU: vk.SamplerAddressModeRepeat,
-		AddressModeV: vk.SamplerAddressModeRepeat,
-		AddressModeW: vk.SamplerAddressModeRepeat,
-		MinLod:       0,
-		MaxLod:       vk.LodClampNone,
-	}
-	if r.maxAnisotropy >= 2 {
-		a := r.maxAnisotropy
-		if a > 16 {
-			a = 16
-		}
-		texInfo.AnisotropyEnable = vk.True
-		texInfo.MaxAnisotropy = a
-	}
-	var texSamp vk.Sampler
-	if res := vk.CreateSampler(r.device, &texInfo, nil, &texSamp); res != vk.Success {
-		return fmt.Errorf("vulkan: world texture sampler: %s", vk.Error(res))
-	}
-	wr.texSampler = texSamp
 
 	clampInfo := vk.SamplerCreateInfo{
 		SType:        vk.StructureTypeSamplerCreateInfo,
@@ -393,25 +370,6 @@ func (r *Renderer) worldCreateOffscreen() error {
 	return nil
 }
 
-// worldCreateDummyTex builds the 1x1 black fallback brightmap. (Formerly
-// also built the two vanilla-LUT images world.frag sampled its sector fade
-// from; that fade is now the continuous formula in fade() — see world.frag
-// — so the LUTs and their upload path were dead weight and were removed.)
-func (r *Renderer) worldCreateDummyTex() error {
-	wr := r.wr
-
-	// 1x1 black dummy — bound to set-0 binding 1 for any texture that has no
-	// brightmap, so world.frag can sample uBright unconditionally.
-	dummy, err := r.wMakeImage(1, 1, vk.FormatR8g8b8a8Unorm,
-		vk.ImageUsageFlags(vk.ImageUsageTransferDstBit)|vk.ImageUsageFlags(vk.ImageUsageSampledBit),
-		vk.ImageAspectFlags(vk.ImageAspectColorBit), 1)
-	if err != nil {
-		return err
-	}
-	wr.dummyTex = dummy
-	return r.uploadImagePixels(dummy.image, 1, 1, []byte{0, 0, 0, 255}, vk.ImageLayoutShaderReadOnlyOptimal)
-}
-
 func (r *Renderer) worldCreateBuffers() error {
 	wr := r.wr
 	ovBytes := wr.w * wr.h * 4
@@ -421,6 +379,9 @@ func (r *Renderer) worldCreateBuffers() error {
 		sl := &wr.slots[i]
 		var err error
 		if sl.ubo, sl.uboMem, sl.uboMapped, err = r.wHostBuffer(worldUBOFloats*4, vk.BufferUsageFlags(vk.BufferUsageUniformBufferBit)); err != nil {
+			return err
+		}
+		if sl.reach, sl.reachMem, sl.reachMapped, err = r.wHostBuffer(worldMaxLights*lightReachStride*4, vk.BufferUsageFlags(vk.BufferUsageStorageBufferBit)); err != nil {
 			return err
 		}
 		if sl.vbuf, sl.vbufMem, sl.vbufMapped, err = r.wHostBuffer(initVbuf, vk.BufferUsageFlags(vk.BufferUsageVertexBufferBit)); err != nil {
@@ -442,18 +403,6 @@ func (r *Renderer) worldCreateBuffers() error {
 
 func (r *Renderer) worldCreateDescriptorLayouts() error {
 	wr := r.wr
-	mk := func(b []vk.DescriptorSetLayoutBinding) (vk.DescriptorSetLayout, error) {
-		info := vk.DescriptorSetLayoutCreateInfo{
-			SType:        vk.StructureTypeDescriptorSetLayoutCreateInfo,
-			BindingCount: uint32(len(b)),
-			PBindings:    b,
-		}
-		var l vk.DescriptorSetLayout
-		if res := vk.CreateDescriptorSetLayout(r.device, &info, nil, &l); res != vk.Success {
-			return nil, fmt.Errorf("vulkan: world dsl: %s", vk.Error(res))
-		}
-		return l, nil
-	}
 	uboBinding := vk.DescriptorSetLayoutBinding{
 		Binding: 2, DescriptorType: vk.DescriptorTypeUniformBuffer, DescriptorCount: 1,
 		StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
@@ -465,20 +414,23 @@ func (r *Renderer) worldCreateDescriptorLayouts() error {
 		StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
 	}
 	var err error
-	if wr.dsl0, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0), samplerBinding(1)}); err != nil {
-		return err
-	}
-	// Bindings 0/1 used to be the two dead vanilla-LUT samplers (see
-	// worldCreateDummyTex's comment) — now reused for uShadowCube0/1 (world
-	// UBO stays at its existing binding 2, so voxel.frag, which shares this
-	// exact layout bound at its own set 0 and never declares either
+	// (dsl0, the per-texture set, is texResidency's — initTexResidency.)
+	// Bindings 0/1 used to be the two dead vanilla-LUT samplers — now
+	// reused for uShadowCube0/1 (world UBO stays at its existing binding
+	// 2, so voxel.frag, which shares this exact layout bound at its own
+	// set 0 and never declares either
 	// sampler, needed no renumbering). Always present (not gated on
 	// wr.realShadows): every allocated set1 gets a real cube view when
 	// realShadows is on, or wr.dummyShadowCube's view otherwise — see
 	// worldCreateDescriptors — so the binding is always legal even though
 	// world.frag only ever actually samples it when the UBO's shadow count
 	// says to.
-	if wr.dsl1, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0), samplerBinding(1), uboBinding}); err != nil {
+	// Binding 3: the per-light sector-reach bitsets (worldSlot.reach).
+	reachBinding := vk.DescriptorSetLayoutBinding{
+		Binding: 3, DescriptorType: vk.DescriptorTypeStorageBuffer, DescriptorCount: 1,
+		StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+	}
+	if wr.dsl1, err = r.newDescriptorSetLayout("world", samplerBinding(0), samplerBinding(1), uboBinding, reachBinding); err != nil {
 		return err
 	}
 	// present blit: uScene (HDR — only .a read now), uBloom (unused by
@@ -486,12 +438,12 @@ func (r *Renderer) worldCreateDescriptorLayouts() error {
 	// allocated/written below rather than reshaping this pool's arithmetic
 	// — see worldCreateDescriptors' own "GOTCHA that bit twice" note),
 	// uOverlay, uDepth (world pass D32), world UBO
-	if wr.dslBlit, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0), samplerBinding(1), samplerBinding(2), samplerBinding(3), uboBindingBlit}); err != nil {
+	if wr.dslBlit, err = r.newDescriptorSetLayout("world", samplerBinding(0), samplerBinding(1), samplerBinding(2), samplerBinding(3), uboBindingBlit); err != nil {
 		return err
 	}
 	if wr.waterRefraction {
 		// waterrefract.frag set 2: uPreWaterColor, uPreWaterDepth.
-		if wr.dslWaterCapture, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0), samplerBinding(1)}); err != nil {
+		if wr.dslWaterCapture, err = r.newDescriptorSetLayout("world", samplerBinding(0), samplerBinding(1)); err != nil {
 			return err
 		}
 	}
@@ -514,8 +466,10 @@ func (r *Renderer) worldCreateDescriptors() error {
 	framePoolInfo := vk.DescriptorPoolCreateInfo{
 		SType:         vk.StructureTypeDescriptorPoolCreateInfo,
 		MaxSets:       uint32(2*maxFramesInFlight + waterCaptureSets), // set1 + setBlit (+ setWaterCapture) per slot
-		PoolSizeCount: 2,
+		PoolSizeCount: 3,
 		PPoolSizes: []vk.DescriptorPoolSize{
+			// per slot: set1's light-reach storage buffer; +1 slack.
+			{Type: vk.DescriptorTypeStorageBuffer, DescriptorCount: uint32(maxFramesInFlight + 1)},
 			// per slot: set1 = 2 samplers (uShadowCube0/1 — real or dummy,
 			// always bound), setBlit = 4 samplers (scene, bloom, overlay,
 			// depth), setWaterCapture = 2 samplers when built; +2 slack.
@@ -530,46 +484,8 @@ func (r *Renderer) worldCreateDescriptors() error {
 	}
 	wr.framePool = fpool
 
-	// One set-0 per resident texture. Sized for many level loads' worth of
-	// unique wall/flat names (the cache never evicts within a session).
-	const maxTextures = 1024
-	texPoolInfo := vk.DescriptorPoolCreateInfo{
-		SType:   vk.StructureTypeDescriptorPoolCreateInfo,
-		MaxSets: maxTextures,
-		// Each set-0 has 2 combined-image-samplers now (base + brightmap).
-		PoolSizeCount: 1,
-		PPoolSizes:    []vk.DescriptorPoolSize{{Type: vk.DescriptorTypeCombinedImageSampler, DescriptorCount: 2 * maxTextures}},
-	}
-	var tpool vk.DescriptorPool
-	if res := vk.CreateDescriptorPool(r.device, &texPoolInfo, nil, &tpool); res != vk.Success {
-		return fmt.Errorf("vulkan: world texture descriptor pool: %s", vk.Error(res))
-	}
-	wr.texPool = tpool
-
 	alloc := func(pool vk.DescriptorPool, layout vk.DescriptorSetLayout) (vk.DescriptorSet, error) {
-		info := vk.DescriptorSetAllocateInfo{
-			SType:              vk.StructureTypeDescriptorSetAllocateInfo,
-			DescriptorPool:     pool,
-			DescriptorSetCount: 1,
-			PSetLayouts:        []vk.DescriptorSetLayout{layout},
-		}
-		var s vk.DescriptorSet
-		if res := vk.AllocateDescriptorSets(r.device, &info, &s); res != vk.Success {
-			return nil, fmt.Errorf("vulkan: world descriptor set: %s", vk.Error(res))
-		}
-		return s, nil
-	}
-	imgW := func(set vk.DescriptorSet, binding uint32, samp vk.Sampler, view vk.ImageView) vk.WriteDescriptorSet {
-		return vk.WriteDescriptorSet{
-			SType:           vk.StructureTypeWriteDescriptorSet,
-			DstSet:          set,
-			DstBinding:      binding,
-			DescriptorCount: 1,
-			DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
-			PImageInfo: []vk.DescriptorImageInfo{{
-				Sampler: samp, ImageView: view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-			}},
-		}
+		return r.allocDescriptorSet(pool, layout, "world")
 	}
 
 	var writes []vk.WriteDescriptorSet
@@ -587,8 +503,8 @@ func (r *Renderer) worldCreateDescriptors() error {
 				return err
 			}
 			writes = append(writes,
-				imgW(sl.setWaterCapture, 0, wr.clampSampler, sl.preWaterColor.view),
-				imgW(sl.setWaterCapture, 1, wr.depthSampler, sl.preWaterDepth.view),
+				imageWrite(sl.setWaterCapture, 0, wr.clampSampler, sl.preWaterColor.view),
+				imageWrite(sl.setWaterCapture, 1, wr.depthSampler, sl.preWaterDepth.view),
 			)
 		}
 		// uShadowCube0/1: this slot's real cube (when realShadows built it)
@@ -598,8 +514,8 @@ func (r *Renderer) worldCreateDescriptors() error {
 			shadow0, shadow1 = sl.shadowCube[0].cubeView, sl.shadowCube[1].cubeView
 		}
 		writes = append(writes,
-			imgW(sl.set1, 0, wr.depthSampler, shadow0),
-			imgW(sl.set1, 1, wr.depthSampler, shadow1),
+			imageWrite(sl.set1, 0, wr.depthSampler, shadow0),
+			imageWrite(sl.set1, 1, wr.depthSampler, shadow1),
 			vk.WriteDescriptorSet{
 				SType:           vk.StructureTypeWriteDescriptorSet,
 				DstSet:          sl.set1,
@@ -608,10 +524,18 @@ func (r *Renderer) worldCreateDescriptors() error {
 				DescriptorType:  vk.DescriptorTypeUniformBuffer,
 				PBufferInfo:     []vk.DescriptorBufferInfo{{Buffer: sl.ubo, Offset: 0, Range: vk.DeviceSize(worldUBOFloats * 4)}},
 			},
-			imgW(sl.setBlit, 0, wr.clampSampler, sl.scene.view),
-			imgW(sl.setBlit, 1, wr.clampSampler, wr.bloom.mip[0].img.view),
-			imgW(sl.setBlit, 2, wr.clampSampler, sl.ovImg.view),
-			imgW(sl.setBlit, 3, wr.depthSampler, sl.depth.view),
+			vk.WriteDescriptorSet{
+				SType:           vk.StructureTypeWriteDescriptorSet,
+				DstSet:          sl.set1,
+				DstBinding:      3,
+				DescriptorCount: 1,
+				DescriptorType:  vk.DescriptorTypeStorageBuffer,
+				PBufferInfo:     []vk.DescriptorBufferInfo{{Buffer: sl.reach, Offset: 0, Range: vk.DeviceSize(worldMaxLights * lightReachStride * 4)}},
+			},
+			imageWrite(sl.setBlit, 0, wr.clampSampler, sl.scene.view),
+			imageWrite(sl.setBlit, 1, wr.clampSampler, wr.bloom.mip[0].img.view),
+			imageWrite(sl.setBlit, 2, wr.clampSampler, sl.ovImg.view),
+			imageWrite(sl.setBlit, 3, wr.depthSampler, sl.depth.view),
 			vk.WriteDescriptorSet{
 				SType:           vk.StructureTypeWriteDescriptorSet,
 				DstSet:          sl.setBlit,

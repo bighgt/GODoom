@@ -7,7 +7,6 @@ import (
 
 	vk "github.com/goki/vulkan"
 
-	"twopointfive/assets"
 	"twopointfive/render/worldgeo"
 	"twopointfive/window"
 )
@@ -20,11 +19,7 @@ import (
 func NewIso(win *window.Window, srcW, srcH int, vsync, debug bool) (*Renderer, error) {
 	r := &Renderer{win: win, vsync: vsync, debug: debug, iso: true}
 	r.srcWidth, r.srcHeight = srcW, srcH // letterboxViewport reads these
-	r.ir = &isoResources{
-		w: srcW, h: srcH,
-		texCache: make(map[*assets.RGBA]*worldTex),
-		voxCache: make(map[*assets.VoxelModel]*voxelMesh),
-	}
+	r.ir = &isoResources{w: srcW, h: srcH}
 
 	steps := []func() error{
 		r.createInstance,
@@ -41,9 +36,8 @@ func NewIso(win *window.Window, srcW, srcH int, vsync, debug bool) (*Renderer, e
 		r.isoCreateSamplers,
 		r.isoCreateSceneRenderPass,
 		r.isoCreateOffscreen,
-		r.isoCreateDummyTex,
+		func() error { return r.initTexResidency(&r.ir.texResidency, "iso") },
 		r.isoCreateDescriptorLayouts,
-		r.isoCreateTexPool,
 		r.isoCreatePresentDescriptor,
 		r.isoCreateRevealResources,
 		r.isoCreatePipelines,
@@ -57,177 +51,6 @@ func NewIso(win *window.Window, srcW, srcH int, vsync, debug bool) (*Renderer, e
 		}
 	}
 	return r, nil
-}
-
-// syncIsoTextures uploads any bitmap in g (wall/flat/sprite textures + the
-// sky) that isn't resident yet — same shape as worldtex.go's
-// syncWorldTextures, its own texCache instead of wr's.
-func (r *Renderer) syncIsoTextures(g *worldgeo.Geometry) error {
-	ir := r.ir
-	missing := func(t *assets.RGBA) bool { return t != nil && ir.texCache[t] == nil }
-
-	pending := missing(g.Sky)
-	if !pending {
-		for _, t := range g.Textures {
-			if missing(t) {
-				pending = true
-				break
-			}
-		}
-	}
-	if !pending {
-		return nil
-	}
-
-	vk.DeviceWaitIdle(r.device)
-	for i, t := range g.Textures {
-		if !missing(t) {
-			continue
-		}
-		var bright *assets.RGBA
-		if i < len(g.Brightmaps) {
-			bright = g.Brightmaps[i]
-		}
-		if err := r.uploadIsoTexture(t, bright); err != nil {
-			return err
-		}
-	}
-	if missing(g.Sky) {
-		if err := r.uploadIsoTexture(g.Sky, nil); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// uploadIsoTexture makes t resident: a device-local RGBA8 image with a full
-// mip chain and its set-0 descriptor, cached by the bitmap pointer — same
-// shape as worldtex.go's uploadWorldTexture, its own dummyTex/dsl0/texPool/
-// texCache instead of wr's. makeResidentImage/recordTextureUpload (used
-// inside it) are generic *Renderer methods with no wr-specific state, so
-// they're reused unchanged.
-func (r *Renderer) uploadIsoTexture(t, bright *assets.RGBA) error {
-	ir := r.ir
-	img, mips, err := r.makeResidentImage(t)
-	if err != nil {
-		return err
-	}
-	var bimg litImage
-	brightView := ir.dummyTex.view
-	if bright != nil {
-		bimg, _, err = r.makeResidentImage(bright)
-		if err != nil {
-			freeLitImage(r.device, img)
-			return err
-		}
-		brightView = bimg.view
-	}
-	set, err := r.isoAllocTexSet(img.view, brightView)
-	if err != nil {
-		freeLitImage(r.device, img)
-		freeLitImage(r.device, bimg)
-		return err
-	}
-	ir.texCache[t] = &worldTex{img: img, bright: bimg, set: set, mips: mips}
-	return nil
-}
-
-func (r *Renderer) isoAllocTexSet(baseView, brightView vk.ImageView) (vk.DescriptorSet, error) {
-	ir := r.ir
-	info := vk.DescriptorSetAllocateInfo{
-		SType:              vk.StructureTypeDescriptorSetAllocateInfo,
-		DescriptorPool:     ir.texPool,
-		DescriptorSetCount: 1,
-		PSetLayouts:        []vk.DescriptorSetLayout{ir.dsl0},
-	}
-	var s vk.DescriptorSet
-	if res := vk.AllocateDescriptorSets(r.device, &info, &s); res != vk.Success {
-		return nil, fmt.Errorf("vulkan: iso texture descriptor set (%d resident): %s", len(ir.texCache), vk.Error(res))
-	}
-	imgW := func(binding uint32, view vk.ImageView) vk.WriteDescriptorSet {
-		return vk.WriteDescriptorSet{
-			SType:           vk.StructureTypeWriteDescriptorSet,
-			DstSet:          s,
-			DstBinding:      binding,
-			DescriptorCount: 1,
-			DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
-			PImageInfo: []vk.DescriptorImageInfo{{
-				Sampler: ir.texSampler, ImageView: view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-			}},
-		}
-	}
-	vk.UpdateDescriptorSets(r.device, 2, []vk.WriteDescriptorSet{imgW(0, baseView), imgW(1, brightView)}, 0, nil)
-	return s, nil
-}
-
-// syncIsoVoxelMeshes meshes + uploads any voxel model referenced this frame
-// that isn't resident yet — same shape as worldvoxel.go's syncVoxelMeshes,
-// its own voxCache instead of wr's. Lazy (mesh-on-first-sight) rather than
-// worldvoxel.go's WarmVoxels-style upfront batch — a possible one-time
-// stutter the first time a new model type comes into view, traded for not
-// needing a second, iso-specific "warm the whole pack now" entry point;
-// worth revisiting if that stutter turns out to matter in practice.
-func (r *Renderer) syncIsoVoxelMeshes(g *worldgeo.Geometry) error {
-	ir := r.ir
-	pending := false
-	for i := range g.Voxels {
-		if m := g.Voxels[i].Model; m != nil && ir.voxCache[m] == nil {
-			pending = true
-			break
-		}
-	}
-	if !pending {
-		return nil
-	}
-	vk.DeviceWaitIdle(r.device)
-	for i := range g.Voxels {
-		m := g.Voxels[i].Model
-		if m == nil || ir.voxCache[m] != nil {
-			continue
-		}
-		if err := r.uploadIsoVoxelMesh(m); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// uploadIsoVoxelMesh mirrors worldvoxel.go's uploadVoxelMesh: mesh via the
-// shared worldgeo.BuildVoxelMesh, upload via the shared
-// deviceLocalVertexBuffer/wHostBuffer/submitOneShot helpers, cache in
-// ir.voxCache instead of wr's.
-func (r *Renderer) uploadIsoVoxelMesh(m *assets.VoxelModel) error {
-	ir := r.ir
-	data := worldgeo.BuildVoxelMesh(m)
-	if len(data) == 0 {
-		ir.voxCache[m] = &voxelMesh{} // meshed to nothing — cache the miss
-		return nil
-	}
-
-	stage, stageMem, mapped, err := r.wHostBuffer(len(data), vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit))
-	if err != nil {
-		return err
-	}
-	vk.Memcopy(mapped, data)
-	defer func() {
-		vk.UnmapMemory(r.device, stageMem)
-		vk.DestroyBuffer(r.device, stage, nil)
-		vk.FreeMemory(r.device, stageMem, nil)
-	}()
-
-	vbuf, vmem, err := r.deviceLocalVertexBuffer(len(data))
-	if err != nil {
-		return err
-	}
-	if err := r.submitOneShot(func(cmd vk.CommandBuffer) {
-		vk.CmdCopyBuffer(cmd, stage, vbuf, 1, []vk.BufferCopy{{Size: vk.DeviceSize(len(data))}})
-	}); err != nil {
-		vk.DestroyBuffer(r.device, vbuf, nil)
-		vk.FreeMemory(r.device, vmem, nil)
-		return err
-	}
-	ir.voxCache[m] = &voxelMesh{vbuf: vbuf, vbufMem: vmem, count: uint32(len(data) / worldgeo.VoxelPackedVertexSize)}
-	return nil
 }
 
 // recordIsoVoxels appends this frame's voxel-model draws inside the
@@ -297,106 +120,42 @@ func (r *Renderer) recordIsoVoxels(cmd vk.CommandBuffer, g *worldgeo.Geometry, v
 	}
 }
 
-// uploadIsoStatic packs g.StaticTris and copies it into the device-local
-// static vertex buffer (grown/created as needed) — same shape as world.go's
-// uploadStaticWorld. Runs only when the builder bumps StaticVersion.
-func (r *Renderer) uploadIsoStatic(g *worldgeo.Geometry) error {
-	ir := r.ir
-	if g.StaticVersion == ir.staticVersion && ir.staticVBO != nil {
-		return nil
-	}
-	ir.staticPackBuf = worldgeo.PackVerts(g.StaticTris, ir.staticPackBuf)
-	n := len(ir.staticPackBuf)
-	if n == 0 {
-		ir.staticVersion = g.StaticVersion
-		return nil
-	}
-	if n > ir.staticVBOCap {
-		grown := ir.staticVBOCap
-		if grown == 0 {
-			grown = 1 << 16
-		}
-		for grown < n {
-			grown *= 2
-		}
-		vk.DeviceWaitIdle(r.device)
-		if ir.staticVBO != nil {
-			vk.DestroyBuffer(r.device, ir.staticVBO, nil)
-			vk.FreeMemory(r.device, ir.staticVBOMem, nil)
-		}
-		b, m, err := r.deviceLocalVertexBuffer(grown)
-		if err != nil {
-			ir.staticVBO, ir.staticVBOMem, ir.staticVBOCap = nil, nil, 0
-			return err
-		}
-		ir.staticVBO, ir.staticVBOMem, ir.staticVBOCap = b, m, grown
-	}
-	stage, stageMem, mapped, err := r.wHostBuffer(n, vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit))
-	if err != nil {
-		return err
-	}
-	vk.Memcopy(mapped, ir.staticPackBuf)
-	defer func() {
-		vk.UnmapMemory(r.device, stageMem)
-		vk.DestroyBuffer(r.device, stage, nil)
-		vk.FreeMemory(r.device, stageMem, nil)
-	}()
-	if err := r.submitOneShot(func(cmd vk.CommandBuffer) {
-		vk.CmdCopyBuffer(cmd, stage, ir.staticVBO, 1, []vk.BufferCopy{{Size: vk.DeviceSize(n)}})
-	}); err != nil {
-		return err
-	}
-	ir.staticVersion = g.StaticVersion
-	return nil
+// isoDynBuf is one frame-in-flight's host-visible dynamic vertex buffer.
+type isoDynBuf struct {
+	buf    vk.Buffer
+	mem    vk.DeviceMemory
+	mapped unsafe.Pointer
+	size   int
 }
 
-// uploadIsoDynamic packs g.Tris (the sprite billboards AddSprites just
-// built) and copies it into the device-local dynamic vertex buffer. Unlike
-// the FPS hardware path this isn't on a per-frame hot path — the viewer
-// only calls this again when the camera's azimuth changes enough to flip a
-// sprite rotation frame (see cmd/isoengine) — so a blocking one-shot copy
-// (like uploadIsoStatic's) is fine here too, rather than a host-visible
-// per-frame streaming buffer.
-func (r *Renderer) uploadIsoDynamic(g *worldgeo.Geometry) error {
+// uploadIsoDynamic packs g.Tris (this frame's sprite billboards and live
+// sectors) into frame's host-visible vertex buffer, growing it as needed.
+// Call only after waiting on frame's in-flight fence: the GPU is then done
+// with this buffer, so it can be rewritten (or replaced) with no copy
+// submit and no further wait.
+func (r *Renderer) uploadIsoDynamic(frame int, g *worldgeo.Geometry) error {
 	ir := r.ir
 	ir.packBuf = worldgeo.PackVerts(g.Tris, ir.packBuf)
 	n := len(ir.packBuf)
 	if n == 0 {
 		return nil
 	}
-	if n > ir.dynVBOCap {
-		grown := ir.dynVBOCap
-		if grown == 0 {
-			grown = 1 << 14
-		}
+	d := &ir.dyn[frame]
+	if n > d.size {
+		grown := max(d.size, 1<<14)
 		for grown < n {
 			grown *= 2
 		}
-		vk.DeviceWaitIdle(r.device)
-		if ir.dynVBO != nil {
-			vk.DestroyBuffer(r.device, ir.dynVBO, nil)
-			vk.FreeMemory(r.device, ir.dynVBOMem, nil)
-		}
-		b, m, err := r.deviceLocalVertexBuffer(grown)
+		freeHostBuffer(r.device, d.buf, d.mem, d.mapped)
+		b, m, p, err := r.wHostBuffer(grown, vk.BufferUsageFlags(vk.BufferUsageVertexBufferBit))
 		if err != nil {
-			ir.dynVBO, ir.dynVBOMem, ir.dynVBOCap = nil, nil, 0
+			*d = isoDynBuf{}
 			return err
 		}
-		ir.dynVBO, ir.dynVBOMem, ir.dynVBOCap = b, m, grown
+		*d = isoDynBuf{b, m, p, grown}
 	}
-	stage, stageMem, mapped, err := r.wHostBuffer(n, vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit))
-	if err != nil {
-		return err
-	}
-	vk.Memcopy(mapped, ir.packBuf)
-	defer func() {
-		vk.UnmapMemory(r.device, stageMem)
-		vk.DestroyBuffer(r.device, stage, nil)
-		vk.FreeMemory(r.device, stageMem, nil)
-	}()
-	return r.submitOneShot(func(cmd vk.CommandBuffer) {
-		vk.CmdCopyBuffer(cmd, stage, ir.dynVBO, 1, []vk.BufferCopy{{Size: vk.DeviceSize(n)}})
-	})
+	vk.Memcopy(d.mapped, ir.packBuf)
+	return nil
 }
 
 // IsoSun/IsoAmbient are DrawIso's fixed shading terms — a directional light
@@ -462,16 +221,13 @@ func (r *Renderer) DrawIso(g *worldgeo.Geometry, cam worldgeo.IsoCamera, overlay
 	if !r.iso {
 		return fmt.Errorf("vulkan: DrawIso called on a non-iso renderer")
 	}
-	if err := r.syncIsoTextures(g); err != nil {
+	if err := r.syncTextures(&r.ir.texResidency, g); err != nil {
 		return err
 	}
-	if err := r.uploadIsoStatic(g); err != nil {
+	if err := r.uploadStatic(&r.ir.staticGeom, g); err != nil {
 		return err
 	}
-	if err := r.uploadIsoDynamic(g); err != nil {
-		return err
-	}
-	if err := r.syncIsoVoxelMeshes(g); err != nil {
+	if err := r.syncVoxelMeshes(&r.ir.texResidency, g); err != nil {
 		return err
 	}
 
@@ -491,6 +247,9 @@ func (r *Renderer) DrawIso(g *worldgeo.Geometry, cam worldgeo.IsoCamera, overlay
 	frame := r.currentFrame
 	vk.WaitForFences(r.device, 1, []vk.Fence{r.inFlight[frame]}, vk.True, vk.MaxUint64)
 
+	if err := r.uploadIsoDynamic(frame, g); err != nil {
+		return err
+	}
 	if err := r.uploadIsoOverlay(overlay); err != nil {
 		return err
 	}
@@ -635,7 +394,9 @@ func (r *Renderer) recordIsoCommandBuffer(cmd vk.CommandBuffer, imageIndex uint3
 	// it through the same plain pipeline as everything else above,
 	// restoring the exact look it had before water was split out.
 	drawRuns(ir.staticVBO, g.WaterDraws)
-	drawRuns(ir.dynVBO, g.Draws)
+	dyn := ir.dyn[frame].buf
+	drawRuns(dyn, g.LiveDraws) // live sectors: moving doors / lifts, flickering lights, scrollers
+	drawRuns(dyn, g.Draws)
 	// Voxel models — own pipeline, still inside the world pass so the depth
 	// buffer sorts them against the level and the textured geometry (same
 	// reasoning as world.go's recordVoxels call).
@@ -654,7 +415,7 @@ func (r *Renderer) recordIsoCommandBuffer(cmd vk.CommandBuffer, imageIndex uint3
 		vk.CmdPushConstants(cmd, ir.plWorld,
 			vk.ShaderStageFlags(vk.ShaderStageVertexBit)|vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
 			0, uint32(unsafe.Sizeof(pc)), unsafe.Pointer(&pc))
-		drawRuns(ir.dynVBO, g.Draws)
+		drawRuns(dyn, g.Draws)
 		r.recordIsoVoxels(cmd, g, vp, IsoRevealAlpha)
 	}
 
@@ -766,14 +527,6 @@ func (r *Renderer) destroyIsoResources() {
 		vk.DestroyDescriptorSetLayout(dev, ir.revealSetLayout, nil)
 	}
 
-	for _, vm := range ir.voxCache {
-		if vm.vbuf != nil {
-			vk.DestroyBuffer(dev, vm.vbuf, nil)
-		}
-		if vm.vbufMem != nil {
-			vk.FreeMemory(dev, vm.vbufMem, nil)
-		}
-	}
 	if ir.pipeVoxel != nil {
 		vk.DestroyPipeline(dev, ir.pipeVoxel, nil)
 	}
@@ -784,29 +537,11 @@ func (r *Renderer) destroyIsoResources() {
 		vk.DestroyPipelineLayout(dev, ir.plVoxel, nil)
 	}
 
-	for _, wt := range ir.texCache {
-		freeLitImage(dev, wt.img)
-		freeLitImage(dev, wt.bright)
-		// wt.set is freed implicitly by destroying texPool below.
-	}
-	if ir.texPool != nil {
-		vk.DestroyDescriptorPool(dev, ir.texPool, nil)
-	}
-	if ir.dsl0 != nil {
-		vk.DestroyDescriptorSetLayout(dev, ir.dsl0, nil)
-	}
-	freeLitImage(dev, ir.dummyTex)
-	if ir.texSampler != nil {
-		vk.DestroySampler(dev, ir.texSampler, nil)
-	}
-
-	if ir.staticVBO != nil {
-		vk.DestroyBuffer(dev, ir.staticVBO, nil)
-		vk.FreeMemory(dev, ir.staticVBOMem, nil)
-	}
-	if ir.dynVBO != nil {
-		vk.DestroyBuffer(dev, ir.dynVBO, nil)
-		vk.FreeMemory(dev, ir.dynVBOMem, nil)
+	ir.texResidency.destroy(dev)
+	ir.staticGeom.destroy(dev)
+	for i := range ir.dyn {
+		freeHostBuffer(dev, ir.dyn[i].buf, ir.dyn[i].mem, ir.dyn[i].mapped)
+		ir.dyn[i] = isoDynBuf{}
 	}
 
 	if ir.fbScene != nil {

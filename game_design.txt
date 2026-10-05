@@ -220,6 +220,10 @@ rather than embedding is deliberate — section 18.
     tools/gentex/    hi-res wall/flat/sprite texture generator
     tools/genbright/ procedural brightmap-mask generator (self-lit texels)
     tools/waddump/   WAD directory + THING/LINEDEF/SECTOR special histogram
+    wad3d/           recompiles a WAD into a "real 3D" WAD — geometry
+                     passes, embedded textures + weapons, TPF3D marker
+                     (section 26)
+    cmd/wad3d/       main() for the converter (section 26)
     tools/genconfig/ writes a full config.json (every option at its default)
 
 
@@ -547,8 +551,21 @@ top-right. Layout constants (qh*) are in the same 320x200 authoring space
 so it obeys hudScale identically.
 
 Debug HUD (raster/hud.go, DrawHUD): a small bitmap-font (Go's basicfont,
-7x13/glyph) overlay for level name / FPS / position / angle — toggled by
-engine.Game.ShowHUD (on by default; config showDebugInfo).
+7x13/glyph) overlay for level name / FPS / position / angle / CPU / memory
+— toggled by engine.Game.ShowHUD (on by default; config showDebugInfo).
+It has its own whole-number pixel scale, debugTextScale = max(1,
+height/540) — 1x below 1080 rows, 2x at 1080p/1440p, 4x at 2160p — not
+the status bar's 320x200 fit (~5x at 1080p, which made it huge).
+CPU and MEM are the engine PROCESS's own use, never system totals
+(package procstats, re-measured every 500 ms by Game.procStats): CPU is
+the process's user+kernel time across all threads over the interval, as
+a % of one core (can exceed 100%), plus the logical core count —
+getrusage on Unix, GetProcessTimes on Windows. MEM is resident memory
+(/proc/self/statm on Linux, the working set via K32GetProcessMemoryInfo on
+Windows; includes GPU-driver/cgo allocations in the process, not video
+memory on the card) with the Go runtime's live heap and total mapped
+(runtime/metrics, no stop-the-world); macOS/other Unix show the Go figures
+only. cpuLine/memLine format the rows.
 
 
 9. RENDER / RENDER-VULKAN — GPU PRESENTATION
@@ -562,22 +579,35 @@ DrawWorld is the hardware (GPU-geometry) path — the only path the game
 uses, stood up by vulkan.NewWorld. render/worldgeo builds the whole level's walls + flats once (wall
 quads + BSP-reconstructed subsector-polygon flats, UVs/pegging/fake-contrast
 matched to raster) into a static triangle list the backend keeps in a
-device-local buffer, rebuilt only when a door/lift moves a sector height
-(Builder.Invalidate, engine worldGeomChanged) OR while one is mid-travel:
-the sim moves sector heights once per 35Hz tic, so renderFrame lerps them.
-runTic snapshots every sector's floor/ceiling into g.prevSectorH before
-tickSpecials; renderFrame's hardware branch (applySectorInterp) then writes
-prev + (cur-prev)*renderLerp() into g.Level.Sectors for that frame's
-geometry build and restores the authoritative values right after — so a
-door/lift glides at display rate instead of stepping at 35Hz. A per-tic
-change bigger than 48 units is taken to be an instant snap and not lerped.
-Presentation only; the sim always reads the real heights. A mid-glide frame
-only actually Invalidate()s (which walks every subsector and blocks on a
-full static-vertex-buffer re-upload) when the interpolated height rounds to
-a DIFFERENT int16 than last frame — renderedSectorHeightsChanged (interp.go)
-gates it, since most mid-glide frames land on the same rounded height and
-were forcing a needless rebuild + GPU stall every frame. Per frame the CPU
-only appends the sprite/voxel-billboard quads. render/worldgeo.ViewProj (byte-matched to
+device-local buffer. Rebuilding it (Builder.Invalidate) walks every
+subsector and blocks on a full re-upload, so anything that changes often
+stays out of it (engine/worldsync.go, syncWorldGeometry — shared by both
+front ends):
+  - LIVE SECTORS. A sector joins the live set the tic its floor, ceiling
+    or light changes (trackLiveSectors, comparing the start-of-tic
+    snapshot) or a wall scroller on it ticks (markLive), and leaves after
+    5 s unchanged; light-special and scroller sectors join at level start.
+    Builder.SetLiveSectors drops their floors/ceilings and every wall
+    touching them from the static mesh, and each Build re-emits them into
+    the per-frame stream (Geometry.LiveDraws, drawn right after the
+    static draws; the opaque prefix also feeds the shadow-map pass) —
+    re-emitted only when one of their inputs (the sectors and sidedefs
+    involved) actually changed. So a door costs two rebuilds per cycle
+    (lifted out as it starts, put back once settled) and a strobing or
+    scrolling sector none — and both animate at full rate.
+  - ANIMATED TEXTURES stepping a frame only repoint the static draws'
+    textures (Builder.Retexture; a full rebuild only if the frames differ
+    in size). Every animation frame is preloaded at level start.
+  - What still rebuilds: a height change outside the live set, a switch
+    texture flipping (geomDirty), a new level.
+The sim moves sector heights once per 35Hz tic, so frames lerp the moving
+ones: runTic snapshots every sector's floor/ceiling into g.prevSectorH
+before tickSpecials; applySectorInterp then writes prev +
+(cur-prev)*renderLerp() into g.Level.Sectors while that frame's Build
+emits the live sectors, and restores the authoritative values right after
+— so a door/lift glides at display rate instead of stepping at 35Hz. A
+per-tic change bigger than 48 units is taken to be an instant snap and not
+lerped. Presentation only; the sim always reads the real heights. render/worldgeo.ViewProj (byte-matched to
 raster's projection) is pushed as a mat4. Each frame the world pass runs a
 depth pre-pass over the opaque static geometry (positions only, no colour)
 so the colour pass's early-Z rejects occluded wall/flat pixels before the
@@ -1417,6 +1447,22 @@ A_ReFire). A weapon can carry a FireSoundSeq — one-shot sounds at fixed
 tic offsets partway through the animation; only the Super Shotgun uses it
 (DSDBOPN / DSDBLOAD / DSDBCLS at the C / D / F frames).
 
+The HD plasma rifle is the one weapon with per-shot and release animation
+(the HD pack's SmoothPlasmaRifle states): FireCycle makes shot n of a held
+burst play FireCycle[n % 3] — PLGF A, B, C, 3 tics each, counted by
+WeaponState.burstShot (WeaponDef.shotFrames) — and ReleaseFrames plays
+PLGC B C D 1, E 13, D C B A 1 when the burst ends, in a fifth phase
+(weaponCooling: no firing or switching until it finishes, then ready).
+Its FlashPrefix is "TNT1" (raster.NoSpritePrefix): hasFlash stays true so
+muzzleFlashLight still lights the room each shot, but DrawWeapon draws no
+sprite. It was the vanilla PLSF — which is not a flash but the whole
+glowing vanilla gun, and doom_weapons.pk3's PLSF a whole HD gun — so it
+drew as a second, smaller rifle beside the HD one. Guards:
+engine/plasma_bfg_test.go (the exact burst/cooldown frame sequence; every
+plasma/BFG viewmodel, projectile and explosion frame resolves to opaque
+pixels with Doom II + the HD packs; the flash adds no pixels).
+fireHeld (fireHeldHook in tests) is the auto-refire button check.
+
 FireWeapon dispatches by kind. The four hitscan guns resolve instantly via
 pLineAttack. The SSG is id's A_FireShotgun2 verbatim — 2 shells a shot, 20
 pellets, each spread twice as wide horizontally as the plain shotgun AND
@@ -1516,6 +1562,56 @@ A_SkullAttack's MF_SKULLFLY charge) or steps toward the target via pMove
 ML_BLOCKING / ML_BLOCKMONSTERS, step-up <= 24, ledge-drop avoidance for
 walkers, thing-vs-thing), re-choosing direction (pNewChaseDir, id's 8-way
 diagonal-first search) when the current one is spent or blocked.
+
+Roaming (engine/roam.go, monsternav.go; config monsterBehavior "roaming",
+the default — "classic" turns it off: idleRoam returns at once and idle
+monsters wait where placed, as in vanilla; alerted monsters still open
+normal doors in their path either way). Idle monsters don't stand still:
+when aLook notices nothing, idleRoam starts a trip for any monster that
+can move (canRoam: live MF_COUNTKILL, Speed > 0, a see state distinct
+from its spawn state — so not Keen or the Icon of Sin), after a staggered
+first pause (1-6 s) and a 2-7 s pause between trips. A roaming monster is
+in its see state with no Target and Mobj.roaming set; aChase hands it to
+roamChase, which runs the same wake checks as aLook (heardShot,
+pLookForPlayers front arc) and on noticing the player drops the trip and
+chases; being shot mid-trip (pDamageMobj names the attacker) does too, and
+a chaser that loses its target returns to idle and later roams again.
+Ambush (MF_AMBUSH) monsters roam as well and stay deaf. Routes: the
+level's sectors form a graph (navGraph, built lazily per level), joined by
+portals wherever two-sided lines monsters may cross (not ML_BLOCKING /
+ML_BLOCKMONSTERS) run between them; navCanPass judges each portal against
+the CURRENT heights and the monster's size (width >= 1.6 x radius, step
+up <= 24, no drop > 24 unless MF_DROPOFF/floating, headroom >= height, a
+monster-openable door counting as open to its full height). planRoam
+breadth-first searches from the monster's sector, picks a random
+reachable sector and an interior point in it (a subsector centroid), and
+lays waypoints on the portals' longest-line midpoints; roamStep walks
+them with id's own P_Move / pNewChaseDirTo steering, re-planning (up to 3
+times) when it stops getting closer, then resting. Monsters that truly
+can't leave (sniper ledges taller than a step, closets behind switch-
+operated doors) stay put until the player opens their way.
+
+Doors. pMove, blocked, calls monsterOpenDoor (id's P_Move spechit use):
+a monster pushing on a door line it may open (monsterCanOpen: manual DR
+doors 1 / 117 only — never key-locked, open-and-stay, switch/trigger
+doors, or lines flagged ML_SECRET 0x20) activates it like a player's
+Use, and waits. A closing door no longer crushes: vldoor.tick checks
+doorPinsLiveThing (the player, or any live solid shootable thing with a
+footprint corner in the door sector, taller than the new ceiling) and,
+like id's T_VerticalDoor (crush off), a normal door reverses and a plain
+close door holds. Before, doors ground whoever stood under them — the
+player included.
+
+The mobj spatial grid (mobjgrid.go) is re-bucketed as a thing moves
+(relinkMobj, from pTryMove and teleports), so solid-thing checks see
+moves made earlier the same tic; two monsters converging on a doorway
+could otherwise step into each other and lock together for good.
+
+Guards: engine/roam_test.go — E1M1 / MAP01 two-minute runs (most
+monsters leave spawn and change rooms, doors get opened, none dies, none
+ends inside a wall or another monster), the door rule table, roamers
+noticing / being shot into chasing, and doors reopening on a monster or
+the player in the doorway. Cost: ~0.02 ms per tic on E1M3 (302 things).
 
 pDamageMobj applies, for the player, the config damageScale percent then
 armour absorption; and, for a monster, a painchance roll into the pain
@@ -1671,9 +1767,10 @@ Hardware-path animated-texture fix (same round): the GPU-geometry builder
 caches static geometry with texture bindings baked in and only rebuilt it
 when a SECTOR HEIGHT changed (worldGeomChanged), so animated flats/walls —
 built-in, ANIMATED, ANIMDEFS and warp alike — were frozen on frame 0 on
-that path. renderFrame now also calls animFrameChanged() (an FNV hash of
-every animated surface's current live name, changing exactly on the tics an
-animation steps) and Invalidate()s the builder then.
+that path. syncAnimTextures (engine/worldsync.go) now compares every
+animated surface's live name with the one the static mesh shows and hands
+the changes to Builder.Retexture, which repoints the draws' textures
+without rebuilding (section 9).
 
 Dynamic lights (engine/lights.go, engine/maplights.go) — everything beyond
 world.frag's sector fade. Two kinds:
@@ -2137,11 +2234,53 @@ tools/genconfig has. The full key list:
                         vertical render resolution; hidden while dead.
   crosshairSize         "tiny" / "small" / "medium" (default) / "large" —
                         scales the crosshair. "medium" is height/240.
-  voxels                true (default) = load assets/voxel/Doom{1,2}_Voxel
-                        .pk3 for the loaded WAD and draw map objects as
-                        voxel models where the pack has one (section 20);
-                        false, or a missing pack, = sprites everywhere.
-  voxelScale            map units per voxel; clamped [0.25, 4.0], default
+  (voxels)              RETIRED — map objects are voxel-only, from the
+                        models baked into each real-3D WAD (section 20);
+                        a leftover key is logged as ignored
+                        (deprecatedKeys).
+  objectStyle           models (default) | voxels: how map objects and
+                        projectiles are drawn when the 3D WAD carries both —
+                        models = its textured 3D models (TPFMODEL, section
+                        20a), a voxel for any sprite frame with no model;
+                        voxels = voxel models, except the weapon pickups
+                        (CSAW SHOT SGN2 MGUN LAUN PLAS BFUG), which keep
+                        their 3D models. The isometric view always uses
+                        voxels. Launcher: Rendering > Object Models.
+  monsterBehavior       roaming (default) | classic: roaming = idle
+                        monsters wander the level and open normal doors
+                        until they notice the player (section 14,
+                        Roaming); classic = vanilla, they wait where
+                        placed. Launcher: Gameplay > Monster Behaviour.
+  smoothMonsterMovement true (default) = a walking monster's A_Chase step
+                        is drawn spread over its walk frame (engine/
+                        interp.go step glide) instead of popping forward
+                        every 3-4 tics. Presentation only. Launcher:
+                        Rendering > Smooth Monster Movement.
+  impFireballs          true (default) = the imp's fireball is a rendered
+                        procedural ball of fire with an ember trail that
+                        bursts with splash damage (up to 16, 64-unit
+                        radius; spares the direct-hit victim, the thrower
+                        and other imps) — engine/impfireball.go; false =
+                        the vanilla BAL1 fireball. Launcher: Gameplay >
+                        Rendered Imp Fireballs.
+  cacoFireballs         true (default) = the cacodemon's fireball is the
+                        same rendered fire, 1.25x larger, coloured as a
+                        red-hot core in blue flames, with a bigger splash
+                        (up to 20, 72-unit radius; spares the direct-hit
+                        victim, the thrower and other cacodemons) —
+                        engine/impfireball.go; false = the vanilla BAL2
+                        fireball. Launcher: Gameplay > Rendered Cacodemon
+                        Fireballs.
+  lostSoulFire          true (default) = living lost souls trail rendered
+                        flames off the back of the skull and cast a
+                        flickering fire light (engine/lostsoulfire.go).
+                        Cosmetic. Launcher: Rendering > Lost Soul Flames.
+  modelScale            size multiplier for map objects' models — the 3D
+                        models (scaling their MODELDEF Scale and Offset)
+                        and the voxels alike; formerly voxelScale, which an
+                        old config still sets when modelScale is absent
+                        (loadFile's back-compat mapping). Launcher:
+                        Rendering > Model Scale; clamped [0.25, 4.0], default
                         1.0 (Cheello's Voxel Doom is authored 1:1).
   quake1Textures        false (default) = ignore any Quake 1 texture pack;
                         true = for every Doom wall/flat name the curated
@@ -2205,10 +2344,25 @@ GPU doesn't need to see. What is done about that:
     colour pass skips a static Draw whose real bounding box fails a
     per-frame camera-vs-FOV test, and shares more textures back-to-back for
     fewer descriptor rebinds.
-  - NOT re-Invalidate()ing the whole static vertex buffer on a mid-glide
-    frame whose interpolated sector height rounds to the same int16 as
-    last frame (renderedSectorHeightsChanged) — it was forcing a full-level
-    walk + a blocking GPU re-upload every frame a door moved.
+  - Live sectors and texture repointing (section 9) instead of whole-level
+    static rebuilds + blocking GPU re-uploads: before, every door/lift
+    height step, every animated-texture frame (several times a second on
+    any level with nukage) and, by accident, nothing else kept the static
+    mesh current.
+  - worldgeo.ViewCone: the visibility test (static draws, things,
+    particles, lights) in closed form — a dot product and a square root
+    against a cone precomputed once per frame, instead of Atan2/Mod/Asin
+    per test.
+  - The isometric renderer streams its per-frame vertices through one
+    host-visible buffer per frame in flight, like the FPS path, instead of
+    a staging buffer + blocking one-shot copy every frame.
+  - Grounded things cache their sector for the per-tic z-clip (mobj
+    zcSec), skipping a BSP walk for everything that hasn't moved.
+  - Pack loading decodes PNG/JPG skins and HD weapon frames across all
+    cores (assets.ParallelFor): ~1.4 s -> 0.23 s for the model pack,
+    ~1.2 s -> 0.25 s for the weapon pack.
+  - engine/perf_test.go benchmarks a tic and a frame's CPU work
+    (buildWorldFrame) on Doom II MAP29 with every monster awake.
   - Moving SSAO's disc gather and the god-ray march off full-res pixels
     into one quarter-res worldambient.frag pass (1/16 the pixel count, plus
     a 3x3 AO denoise).
@@ -2422,19 +2576,106 @@ The engine tests need cgo to build, since the package imports window/audio.
 
 20. VOXEL MODELS
 ---------------
-Map objects — monsters, items, ammo, keys, the corpses and gibs they leave
-— can be drawn as voxel models instead of flat sprites, from a voxel pack
-in assets/voxel/. The engine ships none; supply Cheello's "Voxel Doom"
-Doom1_Voxel.pk3 and Doom2_Voxel.pk3 (or another KVX pack in the same
-layout). They're gitignored — a derivative of id's sprites with their own
-terms. Absent, or `voxels false` in config.json, the game just uses
-sprites.
+Map objects — monsters, items, ammo, keys, decorations, barrels, the
+corpses and gibs they leave, dropped items — are drawn ONLY as voxel
+models; there is no sprite mode and no switch for one. Effects keep their
+sprites: missiles (monster fireballs, Heretic missiles), the player's own
+projectiles, bullet puffs, blood, teleport fog, and the player.
+engine/voxelonly.go: isMapObject (a Doom type with DoomedNum > 0, or any
+MT_HERETIC thing except a missile — hMissile) and appendMobjVoxel, shared
+by collectWorldObjects and CollectIsoWorldObjects: a map object uses its
+frame's model, else its nearest modelled frame of the same sprite
+(VoxelSet.ModelNearest — both Doom packs lack the demon's SARG G pain
+frame), else is not drawn at all.
 
-Loading. cmd/engine picks reikallhereticvoxels.pk3 for a Heretic IWAD
-(section 24), Doom2_Voxel.pk3 when the start map is a Doom II MAPxx, else
-Doom1_Voxel.pk3, and calls assets.LoadVoxelPackDir — which finds the
-assets/voxel directory next to the working directory or the exe and reads
-the .pk3 (a zip):
+The models come from the real-3D WAD, never from disk at play time:
+cmd/wad3d bakes the packs into a TPFVOXEL zip (section 26) and
+wad.CheckPlayable refuses a WAD without one. assets.LoadVoxelsFromWAD
+loads each stored pk3 (LoadVoxelPackBytes) in name order, every later one
+filling only sprites the earlier lack entirely (VoxelSet.FillFrom — whole
+sprites, never single frames, so no object mixes two packs' art). Pack
+choice (wad3d.VoxelPacksFor): Heretic -> reikallhereticvoxels.pk3; Doom II
+maps -> Doom2_Voxel.pk3 (every one of the 90 placeable Doom/Doom II types,
+every animation frame bar SARG G); Doom 1 maps -> DoomVoxelPack.pk3 +
+Doom2_Voxel.pk3 for its 16 gaps (chaingunner, Hell knight, megasphere,
+SSG, lamps, gore). reikall's Heretic pack has NO monster models, so every
+Heretic monster (and the pod) is invisible — cmd/wad3d prints the list
+(engine.UnmodelledObjects). The packs themselves (assets/voxel/, gitignored
+— derivatives of id's sprites with their own terms) are only read by the
+converter, which fails without them.
+
+20a. 3D MODELS (assets/models, render/vulkan/worldmodel.go)
+A MODELDEF model pack — GZDoom's format: MD2, MD3 and Doomsday DMD models
+plus skins, bound to vanilla sprite frames — outranks voxels when config
+objectStyle is "models" (the default); "voxels" makes cmd/engine keep
+only the weapon pickups' bindings (models.Set.Only with
+engine.WeaponPickupSprites), so everything else is drawn from the baked
+voxels while the guns on the floor stay 3D models. In the
+first-person view a map object is drawn as its model when its sprite
+frame has one, else its voxel, else (voxel-only) nothing; an effect (a
+monster fireball, the player's rockets / plasma / BFG ball) as its model,
+else its sprite. The isometric view has no model pipeline and keeps
+voxels. appendMobjVoxel(..., withModels) -> appendMobjModel /
+appendProjectileModel -> appendModelParts (engine/voxelonly.go), filling
+Game.hwModels -> WorldBuilder.AddModels.
+  - Loading (assets/models): Load reads every file whose name up to its
+    first '.' is "modeldef" (GZDoom's lump naming — the pack ships
+    Modeldef.*.def), parses blocks (modeldef.go: Path, Model n, Skin n,
+    Scale, Offset/ZOffset, Angle/Pitch/RollOffset, Rotating,
+    Rotation-Speed/-Vector, PitchFromMomentum, FrameIndex, Frame by name;
+    other flags skipped) and decodes each referenced model (md2.go, md3.go
+    — surfaces flattened — dmd.go: MD2 plus LODs and 5-byte vertices, LOD 0
+    used) and skin (png/jpg, PCX and TGA via assets/imgdec). GZDoom
+    semantics kept: a binding draws EVERY slot its block declares (the
+    named slot at its frame, the rest at frame 0 — the Allmap's button and
+    screen), "FrameIndex X ABC 0 1" binds each letter, the first actor to
+    bind a sprite frame owns it (ZombieMan vs DeadZombieMan both POSS L),
+    paths use \ and match case-insensitively, and a skin named x.png is
+    found as x.jpg. Slot frames carry over exactly as in GZDoom: a block
+    keeps one running frame per slot (0 at its start); each FrameIndex
+    line updates its slot and snapshots every slot for its sprite frame,
+    a later snapshot (later line, or a later block of the same actor)
+    replacing an earlier one. Normals are computed per frame from the geometry
+    (Mesh.Frame), not the formats' packed tables.
+  - Frame blending (GZDoom's model interpolation): appendMobjModel ->
+    modelBlendTarget finds the parts bound to the NEXT state's sprite
+    frame and how far through the current state mo is ((state tics -
+    remaining + renderLerp) / state tics); a part whose next frame is of
+    the same mesh gets ModelInstance.Next/Lerp, unless its block is
+    NOINTERPOLATION. The GPU binds the target frame as vertex binding 1
+    and model.vert mixes position and normal by shade.z (push range
+    [112,128) shared by both stages). Without it, models snapped pose to
+    pose each Doom state — 4-10 tics of stillness, then a jump.
+  - Size: config modelScale multiplies each part's Scale and Offset — the
+    same multiplier voxels use.
+  - Transform (worldgeo.ModelMatrix): scale per model axis, spin (GZDoom's
+    RotSpeed revolutions per 200 tics about RotVec), roll, pitch (positive
+    lifts the +X nose; PitchFromMomentum adds the flight pitch), yaw — the
+    models' +X / +Y-left / +Z-up convention matches Doom's angle 0 = east
+    (the zombieman's rifle sits at +X, the Cyberdemon's cannon on +Y, its
+    left arm) — then position plus the offset rotated by yaw.
+  - GPU (worldmodel.go, model.vert/frag): each bound frame is a static
+    unindexed vertex buffer (pos, normal, uv — 32 B/vertex), all uploaded
+    at level load with the skins as world textures (WarmModels); layout
+    [dsl0 skin, dsl1 World UBO], same as the world pipeline; push
+    constants mvp + model rows (vertex, 112 B) + shade (fragment, 16 B);
+    no backface culling (open shells: flames, trails); alpha-tested skins;
+    lit exactly like voxel.frag. Drawn right after the voxels, before the
+    particle passes (whose set-1/push-constant rebind covers both).
+  - The pack: assets/import/3D_Models.pk3 (a community GZDoom pack, no
+    licence file — gitignored, only baked into local WADs): 528 sprite
+    frames, 197 models, 293 skins, ~45 MB baked; covers every monster,
+    item, decoration and projectile — only first-person weapons and puffs /
+    blood / flashes have none. cmd/wad3d (wad3d/models.go ModelPacks)
+    takes assets/models/*.pk3, else any assets/import/*.pk3 holding a
+    MODELDEF; Heretic WADs get none.
+  Guards: assets/models/models_test.go (MODELDEF semantics on synthetic
+  MD2s, PCX without its palette marker, the real pack loads error-free
+  and covers the core roster), render/worldgeo/modelinst_test.go,
+  engine/models_test.go (MAP01 objects drawn as models and nothing else;
+  a plasma shot as its model), wad3d TestConvertBakesModels.
+
+Reading a pack (the .pk3 is a zip):
   - VOXELDEF (assets/voxeldef.go) — the def lump, named either "VOXELDEF.txt"
     (the Doom packs) or "VOXELDEF" (reikall's Heretic pack). One entry per
     line, `<sprite><frame> = "<basename>" [{ AngleOffset = N  Scale = f }]`,
@@ -3266,3 +3507,207 @@ Keys and controls:
   Ctrl+N                 new level        Ctrl+R   reload the current map
   Ctrl+S                 save as PWAD     F5       play this map
   Ctrl+Q                 quit
+
+
+26. wad3d — RECOMPILING A WAD INTO A "REAL 3D" WAD
+---------------------------------------------------
+ONLY real-3D WADs are playable. wad.CheckPlayable — called by the
+launcher's PickWAD and by both engines' playSession/runHeadless — refuses
+any WAD without a TPF3D marker ("a standard WAD — convert it into a 3D WAD
+with the wad3d converter") or without baked voxels (TPFVOXEL — "converted
+by an older wad3d ... convert the original WAD again"), both wrapping
+wad.ErrNotReal3D. The launcher's quick list (ListWADs) shows only 3D WADs,
+filtered with wad.PeekTPF3D, which reads just the header and directory.
+The refusal is a *wad.NotPlayableError: Error() is the full explanation
+(console/logs), Short() the one-line form the launcher's status bar shows.
+That status bar (drawBottomBar) word-wraps any message into the space left
+of QUIT (wrapStatus: up to 3 lines, then "...", em dashes -> "-" since
+the launcher font lacks them), so nothing runs under the buttons.
+The level editor still opens vanilla WADs but only ever SAVES real-3D
+WADs (editor/save.go): Save (Ctrl+S) writes the map as a plain PWAD to a
+temp file (Doc.prepareConversion — the only step touching the Doc), then
+convertJob.run does the full wad3d.Convert (SaveOptions: passes, textures,
+both arsenals via wad3d.FindWeaponIWADs — moved out of cmd/wad3d so both
+share it — and voxels) on a background goroutine; App.pollSave shows the
+result. It writes <wad>_<map>_3d.wad into the launcher's wad/ folder
+(DefaultSavePath), refuses to overwrite the source, and treats missing
+weapon assets as an error like the converter. Play (F5) is the same
+convertJob with no texture/weapon embedding, so it stays quick.
+Guard: editor/save3d_test.go (a saved MAP01 passes CheckPlayable, merges
+over its source IWAD, carries TPFHIRES/TPFWEAPN/TPFVOXEL).
+
+cmd/wad3d (library: package wad3d) reads a Doom, Doom II or Heretic WAD
+(IWAD or PWAD) and writes a TwoPointFive-only PWAD whose maps carry
+auto-generated true-3D geometry, whose hi-res textures travel inside the
+WAD, and which carries all three games' weapons:
+
+    bin/linux_wad3d                    file picker (window.PickWADFile);
+                                       the console stays open at the end
+    bin/linux_wad3d path/to/doom2.wad  or drag a .wad onto the program
+        [-out FILE|FOLDER] [-choose-out] [-maps MAP01,MAP02] [-passes stairs]
+        [-textures=false] [-alltex] [-max 1024] [-minsteps 3] [-iwad P]
+        [-doom2 P] [-heretic P] [-weapons=false] [-allow-missing-weapons]
+
+Built by scripts/build-wad3d-linux.sh / build-wad3d-windows.ps1
+(bin/windows_wad3d.exe, a console program). Where it's saved: run
+without flags (double-clicked, file picker, or a WAD dragged onto it) it
+asks up front, before converting, with a native Save As dialog
+(window.PickSaveWADFile — sqweek/dialog's Save on Windows/macOS, zenity
+--save --confirm-overwrite / kdialog --getsavefilename elsewhere; both ask
+before overwriting) starting at <name>_3d.wad in the launcher's wad/ folder
+(assets.FindDir), else next to the source. Cancel writes nothing; no
+dialog available falls back to that default. -out names a file or a
+folder (resolveOut: a folder gets <name>_3d.wad, a bare name gets .wad);
+-choose-out forces the dialog, starting from -out. A scripted run (flags
+but no -out) writes the default silently. Missing folders are created;
+saving outside wad/ prints a "use the launcher's Browse..." note — any
+location loads, since the base IWAD is recorded by absolute path.
+Overwriting the source is refused. -max defaults to 1024: the
+Heretic HD pack is up to 2048 px and would otherwise ~double the WAD.
+
+The output is still merged over its base IWAD at load time (monsters,
+level art, music, PLAYPAL — wad.LoadWithIWAD, section 2), and it names
+exactly which one: the converter records the source IWAD (or a PWAD
+source's merged IWAD) in the manifest's iwad line, and LoadWithIWAD's
+recordedIWAD merges that file — else a same-named file in the usual IWAD
+search directories — ahead of both config's "iwad" and the normal
+format-guessing search, which is only the fallback. Without it a
+converted Doom II WAD saved in wad/ was merged over shareware
+testdata/DOOM1.WAD (the search's Doom-1 fallback) and silently lost its
+music. iwadSearchDirs also probes "Game WADs"/ and wad/"Game WADs"/. A PWAD source's non-map lumps (music, TEXTURE1, flats,
+DEHACKED, MAPINFO, ...) are copied through, so the output replaces the
+source PWAD entirely. Converting a WAD that already carries a TPF3D marker
+is refused. Output lump order:
+
+    TPF3D      manifest (wad/tpf3d.go) — plain text "key value" lines:
+               format, tool, source (name + SHA-1), iwad (SHA-1, then the
+               base IWAD's path — rest of line, spaces allowed), passes,
+               textures (set + count), weapons (games + count), maps. wad.(*WAD).TPF3D parses it (unknown
+               keys skipped; a newer format is loaded but logged);
+               DescribeTPF3D is the startup log line cmd/engine and
+               cmd/isoengine print; the launcher tags the WAD "[3D]"
+               (launcher.Model.Is3D).
+    ...        the source PWAD's non-map lumps (PWAD input only)
+    SLOPES     the source's own SLOPES text verbatim, then one generated
+               block per changed map — the existing grammar (engine/
+               slopes), so the engine and editor apply it with no new code
+    TPFHIRES   a zip (stored, not deflated) of walls/<NAME>.png and
+               flats/<NAME>.png (assets/embedded.go)
+    TPFWEAPN   every arsenal's weapon art and sounds (below)
+    TPFVOXEL   the voxel pack(s) map objects are drawn with, stored whole
+               as "<n>-<pack>.pk3" (priority order) — section 20
+    TPFMODEL   optional (Doom only): a MODELDEF 3D-model pack — the
+               definitions plus only the models/skins they use, pack paths
+               kept — section 20a
+    maps       each map block copied verbatim — no pass changes 2D
+               geometry yet, so shipped NODES/REJECT/BLOCKMAP stay valid
+
+Why one zip lump for the textures: wad.Merge lets a later lump shadow an
+earlier one by name, and Flat()/sprite lookups go through w.Find — a PNG
+lump called NUKAGE1 would hide the IWAD's real flat. A zip also lifts the
+8-character name limit.
+
+Embedded textures. assets.New indexes the TPFHIRES container
+(indexEmbedded) and decodes each PNG lazily through the same
+decodeHiresOverride core as the disk set, so TexelsPerUnit is again the
+PNG's width over the TEXTURE1 width (64 for a flat). WallTexture/Flat
+order: ZDoom TEXTURES -> Heretic pack -> Quake 1 pack (both explicit
+opt-ins) -> embedded -> disk hi-res -> the WAD's own art. The tool embeds
+the hi-res override set (assets.HiresOverrideFiles; the Heretic pack for a
+Heretic WAD) for every wall/flat the converted maps reference, plus each
+one's whole animation family and switch partner
+(engine.TextureAnimGroups / engine.SwitchPartner — the engine's own
+ANIMATED/ANIMDEFS expansion, not a copy of it); -alltex embeds every name
+the WAD defines instead. Size: the 4x hi-res set averages ~0.4 MB per
+PNG, so DOOM1 comes to ~68 MB and Doom II ~189 MB; -max N re-encodes
+anything wider than N (Catmull-Rom), which only helps when N is well
+under the set's typical 1024 px.
+
+Heretic. A Heretic source converts like a Doom one: the stairs pass reads
+the same line/sector special conventions (movers excluded the same way),
+engine.TextureAnimGroups already covers Heretic's liquids, and the
+embedded texture set is the Heretic HD pack (assets.HereticOverrideFiles).
+heretic.wad: 48 maps, 243 runs, 1490 ramp sectors.
+
+Weapons (wad3d/weapons.go). Every output WAD carries the Doom, Doom II
+(Super Shotgun) and Heretic arsenals in a TPFWEAPN zip, so config's
+switchWeapons works in any game with no other IWAD on disk, and shareware
+Doom has the registered/Doom II guns' art. One arsenal at a time, as
+before — this only supplies the assets.
+  - What: engine.ArsenalAssets reads the sprite prefixes and sounds
+    straight from both weapon tables (installs the Heretic table, then
+    resetWeaponTables — offline use only), plus weaponPickupSkins /
+    ammoPickupSkins, the Heretic ammo/weapon things, and the puff/blood/
+    pickup-sound names the attack and pickup code uses directly.
+  - From: the Doom II-family IWAD (a Doom 1 IWAD with a warning — no SSG)
+    and the Heretic IWAD — -doom2/-heretic, else the source itself if it
+    is one, else wad.FindGameIWAD's usual IWAD search — plus the HD weapon
+    pack (assets/weapons/*.pk3), the ONLY source of Doom's viewmodel
+    frames (FIS0, PI0G, SHOG, ...). Any asset no source has is a hard
+    error unless -allow-missing-weapons.
+  - How: each sprite is frozen as the exact *RGBA that game's own
+    assets.Textures.Sprite returns — the same loader the game uses, so
+    per-sprite rules live there, not in the game: e.g. assets.New's
+    noHiresSprites (PLSF, the plasma flash, never takes the generic 4x
+    hi-res override — it lands on the screen's left edge against the HD
+    gun; formerly applied in engine.NewGame only, which the converter
+    bypassed) (its palette — Heretic art can't go
+    through Doom's — HD pack, hi-res overrides), stored as
+    sprites/<LUMP>.png plus a sprites/offsets.txt line "LUMP offX offY
+    texelsPerUnit bottomPad" (assets.EncodeEmbeddedSprite); sounds as raw
+    DMX sounds/<LUMP>.lmp. The SSG sits in both tables; the first source
+    wins. ~378 sprites + 31 sounds, ~34 MB.
+  - Engine: assets.Textures.Sprite consults the embedded set when the WAD
+    itself lacks the lump, ahead of the switchWeapons fallback IWAD;
+    SpriteFrame indexes it (spriteIndexFromNames) after the WAD's own
+    sprite namespace; Game.loadSound tries it (post-remap name, then the
+    original DS* one) before AltWAD. cmd/engine / cmd/isoengine log
+    "weapon art/sounds from ...'s embedded weapon set" instead of the
+    blank-art warning when the other IWAD is missing.
+
+Pass "stairs" (wad3d/stairs.go, on by default). Finds straight staircases
+and turns each into ONE continuous ramp:
+  - a step is a sector 0 < rise <= 24 above its lower neighbour; it must
+    not be a mover (topology.mover: tagged, a sector special, or the back
+    sector of a manual D-type door line, vanilla or BOOM generalized),
+    and not already in the source's SLOPES;
+  - consecutive risers must be straight (every endpoint within 2 units
+    of the fitted line), face within ~5 degrees of each other, and rise
+    within +-4 of the first; a tread much deeper than the first
+    (> max(2x, +16)) is a landing and ends the run; a fork ends it too;
+  - runs of >= -minsteps (3) steps get the single plane through the
+    bottom riser at the lower landing's height and the top riser at the
+    upper landing's — landings stay flat and meet the ramp exactly;
+  - rejected if steeper than 45 degrees, if any step vertex projects
+    outside the bottom..top risers (the plane would extrapolate), or if
+    ceiling-minus-ramp at any step vertex drops under 56 (player height);
+  - every step in a run gets the IDENTICAL three SLOPES points, with P1
+    on the bottom riser at a whole-number height — applySlopes rounds the
+    pivot height to int16, so this is what keeps adjacent steps
+    seam-free. Riser walls collapse to zero height on their own.
+Collision, sight and monster moves already read the tilted planes
+(wallOpeningAt, sectorFloorCeil). Known edge: a ramp step's FloorHeight
+now holds the pivot (the ramp's bottom height), which a neighbour-height
+special such as "lower lift to lowest adjacent floor" would read.
+Results: DOOM1 50 runs / 299 sectors, Doom 36 maps / 621 sectors, Doom II
+82 runs / 390 sectors.
+
+Tests: wad3d/wad3d_test.go (synthetic staircase -> one seam-free plane;
+tagged/special/manual-door/too-steep/low-headroom/already-sloped runs
+refused; every IWAD on hand converts, reloads, BSP-builds and parses with
+one SLOPES plane per ramp sector; embedded textures load at the right
+density, carry animation families, and shadow no IWAD lump),
+wad/tpf3d_test.go, and engine/wad3d_ramp_test.go (package engine_test,
+via engine/export_test.go): the player walks up E1M1's first generated
+ramp through tryMove/resolvePlayerZ to the top landing with no per-tic
+rise near a 16-unit step. Weapons: TestWeaponsEmbedded (shareware Doom
+resolves SSG/plasma/BFG and Heretic pickups + viewmodels with no other
+IWAD, the embedded crossbow is byte-identical to Heretic's own decode,
+and a Heretic WAD resolves Doom's) and TestWad3dWeaponSounds (a
+shareware session plays the SSG and crossbow sounds). TestConvertIWADs
+includes heretic.wad.
+
+Not yet: a room-over-room pass (vanilla self-referencing-sector bridges
+-> real 3D floors, which also needs monsters/hitscan to honour extra
+floors — see engine/roomoverroom.go), and cosmetic detail geometry
+(door-jamb bevels, trim) in its own lump.

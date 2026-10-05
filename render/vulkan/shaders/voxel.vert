@@ -18,13 +18,15 @@ layout(location = 2) in vec4 inColor;  // R8G8B8A8_UNORM -> 0..1
 layout(push_constant) uniform PC {
     mat4 mvp;   // viewProj * model
     vec4 trans; // xyz = world position (feet), w = scale (map units / voxel)
-    vec4 rot;   // x = cos(yaw), y = sin(yaw)
+    vec4 rot;   // x = cos(yaw), y = sin(yaw), z = mesh centre height (model space), w = sector + 1
 } pc;
 
 layout(location = 0) out vec3 vColor;
 layout(location = 1) out vec3 vNormal;
 layout(location = 2) out vec3 vWorldPos;
 layout(location = 3) out float vDepth;
+layout(location = 4) flat out vec3 vCenter; // world-space mesh centre (glass shading)
+layout(location = 5) flat out uint vSector; // sector + 1 (0 = unknown) — dynamic-light reach
 
 void main() {
     vec4 clip = pc.mvp * vec4(inPos, 1.0);
@@ -36,6 +38,8 @@ void main() {
     // model = translate(trans.xyz) * rotZ(yaw) * scale(k)
     vec3 rp = vec3(inPos.x * c - inPos.y * s, inPos.x * s + inPos.y * c, inPos.z) * k;
     vWorldPos = pc.trans.xyz + rp;
+    vCenter = pc.trans.xyz + vec3(0.0, 0.0, pc.rot.z * k);
+    vSector = uint(pc.rot.w + 0.5);
     vNormal = normalize(vec3(inNormal.x * c - inNormal.y * s,
                              inNormal.x * s + inNormal.y * c,
                              inNormal.z));

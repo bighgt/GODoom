@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"image"
 	"image/png"
 	"log"
 	"math"
@@ -63,6 +62,13 @@ type Particle struct {
 	// a raised one. See ExplosionScale.SparkBounceFloor and
 	// spawnBFGExtraSparks.
 	bounceFloor bool
+	// wallClip keeps the particle in the space it was spawned in: a
+	// horizontal step that would cross a wall or a closed door
+	// (traceBlock) is cancelled, and it can't rise past its sector's
+	// ceiling. Set on the barrel fire's flames and toxic smoke, which
+	// linger long enough to otherwise drift through into the next room.
+	// A door that opens meanwhile lets them through (the opening is live).
+	wallClip bool
 	// bounces, when bounceFloor is set, caps how many more times this
 	// particle is allowed to bounce before it just settles at the floor
 	// (DZ pinned to 0) instead of reflecting again. Negative means
@@ -833,6 +839,10 @@ type burstParams struct {
 // with orbitSpeed set (see Particle.orbitSpeed's own doc comment) — and
 // drops any that outlived their life. Cheap to call every frame even with
 // zero particles.
+// wallClipCeilMargin keeps a wallClip particle's centre this far under its
+// sector's ceiling, so smoke pools against it instead of rising through it.
+const wallClipCeilMargin = 8.0
+
 func (g *Game) updateParticles(dt float64) {
 	if len(g.particles) == 0 {
 		return
@@ -865,10 +875,22 @@ func (g *Game) updateParticles(dt float64) {
 			}
 			p.DX *= drag
 			p.DY *= drag
-			p.X += p.DX * dt
-			p.Y += p.DY * dt
+			nx, ny := p.X+p.DX*dt, p.Y+p.DY*dt
+			if p.wallClip {
+				if _, blocked := g.traceBlock(p.X, p.Y, p.Z, nx, ny, p.Z, false); blocked {
+					nx, ny = p.X, p.Y
+					p.DX, p.DY = 0, 0
+				}
+			}
+			p.X, p.Y = nx, ny
 		}
 		p.Z += p.DZ * dt
+		if p.wallClip {
+			if _, ceil := g.sectorFloorCeil(p.X, p.Y); p.Z > ceil-wallClipCeilMargin {
+				p.Z = ceil - wallClipCeilMargin
+				p.DZ = 0
+			}
+		}
 		if p.bounceFloor {
 			if floor, _ := g.sectorFloorCeil(p.X, p.Y); p.Z < floor {
 				p.Z = floor
@@ -939,7 +961,7 @@ func (g *Game) collectAllParticleSprites() (additive, transparent []worldgeo.Spr
 	additive = g.hwParticleSprites[:0]
 	transparent = g.hwTransparentParticleSprites[:0]
 	transparentFull := false
-	// viewCam mirrors collectWorldObjects' own: g.particles can run into the
+	// cone mirrors collectWorldObjects' own: g.particles can run into the
 	// tens of thousands after a big explosion's spark burst (see this
 	// function's own doc comment), and every one of them used to become a
 	// worldgeo.Sprite — triangulated, packed, and submitted to the GPU —
@@ -951,12 +973,12 @@ func (g *Game) collectAllParticleSprites() (additive, transparent []worldgeo.Spr
 	if fov <= 0 {
 		fov = 90
 	}
-	viewCam := worldgeo.Camera{X: g.Camera.X, Y: g.Camera.Y, Angle: g.Camera.Angle, FOVDeg: fov}
+	cone := worldgeo.NewViewCone(worldgeo.Camera{X: g.Camera.X, Y: g.Camera.Y, Angle: g.Camera.Angle, FOVDeg: fov})
 	for _, p := range g.particles {
 		if len(p.frames) == 0 {
 			continue
 		}
-		if !worldgeo.LightVisible(viewCam, p.X, p.Y, particleSightRadius) {
+		if !cone.Visible(p.X, p.Y, particleSightRadius) {
 			continue // outside the (widened) view cone — still ages/expires normally, just isn't drawn this frame
 		}
 		idx := (int(p.age*p.frameRate) + p.framePhase) % len(p.frames)
@@ -1921,33 +1943,18 @@ func loadParticlePNG(path string, tpu float64) *assets.RGBA {
 	if err != nil {
 		return nil
 	}
-	b := img.Bounds()
-	w, h := b.Dx(), b.Dy()
-	if w <= 0 || h <= 0 {
+	if b := img.Bounds(); b.Dx() <= 0 || b.Dy() <= 0 {
 		return nil
 	}
-	pix := make([]byte, w*h*4)
-	if nrgba, ok := img.(*image.NRGBA); ok && nrgba.Stride == w*4 && b.Min.X == 0 && b.Min.Y == 0 {
-		copy(pix, nrgba.Pix)
-	} else {
-		for y := 0; y < h; y++ {
-			for x := 0; x < w; x++ {
-				r, g, bch, a := img.At(b.Min.X+x, b.Min.Y+y).RGBA()
-				o := (y*w + x) * 4
-				pix[o], pix[o+1], pix[o+2], pix[o+3] = byte(r>>8), byte(g>>8), byte(bch>>8), byte(a>>8)
-			}
-		}
-	}
-	return &assets.RGBA{
-		Width: w, Height: h, Pix: pix, TexelsPerUnit: tpu,
-		// worldgeo.AddSprites anchors a billboard at (OffsetX, OffsetY) from
-		// its top-left corner — a monster/pickup sprite sets this to its
-		// WAD-authored "feet" hotspot, but these have no such hotspot, so
-		// leaving it at the zero value anchored the quad by its top-left
-		// corner instead: it rendered offset to one side and, vertically,
-		// entirely *below* the spawn point — at a floor-level explosion that
-		// buried the whole sprite under the floor, invisible. Half the
-		// image's own size centers the quad on (X, Y, Z) instead.
-		OffsetX: w / 2, OffsetY: h / 2,
-	}
+	im := assets.ImageToRGBA(img, tpu)
+	// worldgeo.AddSprites anchors a billboard at (OffsetX, OffsetY) from
+	// its top-left corner — a monster/pickup sprite sets this to its
+	// WAD-authored "feet" hotspot, but these have no such hotspot, so
+	// leaving it at the zero value anchored the quad by its top-left
+	// corner instead: it rendered offset to one side and, vertically,
+	// entirely *below* the spawn point — at a floor-level explosion that
+	// buried the whole sprite under the floor, invisible. Half the
+	// image's own size centers the quad on (X, Y, Z) instead.
+	im.OffsetX, im.OffsetY = im.Width/2, im.Height/2
+	return im
 }

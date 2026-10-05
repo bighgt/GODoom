@@ -32,12 +32,6 @@ func TestBuildAndTraverseSharewareDoom(t *testing.T) {
 		t.Errorf("tree has %d leaves, level has %d subsectors", leaves, len(lvl.Subsectors))
 	}
 	t.Logf("%s BSP: %d inner nodes, %d leaves", lvl.Name, nodes, leaves)
-
-	visited := 0
-	Traverse(tree, 0, 0, func(*Leaf) { visited++ })
-	if visited != leaves {
-		t.Errorf("Traverse visited %d leaves, want %d (every leaf exactly once)", visited, leaves)
-	}
 }
 
 // TestBuildRejectsCyclicNodes feeds Build a NODES array whose children point

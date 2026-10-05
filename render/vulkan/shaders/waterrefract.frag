@@ -26,6 +26,7 @@ layout(location = 3) in float vDepth; // this water fragment's own camera-forwar
 layout(location = 4) in vec3 vWorldPos;
 layout(location = 5) in vec3 vNormal;
 layout(location = 6) in float vAlpha;
+layout(location = 7) in flat uint vSector; // sector + 1 (0 = none) — see lightReaches
 
 layout(location = 0) out vec4 outColor;
 
@@ -50,6 +51,20 @@ layout(set = 1, binding = 2) uniform World {
     vec4 lightColor[MAX_LIGHTS];
     vec4 shadowCaster[SHADOW_MAX];
 } W;
+
+// Per-light sector reach (render.Light.Reach): bit s of light i's
+// REACH_STRIDE-word slice is set when the light can reach sector s
+// through open two-sided lines, so it doesn't shine through walls or a
+// closed door. lightColor[i].w flags whether light i has a mask at all;
+// vSector is the surface's sector + 1 (0 = none — sprites, particles).
+const uint REACH_STRIDE = 256u; // keep == vulkan.lightReachStride
+layout(std430, set = 1, binding = 3) readonly buffer LightReach { uint words[]; } LR;
+bool lightReaches(int i) {
+    if (W.lightColor[i].w < 0.5 || vSector == 0u) return true;
+    uint s = vSector - 1u;
+    if (s >= REACH_STRIDE * 32u) return true;
+    return (LR.words[uint(i) * REACH_STRIDE + (s >> 5)] & (1u << (s & 31u))) != 0u;
+}
 
 #define CAM_POS vec3(W.cam.w, W.nLights.z, W.nLights.w)
 
@@ -137,6 +152,7 @@ vec3 dynamicDiffuse(vec3 N, float specMask) {
     vec3 sum = vec3(0.0);
     int n = min(int(W.nLights.x), MAX_LIGHTS);
     for (int i = 0; i < n; ++i) {
+        if (!lightReaches(i)) continue;
         vec3 d = W.lightPos[i].xyz - vWorldPos;
         float d2 = dot(d, d);
         float atten = 1.0 - d2 * W.lightPos[i].w;
@@ -267,6 +283,7 @@ void main() {
     vec3 lref = vec3(0.0);
     int nlr = min(int(W.nLights.x), MAX_LIGHTS);
     for (int i = 0; i < nlr; ++i) {
+        if (!lightReaches(i)) continue;
         vec3 toL = W.lightPos[i].xyz - vWorldPos;
         float dl2 = dot(toL, toL);
         float al = max(dot(Rd, toL * inversesqrt(max(dl2, 1e-6))), 0.0);

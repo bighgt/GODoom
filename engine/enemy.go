@@ -39,6 +39,7 @@ func aLook(g *Game, mo *Mobj) {
 
 	woke := g.heardShot(mo, g.sectorSoundTarget(mo.X, mo.Y))
 	if !woke && !g.pLookForPlayers(mo, false) {
+		g.idleRoam(mo) // nothing noticed: walk about the level (roam.go)
 		return
 	}
 	if s := mo.Info.SeeSound; s != "" {
@@ -75,7 +76,18 @@ func aChase(g *Game, mo *Mobj) {
 		}
 	}
 
-	turnToMoveDir(mo)
+	if mo.roaming {
+		// Shot or provoked mid-trip (the damage/infighting code hands it a
+		// target): drop the trip and chase. Otherwise keep roaming.
+		if t := mo.Target; t != nil && t.Health > 0 && t.Flags&MF_SHOOTABLE != 0 {
+			mo.roaming, mo.roam = false, nil
+		} else {
+			g.roamChase(mo)
+			return
+		}
+	}
+
+	g.chaseTurn(mo)
 
 	if mo.Target == nil || mo.Target.Flags&MF_SHOOTABLE == 0 {
 		if g.pLookForPlayers(mo, true) {
@@ -149,6 +161,7 @@ func aFaceTarget(g *Game, mo *Mobj) {
 	}
 	mo.Flags &^= MF_AMBUSH
 	mo.Angle = math.Atan2(mo.Target.Y-mo.Y, mo.Target.X-mo.X)
+	mo.glideAng = 0 // an attack faces its target at once (see beginStepGlide)
 }
 
 // pLookForPlayers is id's P_LookForPlayers for a single player: the monster
@@ -182,15 +195,20 @@ func (g *Game) pMove(mo *Mobj) bool {
 		return false
 	}
 	speed := mo.Info.Speed
+	x0, y0, z0 := mo.X, mo.Y, mo.Z
 	tryX := mo.X + speed*dirVX[mo.MoveDir]
 	tryY := mo.Y + speed*dirVY[mo.MoveDir]
 	if !g.pTryMove(mo, tryX, tryY) {
-		return false // (Phase 5: try to open a door across this line)
+		// id's P_Move: blocked — push on any door here a monster may open,
+		// and wait for it (counts as a move, so the monster keeps heading
+		// this way instead of turning away from the door).
+		return g.monsterOpenDoor(mo, tryX, tryY)
 	}
 	mo.Flags &^= MF_INFLOAT
 	if mo.Flags&MF_FLOAT == 0 {
 		mo.Z = mo.FloorZ
 	}
+	g.beginStepGlide(mo, mo.X-x0, mo.Y-y0, mo.Z-z0, 0)
 	return true
 }
 
@@ -211,11 +229,17 @@ func (g *Game) pNewChaseDir(mo *Mobj) {
 	if mo.Target == nil {
 		return
 	}
+	g.pNewChaseDirTo(mo, mo.Target.X, mo.Target.Y)
+}
+
+// pNewChaseDirTo is pNewChaseDir toward a point instead of the target — a
+// roaming monster's next waypoint (roam.go).
+func (g *Game) pNewChaseDirTo(mo *Mobj, tx, ty float64) {
 	oldDir := mo.MoveDir
 	turnAround := opposite(oldDir)
 
-	dx := mo.Target.X - mo.X
-	dy := mo.Target.Y - mo.Y
+	dx := tx - mo.X
+	dy := ty - mo.Y
 
 	var dirX, dirY int = diNoDir, diNoDir
 	if dx > 10 {
@@ -398,7 +422,8 @@ func aTroopAttack(g *Game, mo *Mobj) {
 		g.pDamageMobj(mo.Target, mo, mo, (pRandom()%8+1)*3)
 		return
 	}
-	g.pSpawnMissile(mo, mo.Target, MT_TROOPSHOT)
+	th := g.pSpawnMissile(mo, mo.Target, MT_TROOPSHOT)
+	th.fxPhase = fxRand.Intn(64)
 }
 
 func aSargAttack(g *Game, mo *Mobj) {
@@ -420,7 +445,8 @@ func aHeadAttack(g *Game, mo *Mobj) {
 		g.pDamageMobj(mo.Target, mo, mo, (pRandom()%6+1)*10)
 		return
 	}
-	g.pSpawnMissile(mo, mo.Target, MT_HEADSHOT)
+	th := g.pSpawnMissile(mo, mo.Target, MT_HEADSHOT)
+	th.fxPhase = fxRand.Intn(64)
 }
 
 func aBruisAttack(g *Game, mo *Mobj) {

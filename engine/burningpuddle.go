@@ -56,6 +56,15 @@ type burningPuddle struct {
 	// in unison, which would read as one synchronized light rather than
 	// several independent restless flames.
 	seed int
+	// fire identifies the barrel this splatter came from — all of one
+	// barrel's splatters share one dynamic light (appendFireLights), not
+	// one light each.
+	fire int
+	// lit / litAt: whether this splatter has spawned its first flame lick
+	// yet, and its burn time (duration - remaining) when it did — its light
+	// waits for the flames and fades in with them (puddleLight).
+	lit   bool
+	litAt float64
 	// cluster is how many of this barrel's OTHER splatters landed within
 	// puddleClusterRadius of this one, capped at puddleClusterMax — fixed
 	// once at spawn (see spawnBurningPuddle). A tightly packed group of
@@ -141,6 +150,7 @@ const (
 // tradeoff of that performance setting, consistent with it already
 // governing every other particle effect in the game.
 func (g *Game) spawnBurningPuddle(x, y, z float64) {
+	g.nextFireID++
 	n := burningSplatterMin + pRandom()%(burningSplatterMax-burningSplatterMin+1)
 	// Landing spots are picked first, all of them, before any burningPuddle
 	// is created — clustering (see puddleClusterRadius) needs every other
@@ -151,7 +161,9 @@ func (g *Game) spawnBurningPuddle(x, y, z float64) {
 	for i := range spots {
 		ang := pRandomF01() * 2 * math.Pi
 		dist := math.Sqrt(pRandomF01()) * burningSplatterThrowRadius
-		sx, sy := x+math.Cos(ang)*dist, y+math.Sin(ang)*dist
+		// Thrown liquid can't pass through a wall or closed door (or up a
+		// step taller than puddleTraceLift): it lands short of it instead.
+		sx, sy := g.pullBackFromWall(x, y, z+puddleTraceLift, ang, dist)
 		sz, _ := g.sectorFloorCeil(sx, sy) // each splatter sits on its OWN floor height, not the blast's
 		spots[i] = spot{sx, sy, sz, pRandomF01()}
 	}
@@ -181,6 +193,7 @@ func (g *Game) spawnBurningPuddle(x, y, z float64) {
 			decalRot:      pRandomF01() * 2 * math.Pi,
 			seed:          pRandom(),
 			cluster:       cluster,
+			fire:          g.nextFireID,
 		})
 	}
 }
@@ -300,10 +313,34 @@ func puddleSpreadRadius(p *burningPuddle) float64 {
 	return burningPuddleMinRadius + p.amount*(burningPuddleMaxRadius-burningPuddleMinRadius)
 }
 
-func puddleSamplePoint(p *burningPuddle, radiusScale float64) (x, y float64) {
+// A sample that would land across a wall or closed door from the puddle's
+// centre is pulled back to just short of it (pullBackFromWall), so a
+// puddle against a wall never puts flame or smoke on its far side.
+func (g *Game) puddleSamplePoint(p *burningPuddle, radiusScale float64) (x, y float64) {
 	ang := pRandomF01() * 2 * math.Pi
 	dist := math.Sqrt(pRandomF01()) * puddleSpreadRadius(p) * radiusScale
-	return p.x + math.Cos(ang)*dist, p.y + math.Sin(ang)*dist
+	return g.pullBackFromWall(p.x, p.y, p.z+puddleTraceLift, ang, dist)
+}
+
+// puddleTraceLift is the height above the floor at which the barrel
+// fire's wall checks run — low enough that a step up taller than this
+// stops the spill, high enough to clear the floor itself.
+const puddleTraceLift = 16.0
+
+// puddleWallMargin is how far short of a blocking wall a pulled-back
+// splatter or spawn point stops.
+const puddleWallMargin = 6.0
+
+// pullBackFromWall returns the point dist along angle ang from (x, y),
+// shortened to stop puddleWallMargin before the nearest wall or closed
+// door in the way (traceBlock at height z), if any.
+func (g *Game) pullBackFromWall(x, y, z, ang, dist float64) (float64, float64) {
+	ex, ey := x+math.Cos(ang)*dist, y+math.Sin(ang)*dist
+	if t, blocked := g.traceBlock(x, y, z, ex, ey, z, true); blocked {
+		dist = max(t*dist-puddleWallMargin, 0)
+		ex, ey = x+math.Cos(ang)*dist, y+math.Sin(ang)*dist
+	}
+	return ex, ey
 }
 
 // Flame licks: many small, short-lived instances rather than a few big
@@ -349,11 +386,14 @@ const (
 )
 
 func (g *Game) spawnPuddleFlame(p *burningPuddle, frames []*assets.RGBA, fade float64) {
+	if !p.lit {
+		p.lit, p.litAt = true, p.duration-p.remaining
+	}
 	// Same shrinking footprint as the visible puddle decal (see
 	// collectGroundSplats) — the fire should stay confined to whatever's
 	// actually left burning, not keep spawning across the puddle's
 	// original, now-shrunk extent.
-	x, y := puddleSamplePoint(p, 0.4+0.6*fade)
+	x, y := g.puddleSamplePoint(p, 0.4+0.6*fade)
 	sizeFade := 0.5 + 0.5*fade
 	// clusterMul grows a tightly packed group of splatters into one bigger
 	// combined flame over time — see puddleClusterFactor's own doc comment.
@@ -376,6 +416,7 @@ func (g *Game) spawnPuddleFlame(p *burningPuddle, frames []*assets.RGBA, fade fl
 		hold:          fireHoldFrac,
 		clearBrighten: fireClearCool,
 		frames:        frames,
+		wallClip:      true,
 	}
 	g.particles = append(g.particles, fp)
 	// Tracked so spawnPuddleSmoke can spawn off wherever this flame lick
@@ -469,7 +510,7 @@ func (g *Game) spawnPuddleSmoke(p *burningPuddle, frames []*assets.RGBA, fade fl
 	if fp := pickAliveFlame(p.flameParticles); fp != nil {
 		x, y, baseZ = fp.X, fp.Y, fp.Z
 	} else {
-		x, y = puddleSamplePoint(p, 0.6)
+		x, y = g.puddleSamplePoint(p, 0.6)
 		baseZ = p.z
 	}
 	sizeFade := 0.5 + 0.5*fade
@@ -480,11 +521,11 @@ func (g *Game) spawnPuddleSmoke(p *burningPuddle, frames []*assets.RGBA, fade fl
 	for i := 0; i < puddleSmokeClusterSize; i++ {
 		jang := pRandomF01() * 2 * math.Pi
 		jr := pRandomF01() * puddleSmokeClusterJitter
-		jx, jy := math.Cos(jang)*jr, math.Sin(jang)*jr
+		px, py := g.pullBackFromWall(x, y, baseZ+puddleSmokeSpawnLift, jang, jr)
 		jz := (pRandomF01() - 0.5) * puddleSmokeClusterZJitter
 		dx, dy := yawSpeedXYAt(pRandomF01()*2*math.Pi, 4)
 		g.particles = append(g.particles, &Particle{
-			X: x + jx, Y: y + jy, Z: baseZ + puddleSmokeSpawnLift + jz,
+			X: px, Y: py, Z: baseZ + puddleSmokeSpawnLift + jz,
 			DX: dx, DY: dy,
 			DZ:            puddleSmokeRise * (0.5 + 0.5*pRandomF01()),
 			life:          randRange(puddleSmokeLifeMin, puddleSmokeLifeMax),
@@ -499,6 +540,7 @@ func (g *Game) spawnPuddleSmoke(p *burningPuddle, frames []*assets.RGBA, fade fl
 			growFrac:      puddleSmokeGrowFrac,
 			clearBrighten: puddleSmokeBrighten,
 			frames:        frames,
+			wallClip:      true,
 		})
 	}
 }
@@ -572,11 +614,19 @@ const (
 	// itself (which every other flame/lava light in the game still uses
 	// unboosted).
 	puddleLightFlickerBoost = 2.0
+	// puddleLightRampSeconds is how long a splatter's light takes to come
+	// up to full after its first flame lick appears — about as long as the
+	// flame bed takes to fill in (a lick lives ~0.5s, new ones arriving
+	// every 0.07-0.2s), so the glow grows with the fire instead of
+	// switching on at full strength under a single small flame.
+	puddleLightRampSeconds = 0.6
 )
 
 // puddleLight returns the flickering point light one burning puddle casts,
-// or ok=false while it's still waiting to ignite or has burned down too
-// far to matter. Reuses maplights.go's own flickerWobble — the same
+// or ok=false until its flames have actually appeared (no light before the
+// fire, nor at all with explosionParticles off, when the flames aren't
+// drawn) or once it has burned down too far to matter. It fades in over
+// puddleLightRampSeconds from the first flame lick. Reuses maplights.go's own flickerWobble — the same
 // restless per-tic wobble a torch or lava's static light gets — so a
 // barrel fire's glow looks like it belongs to the same family of flame
 // light already established elsewhere in the engine, just for a dynamic
@@ -586,10 +636,12 @@ const (
 // several puddles burning near each other flickering independently rather
 // than in unison.
 func (g *Game) puddleLight(p *burningPuddle) (render.Light, bool) {
-	if p.ignitionDelay > 0 {
+	if !p.lit || !g.explosionParticles {
 		return render.Light{}, false
 	}
-	fade := puddleFade(p)
+	ramp := min((p.duration-p.remaining-p.litAt)/puddleLightRampSeconds, 1)
+	ramp = ramp * ramp * (3 - 2*ramp) // smoothstep: eases in and settles
+	fade := puddleFade(p) * ramp
 	if fade <= 0.05 {
 		return render.Light{}, false
 	}
@@ -605,4 +657,77 @@ func (g *Game) puddleLight(p *burningPuddle) (render.Light, bool) {
 		X: float32(p.x), Y: float32(p.y), Z: float32(p.z) + puddleLightHeight,
 		Radius: radius, R: puddleLightR, G: puddleLightG, B: puddleLightB, Intensity: inten,
 	}, true
+}
+
+// fireLightMaxIntensity caps one barrel fire's combined light. Its
+// splatters' intensities sum, but as separate lights they were spread out
+// and mostly didn't overlap, so the merged light is capped near one big
+// flame's brightness instead. fireLightSpreadFrac is how much of the
+// spill's spread the merged radius grows by — enough to reach the far
+// splatters' surroundings without lighting the whole room.
+const (
+	fireLightMaxIntensity = 1.2
+	fireLightSpreadFrac   = 0.5
+)
+
+// appendFireLights adds one light per burning barrel fire: its live
+// splatters' puddleLights merged at their intensity-weighted centre, with
+// the summed (capped) intensity and a radius grown to cover the spread —
+// rather than one light per splatter (up to burningSplatterMax each). One
+// barrel then costs the shaders one light instead of dozens, and its
+// sector reach (lightreach.go) is flooded once.
+func (g *Game) appendFireLights(out []render.Light, cx, cy float32) []render.Light {
+	fires := g.fireLightScratch[:0]
+	fireOf := func(id int) *fireAcc {
+		for i := range fires {
+			if fires[i].id == id {
+				return &fires[i]
+			}
+		}
+		fires = append(fires, fireAcc{id: id})
+		return &fires[len(fires)-1]
+	}
+	for _, p := range g.burningPuddles {
+		dx, dy := float32(p.x)-cx, float32(p.y)-cy
+		if dx*dx+dy*dy > puddleLightCullDist*puddleLightCullDist {
+			continue
+		}
+		l, ok := g.puddleLight(p)
+		if !ok {
+			continue
+		}
+		f := fireOf(p.fire)
+		w := l.Intensity
+		f.x, f.y, f.z, f.w = f.x+l.X*w, f.y+l.Y*w, f.z+l.Z*w, f.w+w
+		f.r, f.g, f.b = f.r+l.R*w, f.g+l.G*w, f.b+l.B*w
+		f.maxRad = max(f.maxRad, l.Radius)
+	}
+	for i := range fires {
+		f := &fires[i]
+		x, y, z := f.x/f.w, f.y/f.w, f.z/f.w
+		// Grow the radius by part of how far the lit splatters spread from
+		// the centre (fireLightSpreadFrac).
+		spread := 0.0
+		for _, p := range g.burningPuddles {
+			if p.fire == f.id && p.lit {
+				spread = max(spread, math.Hypot(p.x-float64(x), p.y-float64(y)))
+			}
+		}
+		out = append(out, render.Light{
+			X: x, Y: y, Z: z,
+			Radius: f.maxRad + float32(spread)*fireLightSpreadFrac,
+			R:      f.r / f.w, G: f.g / f.w, B: f.b / f.w,
+			Intensity: min(f.w, fireLightMaxIntensity),
+		})
+	}
+	g.fireLightScratch = fires
+	return out
+}
+
+// fireAcc is one barrel fire's running intensity-weighted sums in
+// appendFireLights.
+type fireAcc struct {
+	id                  int
+	x, y, z, w, r, g, b float32
+	maxRad              float32
 }

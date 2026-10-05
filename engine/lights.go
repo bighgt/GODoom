@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"math"
 	"sort"
 
 	"twopointfive/render"
@@ -22,8 +23,12 @@ func (g *Game) muzzleFlashLight() (render.Light, bool) {
 		return render.Light{}, false
 	}
 	dx, dy, _ := aimDirection(g.Camera)
+	// Pulled back short of a wall right in front of the gun, so the flash
+	// lights the player's own room rather than the one behind the wall
+	// (lightreach.go floods from the light's own sector).
+	x, y := g.pullBackFromWall(g.Camera.X, g.Camera.Y, g.Camera.Z, math.Atan2(dy, dx), 48)
 	return render.Light{
-		X: float32(g.Camera.X + dx*48), Y: float32(g.Camera.Y + dy*48), Z: float32(g.Camera.Z),
+		X: float32(x), Y: float32(y), Z: float32(g.Camera.Z),
 		Radius: 340, R: 1.0, G: 0.92, B: 0.75, Intensity: 1.5,
 	}, true
 }
@@ -102,7 +107,7 @@ func missileLight(mo *Mobj, px, py, pz float64) (render.Light, bool) {
 	case MT_TROOPSHOT:
 		r, gg, b, radius, inten = 1.0, 0.55, 0.20, 150, 1.3 // imp: warm orange
 	case MT_HEADSHOT:
-		r, gg, b, radius, inten = 0.55, 0.45, 1.0, 160, 1.3 // caco: blue-violet
+		r, gg, b, radius, inten = 0.8, 0.3, 0.95, 175, 1.3 // caco: purple — its red core in blue flames
 	case MT_BRUISERSHOT:
 		r, gg, b, radius, inten = 0.35, 1.0, 0.35, 160, 1.4 // baron / knight: green
 	default:
@@ -110,6 +115,9 @@ func missileLight(mo *Mobj, px, py, pz float64) (render.Light, bool) {
 	}
 	if mo.Flags&MF_MISSILE == 0 { // exploding
 		r, gg, b = 1.0, 0.72, 0.40
+		if mo.Type == MT_HEADSHOT {
+			r, gg, b = 1.0, 0.45, 0.85 // the caco's burst flashes red-violet
+		}
 		radius *= 1.6
 		inten *= 1.8
 	}
@@ -215,24 +223,18 @@ func (g *Game) collectLights() (lights []render.Light, dynamicN int) {
 			if l, ok := monsterFlashLight(mo, ix, iy, iz); ok {
 				out = append(out, l)
 			}
+		case MT_SKULL:
+			if l, ok := g.lostSoulLight(mo, ix, iy, iz); ok {
+				out = append(out, l)
+			}
 		}
 	}
 	// Burning-puddle fire (engine/burningpuddle.go) — a barrel's spilled
 	// fuel still alight on the floor throws its own flickering glow, the
-	// same way a torch or lava's static light does (see puddleLight). A
-	// dynamic emitter, not a static one: puddles spawn/despawn at runtime,
-	// so they're scored here every frame rather than baked into
-	// g.staticLights once at level load. Distance-culled first since one
-	// barrel can leave dozens of these burning at once.
-	for _, p := range g.burningPuddles {
-		dx, dy := float32(p.x)-cx, float32(p.y)-cy
-		if dx*dx+dy*dy > puddleLightCullDist*puddleLightCullDist {
-			continue
-		}
-		if l, ok := g.puddleLight(p); ok {
-			out = append(out, l)
-		}
-	}
+	// same way a torch or lava's static light does: one light per barrel
+	// fire, merged from its splatters (appendFireLights). Dynamic, not
+	// baked into g.staticLights: puddles spawn/despawn at runtime.
+	out = g.appendFireLights(out, cx, cy)
 	// Dynamic lights alone overflowing the budget is pathological (BFG
 	// spam) — if it happens, keep the nearest.
 	if len(out) > activeLightBudget {
@@ -248,6 +250,7 @@ func (g *Game) collectLights() (lights []render.Light, dynamicN int) {
 	}
 
 	out = g.appendMapLights(out)
+	g.attachLightReach(out) // so none of them shines through a wall (lightreach.go)
 	g.lightScratch = out
 	return out, dynamicN
 }

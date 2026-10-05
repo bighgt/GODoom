@@ -108,7 +108,9 @@ func (r *Renderer) DrawWeapon(spritePrefix string, gunFrame byte, flashPrefix st
 	// bright (it's an FF_FULLBRIGHT sprite that lights the gun, not lit by it).
 	r.blit(gunSp, gunX, gunY, false, pspriteShade(sectorLight, false), true, bobScale) // weapon transform (ignores hudScale)
 
-	if !hasFlash {
+	// "TNT1" is ZDoom's invisible sprite: a flash that only lights the room
+	// (engine.muzzleFlashLight) and draws nothing — the HD plasma rifle's.
+	if !hasFlash || flashPrefix == NoSpritePrefix {
 		return
 	}
 	flashSp, ok := r.textures.Sprite(spriteName(flashPrefix, flashFrame))
@@ -120,6 +122,10 @@ func (r *Renderer) DrawWeapon(spritePrefix string, gunFrame byte, flashPrefix st
 	flashY := gunY + int(float64(gunSp.OffsetY)/gunTPU*bobScale) - int(float64(flashSp.OffsetY)/flashTPU)
 	r.blit(flashSp, flashX, flashY, false, 256, true, 1)
 }
+
+// NoSpritePrefix is ZDoom's "TNT1" — a state with no visible sprite. A
+// weapon uses it for a flash that only casts light.
+const NoSpritePrefix = "TNT1"
 
 func spriteName(prefix string, frame byte) string {
 	// Direct concatenation instead of fmt.Sprintf: this runs 2-3x every

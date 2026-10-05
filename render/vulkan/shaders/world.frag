@@ -13,6 +13,7 @@ layout(location = 3) in float vDepth;   // camera-forward distance, map units
 layout(location = 4) in vec3 vWorldPos; // world position, map units
 layout(location = 5) in vec3 vNormal;   // unit surface normal
 layout(location = 6) in float vAlpha;   // KindSpriteTrans's real blend weight
+layout(location = 7) in flat uint vSector; // sector + 1 (0 = none) — see lightReaches
 
 layout(location = 0) out vec4 outColor;
 
@@ -57,6 +58,20 @@ layout(set = 1, binding = 2) uniform World {
     vec4 shadowCaster[SHADOW_MAX];  // xyz = floor pos, w = radius (0 = list end)
 } W;
 
+// Per-light sector reach (render.Light.Reach): bit s of light i's
+// REACH_STRIDE-word slice is set when the light can reach sector s
+// through open two-sided lines, so it doesn't shine through walls or a
+// closed door. lightColor[i].w flags whether light i has a mask at all;
+// vSector is the surface's sector + 1 (0 = none — sprites, particles).
+const uint REACH_STRIDE = 256u; // keep == vulkan.lightReachStride
+layout(std430, set = 1, binding = 3) readonly buffer LightReach { uint words[]; } LR;
+bool lightReaches(int i) {
+    if (W.lightColor[i].w < 0.5 || vSector == 0u) return true;
+    uint s = vSector - 1u;
+    if (s >= REACH_STRIDE * 32u) return true;
+    return (LR.words[uint(i) * REACH_STRIDE + (s >> 5)] & (1u << (s & 31u))) != 0u;
+}
+
 #define CAM_POS vec3(W.cam.w, W.nLights.z, W.nLights.w)
 
 const uint KIND_WALL         = 0u;
@@ -69,7 +84,7 @@ const uint KIND_LIQUID_WATER = 6u; // water floor: fresnel sky reflection
 const uint KIND_LIQUID_LAVA  = 7u; // lava floor: warm emissive glow
 const uint KIND_LIQUID_NUKAGE= 8u; // nukage/slime floor: green emissive tint
 const uint KIND_SPRITE_TRANS = 9u; // billboard, real alpha blend (vAlpha) — additive-pipeline particles' translucent sibling
-const uint KIND_TELEPORT     = 10u; // teleporter-pad floor: procedural blue/white shimmer, ignores uTex entirely
+const uint KIND_TELEPORT     = 10u; // teleporter-pad floor: procedural shimmering blue water, ignores uTex entirely
 
 // AMBIENT: the fallback faint cool floor a fully-shadowed world pixel
 // settles to instead of pure black — used only when the engine hasn't
@@ -202,18 +217,65 @@ vec3 waterWave(vec2 wp, float t) {
 }
 
 // teleportHash turns a 2D coordinate into a pseudo-random 0..1 value — used
-// by the KIND_TELEPORT branch below so each patch of a teleporter pad
-// twinkles on its own independent, uncorrelated phase instead of sharing
-// one continuous phase gradient across the surface (a shared gradient is
-// exactly what a sine of a raw linear x/y combination produces, and reads
-// as a moving line/band, not a scattered twinkle). Not shared with
-// worldblit.frag's own similar hash12 — this codebase has no GLSL
-// #include, so every fragment shader here already duplicates small
-// helpers like this rather than sharing them across files.
+// by the KIND_TELEPORT branch below so each caustic cell and glitter point
+// moves on its own uncorrelated phase instead of sharing one continuous
+// phase gradient across the surface (a sine of a raw linear x/y
+// combination reads as a moving band, not a scattered shimmer). Not shared
+// with worldblit.frag's own similar hash12 — this codebase has no GLSL
+// #include, so every fragment shader here duplicates small helpers.
 float teleportHash(vec2 p) {
     p = fract(p * vec2(127.1, 311.7));
     p += dot(p, p + 34.23);
     return fract(p.x * p.y);
+}
+
+// teleportCaustic is the bright, wobbling light-net seen on the bottom of a
+// sunlit pool: a soft glow along the cell edges of a jittered-point
+// (Voronoi) field, every point drifting on its own slow circle so the net
+// continuously flexes instead of popping. The input is domain-warped first,
+// which bends Voronoi's straight edges into wavy filaments — unwarped, it
+// reads as cracked glass. ~1 on a filament, falling off to 0 between them.
+// Voronoi (not a grid) so there's no tile seam at any scale.
+float teleportCaustic(vec2 p, float t) {
+    p += 0.45 * vec2(sin(p.y * 1.3 + t * 0.8), sin(p.x * 1.1 - t * 0.7));
+    vec2 base = floor(p);
+    vec2 f = fract(p);
+    float d1 = 8.0, d2 = 8.0;
+    for (int oy = -1; oy <= 1; oy++) {
+        for (int ox = -1; ox <= 1; ox++) {
+            vec2 o = vec2(float(ox), float(oy));
+            vec2 h = vec2(teleportHash(base + o), teleportHash(base + o + 91.0));
+            vec2 pt = o + 0.5 + 0.4 * sin(t * (0.7 + h.yx) + 6.2831853 * h);
+            float d = distance(f, pt);
+            if (d < d1) {
+                d2 = d1;
+                d1 = d;
+            } else if (d < d2) {
+                d2 = d;
+            }
+        }
+    }
+    return exp(-12.0 * (d2 - d1));
+}
+
+// reflectedLights is the water surfaces' cheap stand-in for true SSR on the
+// most important reflectors: reflect the view ray about the up normal,
+// ripple it by the wave slope, and score each dynamic light (torch, lava
+// glow, muzzle flash) by how closely the reflected ray points at it —
+// wobbling coloured streaks on the surface.
+vec3 reflectedLights(vec2 slope) {
+    vec3 Rd = normalize(reflect(normalize(vWorldPos - CAM_POS), vec3(0.0, 0.0, 1.0))
+                        + vec3(slope * 0.16, 0.0));
+    vec3 lref = vec3(0.0);
+    int n = min(int(W.nLights.x), MAX_LIGHTS);
+    for (int i = 0; i < n; ++i) {
+        if (!lightReaches(i)) continue;
+        vec3 toL = W.lightPos[i].xyz - vWorldPos;
+        float dl2 = dot(toL, toL);
+        float al = max(dot(Rd, toL * inversesqrt(max(dl2, 1e-6))), 0.0);
+        lref += W.lightColor[i].rgb * pow(al, 48.0) / (1.0 + dl2 * 0.0006);
+    }
+    return lref;
 }
 
 // lavaWave is waterWave's molten-rock counterpart: one bespoke function per
@@ -311,6 +373,7 @@ vec3 bumpedNormal(vec3 N) {
 bool anyLightNear(vec3 P) {
     int n = min(int(W.nLights.x), MAX_LIGHTS);
     for (int i = 0; i < n; ++i) {
+        if (!lightReaches(i)) continue;
         vec3 d = W.lightPos[i].xyz - P;
         if (dot(d, d) * W.lightPos[i].w < 1.0) return true;
     }
@@ -364,6 +427,7 @@ vec3 dynamicDiffuse(vec3 N, float specMask) {
     vec3 sum = vec3(0.0);
     int n = min(int(W.nLights.x), MAX_LIGHTS);
     for (int i = 0; i < n; ++i) {
+        if (!lightReaches(i)) continue;
         vec3 d = W.lightPos[i].xyz - vWorldPos;
         float d2 = dot(d, d);
         float atten = 1.0 - d2 * W.lightPos[i].w; // 1 - (dist/R)^2
@@ -434,124 +498,65 @@ void main() {
     }
 
     if (vKind == KIND_TELEPORT) {
-        // Teleporter pad: a fully procedural blue/white cut-diamond
-        // surface — no sampling of uTex (the real GATE1-4 texture) at all,
-        // so the old art is completely replaced rather than tinted/warped
-        // like the liquid floors are. Three earlier cuts of this each
-        // fixed a "blocky" bug (a sine of a raw linear world-X/Y
-        // combination reads as a moving line; a per-64-unit-tile radial
-        // glow resets hard at every tile seam) before landing on the
-        // jittered-point (Voronoi) technique both the facets and the
-        // sparkle below now share — it has no grid/tile edge at any scale.
-        //
-        // Facets: the pad is partitioned into irregular cells (a jittered
-        // point per cell, nearest-point-wins — real Voronoi, not a plain
-        // grid), each standing in for one flat face of a cut gem with its
-        // own randomly tilted fake normal. A facet's own highlight is only
-        // bright when the view ray happens to line up with THAT facet's
-        // own tilt, so as the camera moves different facets flash in turn
-        // instead of one uniform sheen — a two-tier pow(dot(N,V)) (broad
-        // soft flash plus a much tighter hard glint riding the same
-        // normal) so a lit facet shows both a sheen and a pinprick sparkle
-        // at once, a thin bright cut-line where neighbouring facets meet
-        // (from the Voronoi cell's own edge distance), a per-facet flat
-        // brightness variance so it reads as faceted even between flashes,
-        // and a per-facet "fire" tint drifting across a narrow icy-blue /
-        // violet / cyan spectrum so neighbouring flashes don't all read as
-        // the exact same colour — real cut gems disperse light into
-        // exactly this kind of shifting colour, not a flat white glint.
-        // Sparkle then layers finer, faster-twinkling points on top, and a
-        // Fresnel rim brightens the whole surface at grazing view angles
-        // (the real floor normal, not a facet's fake one) the same way the
-        // mirror reflection below does. That reflection (alpha 0, same tag
-        // water uses) still runs on top of all of this, plus the real
-        // rising glitter particles (engine/teleportambience.go) for the
-        // upward motion a flat floor plane can't itself show.
+        // Teleporter pad: a glowing pool of shimmering blue water — fully
+        // procedural, no sampling of uTex (the real GATE1-4 art), so the
+        // old texture is replaced rather than tinted. It ripples with the
+        // very same waterWave the water floor uses, so worldresolve.frag's
+        // screen-space reflection (run on it via the alpha-0 tag below,
+        // rippled by its own copy of waterWave) wobbles in step with the
+        // surface. On top: an animated caustic light-net on the pool
+        // bottom, glitter twinkling on the wave crests, a Fresnel sheen at
+        // grazing angles, and the reflected-torch streaks real water gets.
+        // The rising glitter particles (engine/teleportambience.go) add
+        // the upward motion a flat plane can't show itself.
         float t = W.nLights.y;
-        vec3 V = normalize(CAM_POS - vWorldPos);
+        vec3 wv = waterWave(vWorldPos.xy, t);
 
-        float shimmer = mix(0.9, 1.1, 0.5 + 0.5 * sin(t * 1.1));
+        float h = W.screen.y;
+        float horizonY = h * 0.5 + W.screen.w;
+        float graz = clamp(1.0 - (gl_FragCoord.y - horizonY) / max(h - horizonY, 1.0), 0.0, 1.0);
+        float depth = clamp(0.25 + 0.55 * graz, 0.0, 1.0);
 
-        // Nearest-point Voronoi over a 3x3 neighbourhood — bestCellID
-        // identifies which facet this pixel belongs to; bestDist/secondDist
-        // (nearest/second-nearest point distance) locate the cell's own
-        // edge, for the thin bright cut-lines below.
-        vec2 fUV = vWorldPos.xy / 7.0;
-        vec2 fBase = floor(fUV);
-        vec2 fLocal = fract(fUV);
-        float bestDist = 8.0, secondDist = 8.0;
-        vec2 bestCellID = fBase;
-        for (int oy = -1; oy <= 1; oy++) {
-            for (int ox = -1; ox <= 1; ox++) {
-                vec2 cellID = fBase + vec2(float(ox), float(oy));
-                vec2 pointPos = vec2(float(ox), float(oy)) + vec2(teleportHash(cellID), teleportHash(cellID + 91.0));
-                float dd = distance(fLocal, pointPos);
-                if (dd < bestDist) {
-                    secondDist = bestDist;
-                    bestDist = dd;
-                    bestCellID = cellID;
-                } else if (dd < secondDist) {
-                    secondDist = dd;
-                }
-            }
-        }
-        vec2 tilt = (vec2(teleportHash(bestCellID + 3.0), teleportHash(bestCellID + 7.0)) - 0.5) * 1.6;
-        vec3 facetN = normalize(vec3(tilt, 1.0));
-        float ndv = max(dot(facetN, V), 0.0);
-        // Two-tier highlight: a broad soft flash plus a much tighter hard
-        // glint riding the same facet normal — real cut gems show both a
-        // wide sheen and pinprick-sharp sparkle points at once, not just
-        // one size of highlight.
-        float facetSpec = pow(ndv, 40.0) * 0.6 + pow(ndv, 220.0) * 1.6;
-        float facetShade = 0.8 + 0.35 * teleportHash(bestCellID + 13.0);
-        // Cut-line: a thin bright seam where facets meet (secondDist and
-        // bestDist converge), like the visible edges between a diamond's
-        // faces.
-        float facetEdge = 1.0 - smoothstep(0.0, 0.10, secondDist - bestDist);
-        // Fire: each facet's highlight leans toward a different point on a
-        // narrow icy-blue -> violet -> cyan spectrum (never far off the
-        // established blue/white theme) — a diamond's dispersion "fire",
-        // where neighbouring facets flash different tints instead of one
-        // flat colour.
-        float hue = teleportHash(bestCellID + 23.0);
-        vec3 fireA = vec3(0.60, 0.85, 1.00);
-        vec3 fireB = vec3(0.75, 0.60, 1.00);
-        vec3 fireC = vec3(0.55, 1.00, 0.95);
-        vec3 facetColor = mix(mix(fireA, fireB, clamp(hue * 2.0, 0.0, 1.0)), fireC, clamp(hue * 2.0 - 1.0, 0.0, 1.0));
-        // Rim: the real (not fake-tilted) floor normal brightens at
-        // grazing view angles, same Fresnel shape the mirror reflection
-        // below already uses — a gem-like edge glow independent of any one
-        // facet's own flash.
-        float rim = pow(1.0 - clamp(dot(vNormal, V), 0.0, 1.0), 5.0);
+        // Body: luminous blue where shallow / on a crest, deep blue with
+        // view depth, shaded by the wave slope so the ripples themselves
+        // read, and breathing slowly so the whole pad pulses faintly.
+        vec3 shallow = vec3(0.06, 0.30, 0.72);
+        vec3 deep = vec3(0.01, 0.05, 0.18);
+        float pulse = 0.9 + 0.1 * sin(t * 1.1);
+        float slopeShade = 0.8 + 0.12 * clamp(wv.x + 0.6 * wv.y, -2.0, 2.0);
+        vec3 body = mix(shallow, deep, depth) * (0.75 + 0.45 * wv.z) * slopeShade * pulse;
 
-        // Fine sparkle: a second, smaller-scale jittered-point field,
-        // twinkling faster than any one facet flash lasts.
+        // Caustics: two drifting light-nets at different scales/speeds,
+        // refracted by the wave slope; where their filaments cross, a
+        // brighter knot, as real caustics show. Faded out with view depth
+        // and distance (fine filaments would only shimmer/alias far off).
+        vec2 cp = vWorldPos.xy / 18.0 + wv.xy * 0.10;
+        float c1 = teleportCaustic(cp, t * 0.9);
+        float c2 = teleportCaustic(cp * 1.9 + 7.3, t * 1.4);
+        float caustic = 0.45 * c1 + 0.30 * c2 + 0.9 * c1 * c2;
+        float causticFade = (1.0 - 0.6 * depth) * (1.0 - smoothstep(250.0, 800.0, vDepth));
+        body += vec3(0.50, 0.82, 1.00) * caustic * causticFade * 0.75;
+
+        // Glitter: fine twinkling points, only bright where they sit on a
+        // wave crest — sunlight shattering on ripples.
         vec2 gv = vWorldPos.xy / 3.0;
         vec2 gid = floor(gv);
-        vec2 gf = fract(gv) - 0.5;
         vec2 jitter = vec2(teleportHash(gid + 41.0), teleportHash(gid + 59.0)) - 0.5;
-        float d = length(gf - jitter * 0.7);
-        float pt = pow(clamp(1.0 - d * 2.2, 0.0, 1.0), 3.0);
-        float ph = teleportHash(gid + 3.0) * 6.2831853;
-        float spd = 1.5 + 3.0 * teleportHash(gid + 9.0);
-        float sparkle = pt * max(sin(t * spd + ph), 0.0);
+        float pt = pow(clamp(1.0 - length(fract(gv) - 0.5 - jitter * 0.7) * 2.2, 0.0, 1.0), 3.0);
+        float twinkle = max(sin(t * (1.5 + 3.0 * teleportHash(gid + 9.0)) + teleportHash(gid + 3.0) * 6.2831853), 0.0);
+        float glitter = pt * twinkle * pow(wv.z, 2.0);
 
-        vec3 deep = vec3(0.04, 0.09, 0.22); // dark blue mirror base
-        vec3 bright = vec3(0.75, 0.9, 1.0); // sparkle / edge / rim colour
-        vec3 col = deep * shimmer * facetShade
-                 + facetColor * facetSpec * 2.2
-                 + bright * facetEdge * 0.5
-                 + bright * sparkle * 1.2
-                 + bright * rim * 0.4;
+        // Fresnel sheen: the surface lightens toward a pale ice-blue at
+        // grazing angles, the way real water mirrors more there.
+        float fres = 0.04 + 0.45 * pow(graz, 4.0);
+        vec3 col = mix(body, vec3(0.55, 0.78, 1.00), fres);
+        col += vec3(0.80, 0.93, 1.00) * glitter * 1.3;
 
-        float lit = max(fade(true), 0.5); // always reads as its own light source, even in a dark room
-        // Alpha 0 tags this pixel the same way water does, so
-        // worldblit.frag's existing screen-space reflection march runs on
-        // it unchanged — the pad is a flat, Z-up plane exactly like a
-        // water floor is, so that same reflection math (Fresnel-gated:
-        // strong at grazing angles, faint looking straight down) turns
-        // this into a genuine mirror of the room around it.
-        outColor = vec4(applyFog(col * lit), 0.0);
+        float lit = max(fade(true), 0.55); // its own light source, even in a dark room
+        col *= lit;
+        col += reflectedLights(wv.xy) * (0.4 + 0.5 * graz);
+        // Alpha 0 tags this pixel as water for worldresolve.frag's SSR.
+        outColor = vec4(applyFog(col), 0.0);
         return;
     }
 
@@ -597,23 +602,8 @@ void main() {
         // no spec here — water has its own reflection / sun-glint model.
         outc += dynamicDiffuse(vec3(0.0, 0.0, 1.0), 0.0) * (0.08 + 0.4 * pow(wv.z, 4.0) * (0.3 + graz));
 
-        // Reflected lights: the scene's dynamic emitters (torches, lava glow,
-        // muzzle flash) reflect off the surface as wobbling coloured
-        // streaks — a cheap stand-in for true SSR that catches the most
-        // important reflectors. Reflect the view ray about the water's up
-        // normal, ripple it by the wave slope, and score each light by how
-        // closely the reflected ray points at it.
-        vec3 Rd = normalize(reflect(normalize(vWorldPos - CAM_POS), vec3(0.0, 0.0, 1.0))
-                            + vec3(wv.xy * 0.16, 0.0));
-        vec3 lref = vec3(0.0);
-        int nlr = min(int(W.nLights.x), MAX_LIGHTS);
-        for (int i = 0; i < nlr; ++i) {
-            vec3 toL = W.lightPos[i].xyz - vWorldPos;
-            float dl2 = dot(toL, toL);
-            float al = max(dot(Rd, toL * inversesqrt(max(dl2, 1e-6))), 0.0);
-            lref += W.lightColor[i].rgb * pow(al, 48.0) / (1.0 + dl2 * 0.0006);
-        }
-        outc += lref * (0.4 + 0.5 * graz);
+        // Reflected lights: wobbling coloured streaks (see reflectedLights).
+        outc += reflectedLights(wv.xy) * (0.4 + 0.5 * graz);
 
         // Sun glint: one tight bright spot near the horizon whose column
         // drifts slowly (time + camera yaw), shattered into glitter by the

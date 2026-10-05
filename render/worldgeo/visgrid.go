@@ -93,29 +93,67 @@ func (g *visGrid) bounds(cell int32) (minX, minY, maxX, maxY float32) {
 // cell against it — general safety headroom (the widescreen Hor+ vertical-
 // FOV-locked projection, a turn between this frame's cull decision and what
 // actually renders, ordinary approximation slop), on top of — not a
-// substitute for — cellVisible's own exact box/cone math below.
+// substitute for — ViewCone's own exact circle/cone math below.
 const cullMarginDeg = 15.0
 
-// cellVisible reports whether cell's bounding box can be seen from cam: is
-// the camera inside the box, or does the box's bounding CIRCLE overlap the
-// camera's (widened) horizontal FOV cone? Using the circle's angular extent
-// (its half-diagonal, projected to an angle at the box's distance) rather
-// than testing only the box's 4 corners is what makes this safe to use for
-// an actual cull (not just an estimate, see UpdateVisibility): a large box
-// can cross a narrow FOV cone through an edge, with all 4 corners outside
-// it — a corners-only test would wrongly cull that box; measuring the
-// box's angular SPAN against the cone's doesn't have that blind spot.
-func cellVisible(cam Camera, minX, minY, maxX, maxY float32) bool {
-	cx, cy := (minX+maxX)/2, (minY+maxY)/2
-	radius := math.Hypot(float64(maxX-minX), float64(maxY-minY)) / 2 // bounding-circle radius
-	return circleVisible(cam, float64(cx), float64(cy), radius)
+// boxVisible reports whether a bounding box can be seen: is the camera
+// inside it, or does the box's bounding CIRCLE overlap the cone? Using the
+// circle's angular extent rather than testing only the box's 4 corners is
+// what makes this safe to use for an actual cull (not just an estimate,
+// see UpdateVisibility): a large box can cross a narrow FOV cone through
+// an edge, with all 4 corners outside it — a corners-only test would
+// wrongly cull that box; measuring the box's angular SPAN against the
+// cone's doesn't have that blind spot.
+func (c *ViewCone) boxVisible(minX, minY, maxX, maxY float32) bool {
+	w, h := float64(maxX-minX), float64(maxY-minY)
+	return c.Visible(float64(minX+maxX)/2, float64(minY+maxY)/2, math.Sqrt(w*w+h*h)/2) // bounding circle
 }
 
-// circleVisible reports whether a world-space circle centred at (cx, cy)
-// with radius r can be seen from cam — the camera-inside-it or angular-span-
-// overlaps-the-(widened)-FOV-cone test cellVisible's own doc comment
-// explains, factored out so LightVisible can reuse it for a light's reach
-// instead of a geometry cell's bounding box.
+// ViewCone is a camera's widened horizontal view cone (FOV/2 +
+// cullMarginDeg either side of its facing), precomputed so each visibility
+// test is a few multiplies and a square root — no trigonometry. Build one
+// per frame (NewViewCone) and test every cell, thing, particle and light
+// against it. Ignores Z (camera pitch): Doom levels are shallow enough
+// that a 2D horizontal cone suffices.
+type ViewCone struct {
+	cam        Camera
+	fx, fy     float64 // unit view direction
+	cosH, sinH float64 // of the cone's half-angle
+	wide       bool    // half-angle >= 90°: the closed form below doesn't hold
+}
+
+// NewViewCone precomputes cam's view cone.
+func NewViewCone(cam Camera) ViewCone {
+	half := (cam.FOVDeg/2 + cullMarginDeg) * math.Pi / 180
+	return ViewCone{
+		cam: cam, fx: math.Cos(cam.Angle), fy: math.Sin(cam.Angle),
+		cosH: math.Cos(half), sinH: math.Sin(half), wide: half >= math.Pi/2,
+	}
+}
+
+// Visible reports whether a world-space circle centred at (cx, cy) with
+// radius r can be seen: the camera is inside it, or its angular span
+// overlaps the cone. With θ the angle between the view direction and the
+// circle's centre (distance d) and α = asin(r/d) its angular radius, that
+// is θ - α <= h; since h + α < 180° when h < 90°, taking cosines turns it
+// into  along + r·sin h >= cos h · sqrt(d² - r²),  where along = d·cos θ is
+// the centre's distance along the view direction — exact, and trig-free.
+func (c *ViewCone) Visible(cx, cy, r float64) bool {
+	if c.wide {
+		return circleVisible(c.cam, cx, cy, r)
+	}
+	dx, dy := cx-c.cam.X, cy-c.cam.Y
+	d2 := dx*dx + dy*dy
+	if d2 <= r*r {
+		return true // camera is inside (or right on top of) the circle
+	}
+	along := dx*c.fx + dy*c.fy
+	return along+r*c.sinH >= c.cosH*math.Sqrt(d2-r*r)
+}
+
+// circleVisible is ViewCone.Visible's angular form — camera inside the
+// circle, or its angular span overlapping the (widened) FOV cone. Kept for
+// cones of 90° or wider half-angle, where the closed form doesn't apply.
 func circleVisible(cam Camera, cx, cy, r float64) bool {
 	dx, dy := cx-cam.X, cy-cam.Y
 	dist := math.Hypot(dx, dy)
@@ -131,18 +169,4 @@ func circleVisible(cam Camera, cx, cy, r float64) bool {
 	angularRadius := math.Asin(r / dist) // dist > r above, so r/dist < 1
 	half := (cam.FOVDeg/2 + cullMarginDeg) * math.Pi / 180
 	return math.Abs(angToCenter)-angularRadius <= half
-}
-
-// LightVisible reports whether a point light at world position (x, y) with
-// reach radius r could contribute to anything on screen from cam — the same
-// generous cone test cellVisible uses for static-geometry culling (see its
-// own doc comment for why the angular-span test is safe to use as a real
-// cull, not just an estimate), applied to a light's own sphere instead of a
-// geometry cell's bounding box. A render backend can use this to skip
-// uploading/shading a light that's nowhere near the camera's view, the same
-// way UpdateVisibility already skips drawing an off-screen geometry cell.
-// Ignores Z (camera pitch): Doom levels are shallow enough that cellVisible
-// already gets away with a 2D horizontal-only cone too.
-func LightVisible(cam Camera, x, y, r float64) bool {
-	return circleVisible(cam, x, y, r)
 }

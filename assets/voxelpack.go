@@ -2,13 +2,17 @@ package assets
 
 import (
 	"archive/zip"
+	"bytes"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
+
+	"twopointfive/wad"
 )
 
 // VoxelSet is a loaded voxel pack (a .pk3 — really a zip): the VOXELDEF
@@ -94,7 +98,22 @@ func LoadVoxelPack(pk3Path string) (*VoxelSet, error) {
 		return nil, fmt.Errorf("assets: open voxel pack %s: %w", pk3Path, err)
 	}
 	defer zr.Close()
+	return loadVoxelZip(&zr.Reader, pk3Path)
+}
 
+// LoadVoxelPackBytes is LoadVoxelPack for a pk3 already in memory — the
+// copy cmd/wad3d bakes into a real-3D WAD's TPFVOXEL container. name labels
+// it in logs and errors.
+func LoadVoxelPackBytes(data []byte, name string) (*VoxelSet, error) {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, fmt.Errorf("assets: open voxel pack %s: %w", name, err)
+	}
+	return loadVoxelZip(zr, name)
+}
+
+// loadVoxelZip is LoadVoxelPack's core over an open zip.
+func loadVoxelZip(zr *zip.Reader, pk3Path string) (*VoxelSet, error) {
 	var defText strings.Builder
 	kvx := make(map[string][]byte) // basename (no dir, no ".kvx") -> lump bytes
 	for _, f := range zr.File {
@@ -238,6 +257,33 @@ func (vs *VoxelSet) Model(spritePrefix string, frame int) (m *VoxelModel, angleO
 	return ref.model, ref.angleOffset, ref.scale, true
 }
 
+// FillFrom adds other's models for every sprite this set has NO model for
+// at all — whole sprites only, never individual frames, so a monster never
+// mixes one pack's art with another's mid-animation. Used to let a pack
+// that doesn't cover a game's whole roster borrow the rest from a pack
+// that does (Doom 1 maps: DoomVoxelPack.pk3, gaps from Doom2_Voxel.pk3).
+// Returns how many sprites it added.
+func (vs *VoxelSet) FillFrom(other *VoxelSet) int {
+	if vs == nil || other == nil {
+		return 0
+	}
+	have := map[string]bool{}
+	for k := range vs.models {
+		if len(k) >= 4 && k != hFlameKey {
+			have[k[:4]] = true
+		}
+	}
+	added := map[string]bool{}
+	for k, ref := range other.models {
+		if len(k) < 4 || k == hFlameKey || have[k[:4]] {
+			continue
+		}
+		vs.models[k] = ref
+		added[k[:4]] = true
+	}
+	return len(added)
+}
+
 // Frames reports how many sprite frames the pack maps to a model — for
 // startup logging and tests.
 func (vs *VoxelSet) Frames() int {
@@ -272,4 +318,83 @@ func readZipFile(f *zip.File) ([]byte, error) {
 	}
 	defer rc.Close()
 	return io.ReadAll(rc)
+}
+
+// LoadVoxelsFromWAD loads the voxel models a real-3D WAD carries in its
+// TPFVOXEL container (wad.TPFVoxelLump): each stored pk3 in name order, the
+// first as the base and every later one filling only whole sprites the base
+// lacks (FillFrom). This is the ONLY source of voxels the game uses — the
+// packs are baked in by cmd/wad3d, never read from disk at play time.
+func LoadVoxelsFromWAD(w *wad.WAD) (*VoxelSet, []string, error) {
+	zr, ok := w.ZipLump(wad.TPFVoxelLump)
+	if !ok {
+		return nil, nil, fmt.Errorf("assets: this WAD has no %s voxel container", wad.TPFVoxelLump)
+	}
+	files := append([]*zip.File(nil), zr.File...)
+	sort.Slice(files, func(i, j int) bool { return files[i].Name < files[j].Name })
+	var vs *VoxelSet
+	var names []string
+	for _, f := range files {
+		if !strings.EqualFold(path.Ext(f.Name), ".pk3") {
+			continue
+		}
+		data, err := readZipFile(f)
+		if err != nil {
+			return nil, nil, fmt.Errorf("assets: %s %s: %w", wad.TPFVoxelLump, f.Name, err)
+		}
+		v, err := LoadVoxelPackBytes(data, f.Name)
+		if err != nil {
+			return nil, nil, err
+		}
+		names = append(names, f.Name)
+		if vs == nil {
+			vs = v
+		} else if n := vs.FillFrom(v); n > 0 {
+			log.Printf("assets: %s filled %d sprite(s) the earlier voxel pack(s) lack", f.Name, n)
+		}
+	}
+	if vs == nil {
+		return nil, nil, fmt.Errorf("assets: %s holds no voxel packs", wad.TPFVoxelLump)
+	}
+	return vs, names, nil
+}
+
+// VoxelPackPath finds assets/voxel/<pk3Name> on disk the same way
+// LoadVoxelPackDir does — for cmd/wad3d, which bakes the file's bytes into
+// a WAD. ok is false when it isn't there.
+func VoxelPackPath(pk3Name string) (string, bool) {
+	dir, ok := findAssetDir(filepath.Join("assets", "voxel"))
+	if !ok {
+		return "", false
+	}
+	p := filepath.Join(dir, pk3Name)
+	if _, err := os.Stat(p); err != nil {
+		return "", false
+	}
+	return p, true
+}
+
+// ModelNearest is Model, except a frame the pack has no model for falls
+// back to the nearest earlier frame of the SAME sprite that has one (then
+// the nearest later one) — so a voxel-only object never blinks out on the
+// odd frame a pack skipped (e.g. both Doom packs lack the demon's SARG G
+// pain frame; it shows SARG F). ok is false only when the sprite has no
+// model at all.
+func (vs *VoxelSet) ModelNearest(spritePrefix string, frame int) (m *VoxelModel, angleOffsetDeg, scale float64, ok bool) {
+	if m, a, s, ok := vs.Model(spritePrefix, frame); ok {
+		return m, a, s, true
+	}
+	for d := 1; d < 26; d++ {
+		if f := frame - d; f >= 0 {
+			if m, a, s, ok := vs.Model(spritePrefix, f); ok {
+				return m, a, s, true
+			}
+		}
+		if f := frame + d; f < 26 {
+			if m, a, s, ok := vs.Model(spritePrefix, f); ok {
+				return m, a, s, true
+			}
+		}
+	}
+	return nil, 0, 0, false
 }

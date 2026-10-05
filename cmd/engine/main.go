@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"twopointfive/assets"
+	"twopointfive/assets/models"
 	"twopointfive/audio"
 	"twopointfive/bsp"
 	"twopointfive/config"
@@ -133,6 +134,9 @@ func runHeadless(path string) error {
 		log.Printf("engine: %s is a patch WAD — merging base IWAD %s", filepath.Base(path), loaded.IWADPath)
 	}
 	w := loaded.WAD
+	if err := wad.CheckPlayable(w, filepath.Base(path)); err != nil {
+		return err // before the map picker — there's nothing to pick
+	}
 
 	maps := w.ListMaps()
 	if len(maps) == 0 {
@@ -156,6 +160,11 @@ func runHeadless(path string) error {
 // track (see audio.Setup's doc comment on why the player itself isn't
 // recreated per session).
 func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio.Device, music *audio.MusicPlayer) error {
+	// Only real-3D WADs (cmd/wad3d output, with baked voxels) are playable —
+	// the launcher already filters, this also covers the command-line path.
+	if err := wad.CheckPlayable(w, filepath.Base(path)); err != nil {
+		return err
+	}
 	// From here on the window (once created below) is up but the game isn't
 	// running its event/render loop yet — see stageTimer's doc comment. Time
 	// it all so a slow load is diagnosable instead of just looking hung.
@@ -187,6 +196,9 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 	}
 	textures.SetQuake1Textures(cfg.Quake1Textures)
 	done()
+	if d := w.DescribeTPF3D(); d != "" {
+		log.Printf("engine: %s", d)
+	}
 
 	// config's switchWeapons: play with the OTHER game's arsenal. The
 	// weapon-table swap itself is in engine.NewGame (it reads cfg); here we
@@ -202,6 +214,8 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 				which = "Doom"
 			}
 			log.Printf("engine: switchWeapons — %s weapon art/sounds from %s", which, filepath.Base(op))
+		} else if textures.EmbeddedSpriteCount() > 0 {
+			log.Printf("engine: switchWeapons — weapon art/sounds from %s's embedded weapon set", filepath.Base(path))
 		} else {
 			log.Printf("engine: switchWeapons on, but the other game's IWAD wasn't found next to %s — the arsenal still swaps, the new guns just draw/sound blank", filepath.Base(path))
 		}
@@ -216,10 +230,10 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 		runMode = "always-run"
 	}
 	log.Printf("engine: config in effect — %s, resolution=%s x%.2f, fov=%.0f, vsync=%v, hudScale=%.2f, weaponScale=%.2f, lightScale=%.2f exposure=%.2f, "+
-		"invertMouseY=%v, mouseSensitivity=%.4f, turnSpeed=%.2f, %s, skill=%d, damageScale=%d, music=%v, musicVolume=%.2f, weaponVolume=%.2f, worldVolume=%.2f, debugInfo=%v, hud=%s, crosshair=%s/%s, voxels=%v x%.2f, quake1Textures=%v",
+		"invertMouseY=%v, mouseSensitivity=%.4f, turnSpeed=%.2f, %s, skill=%d, damageScale=%d, music=%v, musicVolume=%.2f, weaponVolume=%.2f, worldVolume=%.2f, debugInfo=%v, hud=%s, crosshair=%s/%s, objectStyle=%s, modelScale=%.2f, quake1Textures=%v",
 		wm, cfg.Resolution, cfg.RenderScale, cfg.FOVDegrees, cfg.VSync, cfg.HUDScale, cfg.WeaponScale, cfg.LightScale, cfg.Exposure,
 		cfg.InvertMouseY, cfg.MouseSensitivity, cfg.TurnSpeed, runMode, cfg.Skill, cfg.DamageScale, cfg.Music, cfg.MusicVolume, cfg.WeaponVolume, cfg.WorldVolume, cfg.ShowDebugInfo, cfg.HUDStyle, cfg.Crosshair, cfg.CrosshairSize,
-		cfg.Voxels, cfg.VoxelScale, cfg.Quake1Textures)
+		cfg.ObjectStyle, cfg.ModelScale, cfg.Quake1Textures)
 
 	cam := engine.StartCamera(level, tree)
 	cam.FOVDeg = cfg.FOVDegrees
@@ -300,38 +314,46 @@ func playSession(path, mapName string, cfg config.Config, w *wad.WAD, dev *audio
 	// isn't washed, only genuine highlights glow.
 	renderer.SetHDR(float32(cfg.Exposure), 0.55)
 
-	if cfg.Voxels {
-		// DoomVoxelPack.pk3 (assets/voxel/) is an updated/alternate monster
-		// + item set assembled from a user-supplied .kvx drop — it covers
-		// every Doom1/Ultimate Doom monster (troo/poss/sarg/skul/head/boss/
-		// cybr/spid) plus items/decorations, but NOT Doom II's exclusive
-		// roster (mancubus/revenant/arch-vile/pain elemental/arachnotron/
-		// chaingunner), so it only replaces Doom1_Voxel.pk3 here — Doom II
-		// maps keep Doom2_Voxel.pk3, which already covers its full roster.
-		pk3 := "DoomVoxelPack.pk3"
-		switch {
-		case w.IsHeretic():
-			pk3 = "reikallhereticvoxels.pk3"
-		case strings.HasPrefix(mapName, "MAP"):
-			pk3 = "Doom2_Voxel.pk3"
+	// Map objects are voxel-only, and their models travel inside the real-3D
+	// WAD (TPFVOXEL, baked by cmd/wad3d) — never read from disk here.
+	// CheckPlayable already refused a WAD without them.
+	done = stageTimer("load baked voxel models")
+	vs, packs, err := assets.LoadVoxelsFromWAD(w)
+	done()
+	win.PollEvents()
+	if err != nil {
+		return fmt.Errorf("engine: %s's voxel models: %w — convert the original WAD again with %s", filepath.Base(path), err, wad.ConvertTool)
+	}
+	game.Voxels = vs
+	game.ModelScale = cfg.ModelScale
+	log.Printf("engine: voxel models — %s, %d sprite frames (map objects are voxel-only)", strings.Join(packs, " + "), vs.Frames())
+	// Mesh + upload every model up front so no first-sight GPU stall hits
+	// the render loop mid-game.
+	done = stageTimer("mesh + upload voxel models")
+	renderer.WarmVoxels(vs.Models())
+	done()
+	win.PollEvents()
+
+	// Textured 3D models, when the WAD carries a pack (TPFMODEL): drawn
+	// instead of voxels wherever a sprite frame has one.
+	done = stageTimer("load + upload 3D models")
+	if ms, ok, errs := models.LoadFromWAD(w); ok {
+		for _, e := range errs {
+			log.Printf("engine: 3D models: %v", e)
 		}
-		done = stageTimer("load voxel pack " + pk3)
-		vs, err := assets.LoadVoxelPackDir(pk3)
-		done()
-		win.PollEvents()
-		if err != nil {
-			log.Printf("engine: voxel models unavailable (%v) — using sprites", err)
-		} else {
-			game.Voxels = vs
-			log.Printf("engine: voxel models active — %s, %d sprite frames", pk3, vs.Frames())
-			// Mesh + upload every model up front so no first-sight GPU stall
-			// hits the render loop mid-game.
-			done = stageTimer("mesh + upload voxel models")
-			renderer.WarmVoxels(vs.Models())
-			done()
-			win.PollEvents()
+		if cfg.ObjectStyle == config.ObjectStyleVoxels {
+			// Voxels for everything but the weapon pickups.
+			ms = ms.Only(engine.WeaponPickupSprites...)
+			log.Printf("engine: objectStyle voxels — voxel models, except the weapon pickups' 3D models")
+		}
+		if ms != nil {
+			game.Models = ms
+			renderer.WarmModels(ms)
+			log.Printf("engine: 3D models — %d sprite frame(s) with a model (these outrank voxels)", ms.Stats.Frames)
 		}
 	}
+	done()
+	win.PollEvents()
 
 	game.AudioDevice = dev // nil is fine — see audio.Setup's doc comment
 

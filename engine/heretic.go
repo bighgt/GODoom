@@ -383,7 +383,7 @@ func (g *Game) hereticFlameFor(sprite string, host *assets.VoxelModel, x, y, bas
 	if fm == nil {
 		return worldgeo.VoxelInstance{}, false
 	}
-	vs := g.VoxelScale
+	vs := g.ModelScale
 	if vs <= 0 {
 		vs = 1
 	}

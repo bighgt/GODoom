@@ -48,6 +48,18 @@ type wallAnimSlot struct {
 	base string
 }
 
+// texture is the sidedef texture field s animates.
+func (s wallAnimSlot) texture(g *Game) *string {
+	sd := &g.Level.Sidedefs[s.side]
+	switch s.slot {
+	case 0:
+		return &sd.UpperTexture
+	case 1:
+		return &sd.MiddleTexture
+	}
+	return &sd.LowerTexture
+}
+
 // animDef is one row of the animation table: the first and last frame name
 // and the tics per frame. isTexture picks the wall-texture namespace over
 // the flat namespace. explicit, when set, is the exact frame list — used
@@ -347,7 +359,7 @@ func (g *Game) expandAnimDef(d animDef, texOrder []string, texSet map[string]boo
 func (g *Game) initTexAnims() {
 	g.flatAnimByName = map[string]texAnimRef{}
 	g.wallAnimByName = map[string]texAnimRef{}
-	g.lastAnimHashSet = false // force one static-geometry rebuild on the HW path
+	g.geomBuilder = nil // re-sync the hardware static mesh with the new animations (worldsync.go)
 
 	texOrder, texSet := g.buildTextureOrder()
 
@@ -460,15 +472,6 @@ func (g *Game) animateFlats() {
 // the current frame. Called from runTic, right after animateFlats.
 func (g *Game) animateWalls() {
 	for _, s := range g.wallAnimSlots {
-		sd := &g.Level.Sidedefs[s.side]
-		name := g.frameFor(s.base, g.levelTime)
-		switch s.slot {
-		case 0:
-			sd.UpperTexture = name
-		case 1:
-			sd.MiddleTexture = name
-		case 2:
-			sd.LowerTexture = name
-		}
+		*s.texture(g) = g.frameFor(s.base, g.levelTime)
 	}
 }

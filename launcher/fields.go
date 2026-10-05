@@ -101,6 +101,14 @@ var (
 		{"1440p", "1440p (2560x1440)"},
 		{"native", "Native (Display Resolution)"},
 	}
+	objectStyleOptions = []choice{
+		{config.ObjectStyleModels, "3D Models (voxels where missing)"},
+		{config.ObjectStyleVoxels, "Voxels (3D model weapons)"},
+	}
+	monsterBehaviorOptions = []choice{
+		{config.MonsterBehaviorRoaming, "Roaming (wander, open doors)"},
+		{config.MonsterBehaviorClassic, "Classic (wait until alerted)"},
+	}
 	hudStyleOptions = []choice{
 		{config.HUDStyleDoom, "Doom (Full Status Bar)"},
 		{config.HUDStyleQuake2, "Quake II (Minimal HUD)"},
@@ -163,14 +171,18 @@ var fields = []field{
 		floatAt: func(c *config.Config) *float64 { return &c.AmbientLight }, min: config.MinAmbientLight, max: config.MaxAmbientLight, format: "%.2f"},
 	{id: "exposure", label: "Exposure", hint: "Tone-mapping exposure for the hardware renderer. Higher is brighter.", section: SectionRendering, kind: kindSlider,
 		floatAt: func(c *config.Config) *float64 { return &c.Exposure }, min: config.MinExposure, max: config.MaxExposure, format: "%.2f"},
-	{id: "voxels", label: "Voxel Models", hint: "Render supported items and decorations as 3D voxel models instead of flat sprites.", section: SectionRendering, kind: kindCheckbox,
-		boolAt: func(c *config.Config) *bool { return &c.Voxels }},
-	{id: "voxelScale", label: "Voxel Scale", hint: "Size multiplier for voxel models.", section: SectionRendering, kind: kindSlider,
-		floatAt: func(c *config.Config) *float64 { return &c.VoxelScale }, min: config.MinVoxelScale, max: config.MaxVoxelScale, format: "%.2f"},
+	{id: "objectStyle", label: "Object Models", hint: "How monsters, items and projectiles are drawn: textured 3D models (voxels where the WAD has no model), or voxels with 3D-model weapon pickups.", section: SectionRendering, kind: kindOptions,
+		stringAt: func(c *config.Config) *string { return &c.ObjectStyle }, options: objectStyleOptions},
+	{id: "modelScale", label: "Model Scale", hint: "Size multiplier for map objects' models - 3D models and voxels alike.", section: SectionRendering, kind: kindSlider,
+		floatAt: func(c *config.Config) *float64 { return &c.ModelScale }, min: config.MinModelScale, max: config.MaxModelScale, format: "%.2f"},
 	{id: "quake1Textures", label: "Quake 1 Texture Pack", hint: "Swap in the converted Quake 1 textures wherever a matching name exists.", section: SectionRendering, kind: kindCheckbox,
 		boolAt: func(c *config.Config) *bool { return &c.Quake1Textures }},
 	{id: "explosionParticles", label: "Explosion Particles", hint: "Flying spark billboards on rocket/plasma/BFG/fireball impacts. Purely cosmetic.", section: SectionRendering, kind: kindCheckbox,
 		boolAt: func(c *config.Config) *bool { return &c.ExplosionParticles }},
+	{id: "smoothMonsterMovement", label: "Smooth Monster Movement", hint: "Walking monsters glide through each step instead of hopping forward every few tics. Purely visual.", section: SectionRendering, kind: kindCheckbox,
+		boolAt: func(c *config.Config) *bool { return &c.SmoothMonsterMovement }},
+	{id: "lostSoulFire", label: "Lost Soul Flames", hint: "Lost souls trail rendered flames off the back of the skull and glow with a flickering fire light. Purely cosmetic.", section: SectionRendering, kind: kindCheckbox,
+		boolAt: func(c *config.Config) *bool { return &c.LostSoulFire }},
 	{id: "liquidAmbience", label: "Liquid Ambience", hint: "Steam off lava, mist over water, bubbles in acid, and a splash when crossing in/out. Purely cosmetic.", section: SectionRendering, kind: kindCheckbox,
 		boolAt: func(c *config.Config) *bool { return &c.LiquidAmbience }},
 	{id: "waterRefraction", label: "Water Refraction", hint: "Real depth-based refraction/murk for water. Only visibly differs from the default fake shading on maps with real geometry beneath a transparent water surface.", section: SectionRendering, kind: kindCheckbox,
@@ -206,6 +218,12 @@ var fields = []field{
 	// --- Gameplay ---
 	{id: "skill", label: "Skill", hint: "Difficulty 1 (easiest) to 5 (Nightmare): monster count, damage and respawns.", section: SectionGameplay, kind: kindIntSlider,
 		intAt: func(c *config.Config) *int { return &c.Skill }, min: config.MinSkill, max: config.MaxSkill, format: "%.0f"},
+	{id: "monsterBehavior", label: "Monster Behaviour", hint: "Roaming: idle monsters wander the level and open doors until they notice you. Classic: they wait where they were placed, as in vanilla Doom.", section: SectionGameplay, kind: kindOptions,
+		stringAt: func(c *config.Config) *string { return &c.MonsterBehavior }, options: monsterBehaviorOptions},
+	{id: "impFireballs", label: "Rendered Imp Fireballs", hint: "Imps throw a rendered ball of fire with an ember trail that bursts with splash damage on impact, instead of the classic sprite.", section: SectionGameplay, kind: kindCheckbox,
+		boolAt: func(c *config.Config) *bool { return &c.ImpFireballs }},
+	{id: "cacoFireballs", label: "Rendered Cacodemon Fireballs", hint: "Cacodemons spit a larger rendered fireball — a red-hot core in blue flames — with an ember trail that bursts with splash damage on impact, instead of the classic sprite.", section: SectionGameplay, kind: kindCheckbox,
+		boolAt: func(c *config.Config) *bool { return &c.CacoFireballs }},
 	{id: "damageScale", label: "Damage Scale %", hint: "Percentage multiplier on damage the player takes. 100 is normal.", section: SectionGameplay, kind: kindIntField,
 		intAt: func(c *config.Config) *int { return &c.DamageScale }},
 	{id: "switchWeaponOnPickup", label: "Auto-Switch Weapon", hint: "Automatically switch to a newly picked-up weapon.", section: SectionGameplay, kind: kindCheckbox,

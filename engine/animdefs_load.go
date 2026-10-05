@@ -185,63 +185,6 @@ func (g *Game) initWarpAnims() {
 	}
 }
 
-// animLiveHash is an FNV-1a hash of every animated surface's current live
-// texture name. It changes exactly on the tics an animation steps a frame,
-// which is how the hardware path knows to rebuild its otherwise-static
-// geometry (worldGeomChanged only watches sector heights). Call after
-// animateFlats / animateWalls have run for the tic.
-func (g *Game) animLiveHash() uint64 {
-	const (
-		off   = uint64(1469598103934665603)
-		prime = uint64(1099511628211)
-	)
-	h := off
-	mix := func(s string) {
-		for i := 0; i < len(s); i++ {
-			h ^= uint64(s[i])
-			h *= prime
-		}
-		h ^= '|'
-		h *= prime
-	}
-	for i := range g.animBaseFloor {
-		if g.animBaseFloor[i] != "" {
-			mix(g.Level.Sectors[i].FloorTexture)
-		}
-		if g.animBaseCeil[i] != "" {
-			mix(g.Level.Sectors[i].CeilingTexture)
-		}
-	}
-	for _, s := range g.wallAnimSlots {
-		sd := &g.Level.Sidedefs[s.side]
-		switch s.slot {
-		case 0:
-			mix(sd.UpperTexture)
-		case 1:
-			mix(sd.MiddleTexture)
-		case 2:
-			mix(sd.LowerTexture)
-		}
-	}
-	return h
-}
-
-// animFrameChanged reports whether any animated texture stepped since the
-// last call (always true on the very first call with animations present, to
-// force one initial rebuild).
-func (g *Game) animFrameChanged() bool {
-	if len(g.flatAnimByName) == 0 && len(g.wallAnimByName) == 0 {
-		return false
-	}
-	h := g.animLiveHash()
-	if !g.lastAnimHashSet || h != g.lastAnimHash {
-		g.lastAnimHash = h
-		g.lastAnimHashSet = true
-		return true
-	}
-	return false
-}
-
 func isAllDigits(s string) bool {
 	if s == "" {
 		return false

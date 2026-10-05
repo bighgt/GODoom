@@ -1,7 +1,9 @@
 package launcher
 
 import (
+	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"twopointfive/config"
@@ -19,6 +21,7 @@ type Model struct {
 	WADPath  string // "" until a WAD is chosen
 	WAD      *wad.WAD
 	IWADPath string // the base IWAD that got merged in, "" if WADPath was self-contained
+	Is3D     bool   // WADPath is a tools/wad3d "real 3D" WAD (carries a TPF3D marker)
 	Maps     []string
 	MapName  string
 
@@ -64,6 +67,17 @@ func (m *Model) PickWAD(path string) {
 		m.StatusErr = true
 		return
 	}
+	// Only real-3D WADs (cmd/wad3d output) are playable — anything else is
+	// refused here with the "convert it first" message rather than at launch.
+	if err := wad.CheckPlayable(res.WAD, filepath.Base(path)); err != nil {
+		m.Status = err.Error()
+		var np *wad.NotPlayableError
+		if errors.As(err, &np) {
+			m.Status = np.Short() // the full text is too long for the status bar
+		}
+		m.StatusErr = true
+		return
+	}
 	maps := res.WAD.ListMaps()
 	if len(maps) == 0 {
 		m.Status = fmt.Sprintf("%s has no maps (no THINGS/LINEDEFS lumps under a map marker)", path)
@@ -71,6 +85,7 @@ func (m *Model) PickWAD(path string) {
 		return
 	}
 	m.WADPath, m.WAD, m.IWADPath, m.Maps = path, res.WAD, res.IWADPath, maps
+	_, m.Is3D = res.WAD.TPF3D()
 	m.MapName = pickDefaultMap(maps, m.MapName)
 	m.Status, m.StatusErr = "", false
 }

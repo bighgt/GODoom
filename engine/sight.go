@@ -12,12 +12,25 @@ func (g *Game) pCheckSight(t1, t2 *Mobj) bool {
 	if g.Level == nil || t1 == nil || t2 == nil {
 		return t1 != nil && t2 != nil
 	}
-	sx, sy := t1.X, t1.Y
-	ex, ey := t2.X, t2.Y
 	sz := t1.Z + t1.Height*0.75 // eye height, id's t1->z + t1->height/2 + ... (3/4 is close enough)
 	ez := t2.Z + t2.Height*0.5
+	_, blocked := g.traceBlock(t1.X, t1.Y, sz, t2.X, t2.Y, ez, false)
+	return !blocked
+}
 
-	blocked := false
+// traceBlock walks the segment (sx,sy,sz)-(ex,ey,ez) and reports whether a
+// wall blocks it: any one-sided line it crosses, or a two-sided line
+// whose current vertical opening (wallOpeningAt — live, so a door that
+// has opened since lets it through) is shut or doesn't contain the
+// segment's interpolated height at the crossing. With nearest, it scans
+// every crossing and returns the parameter (0..1) of the CLOSEST block to
+// the start; without, it stops at the first one found (any order — a
+// plain yes/no, cheaper) and the parameter is meaningless.
+func (g *Game) traceBlock(sx, sy, sz, ex, ey, ez float64, nearest bool) (float64, bool) {
+	if g.Level == nil {
+		return 1, false
+	}
+	first, blocked := 1.0, false
 	g.blockGrid.forEachAlongSegment(sx, sy, ex, ey, func(i int32) bool {
 		ld := &g.Level.Linedefs[i]
 		v1 := g.Level.Vertexes[ld.StartVertex]
@@ -27,23 +40,22 @@ func (g *Game) pCheckSight(t1, t2 *Mobj) bool {
 		if !hit {
 			return true
 		}
+		stop := false
 		if ld.BackSidedef == wad.NoSidedef {
-			blocked = true
-			return false // solid wall across the line of sight
+			stop = true // solid wall
+		} else if open := g.wallOpeningAt(ld); !open.twoSided || open.top <= open.bottom {
+			stop = true // closed door / sealed opening
+		} else if z := sz + (ez-sz)*tSeg; z <= open.bottom || z >= open.top {
+			stop = true // passes through floor or ceiling at this crossing
 		}
-		open := g.wallOpeningAt(ld)
-		if !open.twoSided || open.top <= open.bottom {
-			blocked = true
-			return false
+		if !stop {
+			return true
 		}
-		z := sz + (ez-sz)*tSeg
-		if z <= open.bottom || z >= open.top {
-			blocked = true
-			return false // sight passes through floor or ceiling at this crossing
-		}
-		return true
+		blocked = true
+		first = min(first, tSeg)
+		return nearest
 	})
-	return !blocked
+	return first, blocked
 }
 
 // segCross reports whether segments A(ax,ay)-(bx,by) and B(cx,cy)-(dx,dy)

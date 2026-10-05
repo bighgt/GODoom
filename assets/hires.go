@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image"
 	"image/png"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -136,10 +137,19 @@ func loadHiresOverride(path string, origWidthUnits float64) *RGBA {
 		log.Printf("assets: open %s: %v", path, err)
 		return nil
 	}
-	img, err := png.Decode(f)
-	f.Close()
+	defer f.Close()
+	return decodeHiresOverride(f, path, origWidthUnits)
+}
+
+// decodeHiresOverride is loadHiresOverride's source-agnostic core: it
+// decodes one PNG from r (label names it in the log) and sizes its
+// TexelsPerUnit against origWidthUnits exactly as loadHiresOverride's doc
+// comment describes. Shared with the WAD-embedded TPFHIRES set
+// (embedded.go), so a texture reads identically from disk or from a WAD.
+func decodeHiresOverride(r io.Reader, label string, origWidthUnits float64) *RGBA {
+	img, err := png.Decode(r)
 	if err != nil {
-		log.Printf("assets: decode %s: %v", path, err)
+		log.Printf("assets: decode %s: %v", label, err)
 		return nil
 	}
 
@@ -153,7 +163,7 @@ func loadHiresOverride(path string, origWidthUnits float64) *RGBA {
 			tpu = 16
 		}
 	}
-	return imageToRGBA(img, tpu)
+	return ImageToRGBA(img, tpu)
 }
 
 // ImportWallTexture decodes the PNG at path and registers it as wall
@@ -197,7 +207,7 @@ func decodeImportedPNG(path string) (*RGBA, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	return imageToRGBA(img, 1), nil
+	return ImageToRGBA(img, 1), nil
 }
 
 // decodeFSName reverses tools/gentex's fsName: %XX hex escapes (used for
@@ -269,11 +279,11 @@ func findAssetDir(relDir string) (string, bool) {
 	return "", false
 }
 
-// imageToRGBA converts a decoded image.Image into this package's RGBA
-// format at the given texel density — shared by loadHiresDir above and
-// skybox.go's LoadSkybox (which always passes 1, since the sky isn't
-// sampled in map-unit space at all).
-func imageToRGBA(img image.Image, texelsPerUnit float64) *RGBA {
+// ImageToRGBA converts a decoded image.Image into this package's RGBA
+// format at the given texel density — shared by the hi-res, embedded and
+// weapon loaders here and engine's particle sprites. An NRGBA image is
+// copied as-is (straight alpha); any other type goes through At().RGBA().
+func ImageToRGBA(img image.Image, texelsPerUnit float64) *RGBA {
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
 	pix := make([]byte, w*h*4)

@@ -842,10 +842,13 @@ func init() {
 		S_TROO_ATK3:  {SPR_TROO, 6, 6, aTroopAttack, S_TROO_RUN1, false},
 		S_TROO_PAIN:  {SPR_TROO, 7, 2, nil, S_TROO_PAIN2, false},
 		S_TROO_PAIN2: {SPR_TROO, 7, 2, aPain, S_TROO_RUN1, false},
-		S_TROO_DIE1:  {SPR_TROO, 8, 8, nil, S_TROO_DIE2, false},
-		S_TROO_DIE2:  {SPR_TROO, 9, 8, aScream, S_TROO_DIE3, false},
-		S_TROO_DIE3:  {SPR_TROO, 10, 6, aFall, S_TROO_DIE4, false},
-		S_TROO_DIE4:  {SPR_TROO, 11, 6, nil, S_TROO_DIE5, false},
+		// Death retimed from id's 8/8/6/6 (28 tics) to 5/5/4/4 (18): with
+		// the 3D model pack's frame blending, the vanilla timing played as
+		// a slow-motion fall. A DEHACKED patch's own tics still win.
+		S_TROO_DIE1:  {SPR_TROO, 8, 5, nil, S_TROO_DIE2, false},
+		S_TROO_DIE2:  {SPR_TROO, 9, 5, aScream, S_TROO_DIE3, false},
+		S_TROO_DIE3:  {SPR_TROO, 10, 4, aFall, S_TROO_DIE4, false},
+		S_TROO_DIE4:  {SPR_TROO, 11, 4, nil, S_TROO_DIE5, false},
 		S_TROO_DIE5:  {SPR_TROO, 12, -1, nil, S_NULL, false},
 		S_TROO_XDIE1: {SPR_TROO, 13, 5, nil, S_TROO_XDIE2, false},
 		S_TROO_XDIE2: {SPR_TROO, 14, 5, aXScream, S_TROO_XDIE3, false},

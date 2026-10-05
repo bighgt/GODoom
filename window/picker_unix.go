@@ -41,6 +41,24 @@ func pickWAD() (string, error) {
 		"(or kdialog), or name the WAD on the command line or in $TPF_WAD")
 }
 
+// pickSaveWAD is PickSaveWADFile's zenity/kdialog backend: a save-mode
+// file chooser pre-filled with defaultPath, asking before it overwrites.
+// (zenity 4 always confirms and ignores --confirm-overwrite with a stderr
+// note; the older zenity forks need the flag.)
+func pickSaveWAD(title, defaultPath string) (string, error) {
+	for _, name := range []string{"zenity", "qarma", "matedialog"} {
+		if bin, err := exec.LookPath(name); err == nil {
+			return runFileChooser(bin, "--file-selection", "--save", "--confirm-overwrite",
+				"--title="+title, "--filename="+defaultPath,
+				"--file-filter=Doom WAD files | *.wad *.WAD")
+		}
+	}
+	if bin, err := exec.LookPath("kdialog"); err == nil {
+		return runFileChooser(bin, "--getsavefilename", defaultPath, "*.wad *.WAD | Doom WAD files", "--title", title)
+	}
+	return "", fmt.Errorf("window: no graphical file chooser found — install zenity (or kdialog)")
+}
+
 // pickImageFile is PickImageFile's zenity/kdialog backend.
 func pickImageFile() (string, error) {
 	const title = "Select a texture image"

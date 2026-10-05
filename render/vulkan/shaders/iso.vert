@@ -27,6 +27,6 @@ void main() {
     gl_Position = pc.viewProj * vec4(inPos, 1.0);
     vUV = inUV;
     vLight = inLight;
-    vKind = inKind;
+    vKind = inKind & 0xFFFFu; // high 16 bits carry the sector (world.frag's light reach) — unused here
     vNormal = inNormal;
 }

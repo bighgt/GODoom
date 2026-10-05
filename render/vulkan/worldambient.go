@@ -128,59 +128,16 @@ func (r *Renderer) worldCreateAmbientPass() error {
 	}
 
 	// Render pass: one colour attachment, cleared then written every frame,
-	// left shader-readable for worldblit.frag's bilinear sample. The same
-	// two SubpassDependency entries worldCreateSceneRenderPass uses for its
-	// own shared, frame-reused image: a previous frame's blit read must
-	// finish before this frame's clear/write, and this frame's write must
-	// be visible to the blit's later read.
-	color := vk.AttachmentDescription{
-		Format: sceneHDRFormat, Samples: vk.SampleCount1Bit,
-		LoadOp: vk.AttachmentLoadOpClear, StoreOp: vk.AttachmentStoreOpStore,
-		StencilLoadOp: vk.AttachmentLoadOpDontCare, StencilStoreOp: vk.AttachmentStoreOpDontCare,
-		InitialLayout: vk.ImageLayoutUndefined, FinalLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-	}
-	ref := vk.AttachmentReference{Attachment: 0, Layout: vk.ImageLayoutColorAttachmentOptimal}
-	sub := vk.SubpassDescription{
-		PipelineBindPoint: vk.PipelineBindPointGraphics, ColorAttachmentCount: 1,
-		PColorAttachments: []vk.AttachmentReference{ref},
-	}
-	deps := []vk.SubpassDependency{
-		{
-			SrcSubpass:    vk.SubpassExternal,
-			DstSubpass:    0,
-			SrcStageMask:  vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit),
-			DstStageMask:  vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit),
-			SrcAccessMask: vk.AccessFlags(vk.AccessShaderReadBit),
-			DstAccessMask: vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
-		},
-		{
-			SrcSubpass:    0,
-			DstSubpass:    vk.SubpassExternal,
-			SrcStageMask:  vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit),
-			DstStageMask:  vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit),
-			SrcAccessMask: vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
-			DstAccessMask: vk.AccessFlags(vk.AccessShaderReadBit),
-		},
-	}
-	rpInfo := vk.RenderPassCreateInfo{
-		SType: vk.StructureTypeRenderPassCreateInfo, AttachmentCount: 1,
-		PAttachments: []vk.AttachmentDescription{color}, SubpassCount: 1,
-		PSubpasses: []vk.SubpassDescription{sub}, DependencyCount: uint32(len(deps)), PDependencies: deps,
-	}
-	var rp vk.RenderPass
-	if res := vk.CreateRenderPass(r.device, &rpInfo, nil, &rp); res != vk.Success {
-		return fmt.Errorf("vulkan: ambient render pass: %s", vk.Error(res))
+	// left shader-readable for worldblit.frag's bilinear sample.
+	rp, err := r.newSampledColorPass(sceneHDRFormat, vk.AttachmentLoadOpClear, vk.ImageLayoutUndefined, "ambient")
+	if err != nil {
+		return err
 	}
 	wr.ambient.rp = rp
 
-	fbInfo := vk.FramebufferCreateInfo{
-		SType: vk.StructureTypeFramebufferCreateInfo, RenderPass: rp,
-		AttachmentCount: 1, PAttachments: []vk.ImageView{wr.ambient.img.view},
-		Width: uint32(w), Height: uint32(h), Layers: 1,
-	}
-	var fb vk.Framebuffer
-	if res := vk.CreateFramebuffer(r.device, &fbInfo, nil, &fb); res != vk.Success {
-		return fmt.Errorf("vulkan: ambient framebuffer: %s", vk.Error(res))
+	fb, err := r.newFramebuffer(rp, w, h, "ambient", wr.ambient.img.view)
+	if err != nil {
+		return err
 	}
 	wr.ambient.fb = fb
 
@@ -194,40 +151,23 @@ func (r *Renderer) worldCreateAmbientPass() error {
 	if err != nil {
 		return err
 	}
-	fbBlurInfo := vk.FramebufferCreateInfo{
-		SType: vk.StructureTypeFramebufferCreateInfo, RenderPass: rp,
-		AttachmentCount: 1, PAttachments: []vk.ImageView{wr.ambient.imgBlur.view},
-		Width: uint32(w), Height: uint32(h), Layers: 1,
-	}
-	var fbBlur vk.Framebuffer
-	if res := vk.CreateFramebuffer(r.device, &fbBlurInfo, nil, &fbBlur); res != vk.Success {
-		return fmt.Errorf("vulkan: ambient blur framebuffer: %s", vk.Error(res))
+	fbBlur, err := r.newFramebuffer(rp, w, h, "ambient blur", wr.ambient.imgBlur.view)
+	if err != nil {
+		return err
 	}
 	wr.ambient.fbBlur = fbBlur
 
-	mk := func(bindings []vk.DescriptorSetLayoutBinding) (vk.DescriptorSetLayout, error) {
-		info := vk.DescriptorSetLayoutCreateInfo{
-			SType:        vk.StructureTypeDescriptorSetLayoutCreateInfo,
-			BindingCount: uint32(len(bindings)),
-			PBindings:    bindings,
-		}
-		var l vk.DescriptorSetLayout
-		if res := vk.CreateDescriptorSetLayout(r.device, &info, nil, &l); res != vk.Success {
-			return nil, fmt.Errorf("vulkan: ambient dsl: %s", vk.Error(res))
-		}
-		return l, nil
-	}
 	uboBinding := vk.DescriptorSetLayoutBinding{
 		Binding: 1, DescriptorType: vk.DescriptorTypeUniformBuffer, DescriptorCount: 1,
 		StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
 	}
-	if wr.ambient.dslSrc, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0), uboBinding, samplerBinding(2)}); err != nil {
+	if wr.ambient.dslSrc, err = r.newDescriptorSetLayout("ambient", samplerBinding(0), uboBinding, samplerBinding(2)); err != nil {
 		return err
 	}
-	if wr.ambient.dslSample, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0)}); err != nil {
+	if wr.ambient.dslSample, err = r.newDescriptorSetLayout("ambient", samplerBinding(0)); err != nil {
 		return err
 	}
-	if wr.ambient.dslBlurSrc, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0)}); err != nil {
+	if wr.ambient.dslBlurSrc, err = r.newDescriptorSetLayout("ambient", samplerBinding(0)); err != nil {
 		return err
 	}
 
@@ -253,15 +193,7 @@ func (r *Renderer) worldCreateAmbientPass() error {
 	wr.ambient.pool = pool
 
 	alloc := func(layout vk.DescriptorSetLayout) (vk.DescriptorSet, error) {
-		info := vk.DescriptorSetAllocateInfo{
-			SType: vk.StructureTypeDescriptorSetAllocateInfo, DescriptorPool: pool,
-			DescriptorSetCount: 1, PSetLayouts: []vk.DescriptorSetLayout{layout},
-		}
-		var s vk.DescriptorSet
-		if res := vk.AllocateDescriptorSets(r.device, &info, &s); res != vk.Success {
-			return nil, fmt.Errorf("vulkan: ambient descriptor set: %s", vk.Error(res))
-		}
-		return s, nil
+		return r.allocDescriptorSet(pool, layout, "ambient")
 	}
 
 	var writes []vk.WriteDescriptorSet
@@ -273,25 +205,13 @@ func (r *Renderer) worldCreateAmbientPass() error {
 		}
 		wr.ambient.setSrc[i] = s
 		writes = append(writes,
-			vk.WriteDescriptorSet{
-				SType: vk.StructureTypeWriteDescriptorSet, DstSet: s, DstBinding: 0,
-				DescriptorCount: 1, DescriptorType: vk.DescriptorTypeCombinedImageSampler,
-				PImageInfo: []vk.DescriptorImageInfo{{
-					Sampler: wr.depthSampler, ImageView: sl.depth.view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-				}},
-			},
+			imageWrite(s, 0, wr.depthSampler, sl.depth.view),
 			vk.WriteDescriptorSet{
 				SType: vk.StructureTypeWriteDescriptorSet, DstSet: s, DstBinding: 1,
 				DescriptorCount: 1, DescriptorType: vk.DescriptorTypeUniformBuffer,
 				PBufferInfo: []vk.DescriptorBufferInfo{{Buffer: sl.ubo, Offset: 0, Range: vk.DeviceSize(worldUBOFloats * 4)}},
 			},
-			vk.WriteDescriptorSet{
-				SType: vk.StructureTypeWriteDescriptorSet, DstSet: s, DstBinding: 2,
-				DescriptorCount: 1, DescriptorType: vk.DescriptorTypeCombinedImageSampler,
-				PImageInfo: []vk.DescriptorImageInfo{{
-					Sampler: wr.clampSampler, ImageView: sl.scene.view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-				}},
-			},
+			imageWrite(s, 2, wr.clampSampler, sl.scene.view),
 		)
 	}
 	// worldblit.frag samples the BLURRED buffer, not the raw generation
@@ -301,26 +221,14 @@ func (r *Renderer) worldCreateAmbientPass() error {
 		return err
 	}
 	wr.ambient.setSample = ss
-	writes = append(writes, vk.WriteDescriptorSet{
-		SType: vk.StructureTypeWriteDescriptorSet, DstSet: ss, DstBinding: 0,
-		DescriptorCount: 1, DescriptorType: vk.DescriptorTypeCombinedImageSampler,
-		PImageInfo: []vk.DescriptorImageInfo{{
-			Sampler: wr.clampSampler, ImageView: wr.ambient.imgBlur.view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-		}},
-	})
+	writes = append(writes, imageWrite(ss, 0, wr.clampSampler, wr.ambient.imgBlur.view))
 
 	bs, err := alloc(wr.ambient.dslBlurSrc)
 	if err != nil {
 		return err
 	}
 	wr.ambient.setBlurSrc = bs
-	writes = append(writes, vk.WriteDescriptorSet{
-		SType: vk.StructureTypeWriteDescriptorSet, DstSet: bs, DstBinding: 0,
-		DescriptorCount: 1, DescriptorType: vk.DescriptorTypeCombinedImageSampler,
-		PImageInfo: []vk.DescriptorImageInfo{{
-			Sampler: wr.clampSampler, ImageView: wr.ambient.img.view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-		}},
-	})
+	writes = append(writes, imageWrite(bs, 0, wr.clampSampler, wr.ambient.img.view))
 	vk.UpdateDescriptorSets(r.device, uint32(len(writes)), writes, 0, nil)
 
 	if wr.ambient.plGen, err = r.litPipelineLayout(wr.ambient.dslSrc, 96); err != nil {

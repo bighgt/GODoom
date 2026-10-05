@@ -31,8 +31,8 @@ func openDropdown(ui *UI, id string, row Rect, current string, options []string)
 // dropdown's overlay list must swallow clicks aimed at its options.
 func TestOpenDropdownListSwallowsClicksBeneathIt(t *testing.T) {
 	ui := NewUI(NewCanvas(windowW, windowH))
-	rowA := Rect{panelPad, 194, 600, rowHeight}                      // "renderer"
-	rowB := Rect{panelPad, 194 + rowHeight + rowGap, 600, rowHeight} // "lightingMode"
+	rowA := Rect{X: panelPad, Y: 194, W: 600, H: rowHeight}                      // "renderer"
+	rowB := Rect{X: panelPad, Y: 194 + rowHeight + rowGap, W: 600, H: rowHeight} // "lightingMode"
 	optsA := []choice{{"software", "Software"}, {"hardware", "Hardware"}}
 	optsB := []choice{{"enhanced", "Enhanced"}, {"vanilla", "Vanilla"}}
 	var selA, selB string
@@ -88,7 +88,7 @@ func TestDropdownRowsStayFullHeightWithManyOptions(t *testing.T) {
 		opts[i] = fmt.Sprintf("MAP%02d", i+1)
 	}
 	ui := NewUI(NewCanvas(windowW, windowH))
-	box := Rect{100, 100, 300, rowHeight}
+	box := Rect{X: 100, Y: 100, W: 300, H: rowHeight}
 	d := openDropdown(ui, "map", box, opts[0], opts)
 	if d == nil {
 		t.Fatal("dropdown did not open")
@@ -108,7 +108,7 @@ func TestDropdownRowsStayFullHeightWithManyOptions(t *testing.T) {
 func TestDropdownFewOptionsNoScroll(t *testing.T) {
 	opts := []string{"E1M1", "E1M2", "E1M3"}
 	ui := NewUI(NewCanvas(windowW, windowH))
-	box := Rect{100, 100, 300, rowHeight}
+	box := Rect{X: 100, Y: 100, W: 300, H: rowHeight}
 	d := openDropdown(ui, "map", box, opts[0], opts)
 	if d == nil {
 		t.Fatal("dropdown did not open")
@@ -134,7 +134,7 @@ func TestDropdownScrollRevealsLaterOptions(t *testing.T) {
 		opts[i] = fmt.Sprintf("MAP%02d", i+1)
 	}
 	ui := NewUI(NewCanvas(windowW, windowH))
-	row := Rect{100, 100, 300, rowHeight}
+	row := Rect{X: 100, Y: 100, W: 300, H: rowHeight}
 	var selected string
 	write := func(s string) { selected = s }
 

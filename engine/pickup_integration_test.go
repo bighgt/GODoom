@@ -10,7 +10,7 @@ import (
 // loadRealLevel builds a Game from an IWAD map with just enough wired up to
 // run runTic (no window/renderer needed). Skips if the shareware WAD isn't
 // present.
-func loadRealLevel(t *testing.T, path, mapName string) *Game {
+func loadRealLevel(t testing.TB, path, mapName string) *Game {
 	t.Helper()
 	w, err := wad.Load(path)
 	if err != nil {

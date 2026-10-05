@@ -1,4 +1,6 @@
-package main
+// Package imgdec decodes the legacy image formats third-party Doom asset
+// packs ship that Go's standard library doesn't: Targa (TGA) and PCX.
+package imgdec
 
 import (
 	"encoding/binary"
@@ -7,7 +9,7 @@ import (
 	"io"
 )
 
-// decodeTGA decodes the Targa images used by the Quake 1 texture pack into
+// DecodeTGA decodes the Targa images used by the Quake 1 texture pack into
 // an *image.NRGBA. The pack is a mix of 24- and 32-bit truecolour TGAs,
 // some stored raw (image type 2) and some run-length encoded (type 10),
 // with either a bottom-left or top-left origin — that is the whole matrix
@@ -15,7 +17,7 @@ import (
 // used by the pack and are rejected rather than half-supported. The 2.0
 // footer/extension area, when present, just sits after the pixel data and
 // is ignored.
-func decodeTGA(r io.Reader) (*image.NRGBA, error) {
+func DecodeTGA(r io.Reader) (*image.NRGBA, error) {
 	blob, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err

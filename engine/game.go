@@ -1,12 +1,14 @@
 package engine
 
 import (
+	"archive/zip"
 	"fmt"
 	"log"
 	"math"
 	"time"
 
 	"twopointfive/assets"
+	"twopointfive/assets/models"
 	"twopointfive/assets/vfs"
 	"twopointfive/audio"
 	"twopointfive/bsp"
@@ -15,6 +17,7 @@ import (
 	"twopointfive/engine/gldefs"
 	"twopointfive/engine/mapinfo"
 	"twopointfive/engine/slopes"
+	"twopointfive/procstats"
 	"twopointfive/raster"
 	"twopointfive/render"
 	"twopointfive/render/worldgeo"
@@ -209,12 +212,30 @@ type Game struct {
 	// model wherever the loaded pack has one for that sprite frame (see
 	// drawMobjs, raster.DrawVoxel). nil = sprites only. Set by cmd/engine
 	// after picking the Doom1/Doom2 pack for the loaded WAD.
-	Voxels            *assets.VoxelSet
-	VoxelScale        float64 // config voxelScale — map units per voxel (hardware voxel path)
+	Voxels *assets.VoxelSet
+	// Models is the 3D model pack baked into the real-3D WAD (TPFMODEL —
+	// assets/models), nil when the WAD carries none; it outranks Voxels in
+	// the first-person view (voxelonly.go).
+	Models            *models.Set
+	ModelScale        float64 // config modelScale — size multiplier for 3D models and voxels
 	loggedVoxelStatus bool    // drawMobjs logs a one-line voxel/sprite tally once
 
 	soundCache map[string]*wad.Sound
-	sfxHook    func(name string) // tests only — observes every playSound call
+	// embeddedSounds is a real-3D WAD's TPFWEAPN weapon sounds (every
+	// arsenal's fire/impact/pickup lumps), indexed on first loadSound miss;
+	// embeddedSoundsProbed marks that the index was built (nil = none).
+	embeddedSounds       map[string]*zip.File
+	embeddedSoundsProbed bool
+	fireHeldHook         func() bool // tests only — stands in for the fire button (see fireHeld)
+
+	// procStats measures the engine process's own CPU and memory for the
+	// debug overlay (config showDebugInfo) — see package procstats.
+	procStats procstats.Sampler
+
+	// nav is the current level's monster route graph (monsternav.go),
+	// built on first use and rebuilt when g.Level changes.
+	nav     *navGraph
+	sfxHook func(name string) // tests only — observes every playSound call
 
 	// liquidCrossingHook, like sfxHook, is a tests-only observation point —
 	// checkPlayerLiquidCrossing (engine/liquidsplash.go) calls it on every
@@ -310,10 +331,8 @@ type Game struct {
 	// added spread a clear line of sight to the target is a guaranteed hit.
 	// Unused by the first-person front end.
 	IsoAimLocked bool
-	// geomHeights snapshots every sector's floor+ceiling height; renderFrame
-	// rebuilds the cached static geometry only when one of them actually
-	// moved — a live door in its open-wait, a strobe light, etc. must not
-	// trigger a rebuild.
+	// geomHeights snapshots every sector's floor+ceiling height as the
+	// static mesh last saw it (see worldGeomChanged, worldsync.go).
 	geomHeights []int16
 	dbgHWFrames int // rate-limits the hardware-path dynamic-light diagnostic
 	// dbgSimMS/dbgBuildMS/dbgDrawMS are smoothed (same EMA as fps below)
@@ -341,6 +360,24 @@ type Game struct {
 	// explosionParticles (config explosionParticles, default on) gates
 	// spawnExplosionParticles — see engine/particles.go.
 	explosionParticles bool
+
+	// smoothMonsterMovement (config smoothMonsterMovement, default on) gates
+	// the walking-monster step glide — see beginStepGlide in interp.go.
+	smoothMonsterMovement bool
+
+	// impFireballs / cacoFireballs (config, default on): the imp's and the
+	// cacodemon's rendered fireballs and their splash damage — see
+	// engine/impfireball.go.
+	impFireballs  bool
+	cacoFireballs bool
+
+	// lostSoulFire (config lostSoulFire, default on): flames trailing off
+	// living lost souls, plus their fire light — see engine/lostsoulfire.go.
+	lostSoulFire bool
+
+	// monsterRoaming (config monsterBehavior "roaming", the default): idle
+	// monsters wander the level (roam.go); off is vanilla's stand-and-wait.
+	monsterRoaming bool
 
 	// liquidAmbience (config liquidAmbience, default on) gates the ambient
 	// steam/mist/bubble particles (engine/liquidambience.go) and the rising
@@ -479,13 +516,9 @@ type Game struct {
 	animBaseFloor, animBaseCeil []string
 	wallAnimSlots               []wallAnimSlot
 	// animDefsCache is the parsed+merged ANIMDEFS lump(s) (nil once probed
-	// and absent — animDefsProbed tells the two apart). lastAnimHash lets the
-	// hardware path rebuild static geometry only on the tics an animated
-	// texture actually steps a frame (worldGeomChanged only sees heights).
-	animDefsCache   *animdefs.AnimDefs
-	animDefsProbed  bool
-	lastAnimHash    uint64
-	lastAnimHashSet bool
+	// and absent — animDefsProbed tells the two apart).
+	animDefsCache  *animdefs.AnimDefs
+	animDefsProbed bool
 	// exitLevel: 0 none, 1 normal exit, 2 secret exit — checked by Run.
 	exitLevel int
 	// exitDelay counts down (tics) before a pending exitLevel actually
@@ -509,6 +542,8 @@ type Game struct {
 	mobjs                        []*Mobj
 	hwSprites                    []worldgeo.Sprite        // reused per-frame billboard list
 	hwVoxels                     []worldgeo.VoxelInstance // reused per-frame voxel-instance list
+	hwModels                     []worldgeo.ModelInstance // reused per-frame 3D-model part list (collectWorldObjects)
+	hwAddSprites                 []worldgeo.Sprite        // reused per-frame additive thing billboards (collectWorldObjects; renderstyle.go)
 	hwParticleSprites            []worldgeo.Sprite        // reused per-frame additive particle billboard list — see collectParticleSprites
 	hwTransparentParticleSprites []worldgeo.Sprite        // reused per-frame translucent (smoke) billboard list — see collectTransparentParticleSprites
 	hwShadows                    [][4]float32             // reused per-frame ground-shadow caster list
@@ -520,22 +555,33 @@ type Game struct {
 
 	// Hardware-path sector-motion interpolation: prevSectorH is every
 	// sector's floor/ceiling height (interleaved) snapshotted at the top of
-	// runTic — the "start of the last tic" state renderFrame lerps forward
-	// from by renderLerp(), so a door/lift glides instead of stepping at
-	// 35Hz. secInterpSaved holds the authoritative heights displaced during
-	// one frame's geometry build, restored immediately after. sectorInterp
-	// Active reports that some sector was mid-travel this frame (forces a
-	// static-geometry rebuild, gated further by lastRenderedSecH below).
-	// Presentation only — the sim reads the real Level.Sectors heights.
-	prevSectorH        []int16
-	secInterpSaved     []savedSecH
-	sectorInterpActive bool
-	// lastRenderedSecH is every sector's floor/ceiling height (interleaved)
-	// as of the last frame's static-geometry build — see
-	// renderedSectorHeightsChanged's doc comment (interp.go) on why a
-	// sectorInterpActive frame still needs this second check before paying
-	// for a full-level Invalidate + blocking GPU re-upload.
-	lastRenderedSecH []int16
+	// runTic — the "start of the last tic" state a frame lerps the moving
+	// sectors forward from by renderLerp(), so a door/lift glides instead
+	// of stepping at 35Hz. secInterpSaved holds the authoritative heights
+	// displaced during one frame's geometry build, restored immediately
+	// after. Presentation only — the sim reads the real Level.Sectors
+	// heights.
+	prevSectorH     []int16
+	prevSectorLight []int16 // light at the top of the tic — see trackLiveSectors
+	secInterpSaved  []savedSecH
+
+	// Static-mesh sync for the hardware paths (worldsync.go). liveHold is
+	// per sector: tics left in the live set (re-armed each tic it moves,
+	// changes light or scrolls); liveList is that set, handed to
+	// WorldBuilder.SetLiveSectors when liveDirty. geomBuilder is the
+	// builder the rest was synced with (nil forces a full re-sync);
+	// geomDirty asks for one static rebuild (a switch texture flipped).
+	// animShown* is each animated surface's texture name as the static
+	// mesh shows it.
+	liveHold                   []int16
+	liveList                   []int
+	liveLevel                  *wad.Level
+	liveDirty, geomDirty       bool
+	liveJoined                 bool // markLive added a sector this tic
+	geomBuilder                *worldgeo.Builder
+	animShownFlat              []string
+	animShownWall              []string
+	animFlatSwap, animWallSwap map[string]string
 
 	// pickupPrev* is the player's position at the previous checkItemPickups
 	// call. The check only runs at the 35Hz tic rate while the camera moves
@@ -569,6 +615,15 @@ type Game struct {
 	// Built by spawnSpecials at level load, immutable thereafter.
 	sectorLines     [][]int32
 	sectorNeighbors [][]int32
+
+	// sectorHeightEpoch counts tics in which any sector's floor or ceiling
+	// moved (trackLiveSectors) — lightReach's cache key, so dynamic lights
+	// re-flood their sector reach as doors open and close (lightreach.go).
+	sectorHeightEpoch uint64
+	lightReach        lightReachCache
+
+	nextFireID       int       // burningPuddle.fire for the next barrel to explode
+	fireLightScratch []fireAcc // reused appendFireLights accumulator
 
 	// Sound-alert flood, one entry per level sector (id's
 	// sector_t.soundtarget / soundtraversed). pNoiseAlert (noise.go) floods
@@ -620,23 +675,28 @@ func NewGame(win *window.Window, renderer render.Renderer, ras *raster.Renderer,
 
 		hudStyle: hudStyleFromConfig(cfg.HUDStyle),
 
-		SwitchWeaponOnPickup: cfg.SwitchWeaponOnPickup,
-		InvertMouseY:         cfg.InvertMouseY,
-		MouseSensitivity:     sens,
-		TurnSpeed:            turn,
-		AlwaysRun:            cfg.AlwaysRun,
-		Crosshair:            cfg.Crosshair,
-		CrosshairSize:        cfg.CrosshairSize,
-		Skill:                skill,
-		MaxFPS:               cfg.MaxFPS,
-		cartoonShading:       cfg.CartoonShading,
-		explosionParticles:   cfg.ExplosionParticles,
-		liquidAmbience:       cfg.LiquidAmbience,
-		damageScale:          cfg.DamageScale,
-		weaponVolume:         cfg.WeaponVolume,
-		worldVolume:          cfg.WorldVolume,
-		VoxelScale:           cfg.VoxelScale,
-		flashlightEnabled:    cfg.Flashlight,
+		SwitchWeaponOnPickup:  cfg.SwitchWeaponOnPickup,
+		InvertMouseY:          cfg.InvertMouseY,
+		MouseSensitivity:      sens,
+		TurnSpeed:             turn,
+		AlwaysRun:             cfg.AlwaysRun,
+		Crosshair:             cfg.Crosshair,
+		CrosshairSize:         cfg.CrosshairSize,
+		Skill:                 skill,
+		MaxFPS:                cfg.MaxFPS,
+		cartoonShading:        cfg.CartoonShading,
+		explosionParticles:    cfg.ExplosionParticles,
+		smoothMonsterMovement: cfg.SmoothMonsterMovement,
+		impFireballs:          cfg.ImpFireballs,
+		cacoFireballs:         cfg.CacoFireballs,
+		lostSoulFire:          cfg.LostSoulFire,
+		monsterRoaming:        cfg.MonsterBehavior != config.MonsterBehaviorClassic,
+		liquidAmbience:        cfg.LiquidAmbience,
+		damageScale:           cfg.DamageScale,
+		weaponVolume:          cfg.WeaponVolume,
+		worldVolume:           cfg.WorldVolume,
+		ModelScale:            cfg.ModelScale,
+		flashlightEnabled:     cfg.Flashlight,
 	}
 	if fr, fg, fb, fdens, on := cfg.Fog(); on {
 		g.fogR, g.fogG, g.fogB, g.fogDensity = fr, fg, fb, float32(fdens)
@@ -658,32 +718,9 @@ func NewGame(win *window.Window, renderer render.Renderer, ras *raster.Renderer,
 	// the next Doom one through the launcher loop.
 	resetWeaponTables()
 
-	// PLSF (the plasma rifle's muzzle flash) has a locally-supplied generic
-	// hi-res sprite override (assets/textures/sprites/, indexed by
-	// indexHiresSprites — the same system that upscales THING/pickup
-	// sprites seen in the 3D world) whose hotspot is scaled from the
-	// VANILLA WAD patch's own offset. DrawWeapon (raster/weapon.go)
-	// positions the flash relative to the GUN by assuming both share one
-	// common origin point — true for two vanilla sprites (id authored them
-	// that way), but not when the gun itself is drawn from a separate,
-	// independently-authored HD weapon-viewmodel pack (assets/weapons/,
-	// loaded via a completely different code path with its own offset
-	// convention — see weaponOverrideRGBA's doc comment) that has no
-	// matching flash replacement of its own: the two origins disagree, and
-	// the disagreement gets magnified by the generic override's own ~4x
-	// upscale, throwing the flash far from the gun (reported: it rendered
-	// on the left edge of the screen instead of over the weapon). Dropping
-	// this specific override makes PLSF resolve straight from the vanilla
-	// WAD patch instead — self-consistent with a vanilla gun, and a much
-	// smaller (native-resolution) coordinate space even against an HD gun,
-	// so any residual cross-pack mismatch stays visually small instead of
-	// being thrown across the screen. Unconditional (not gated on which
-	// game/pack is active): correct either way, per the reasoning above.
-	if g.Raster != nil {
-		if tx := g.Raster.Textures(); tx != nil {
-			tx.DropHiresOverrides("PLSFA0", "PLSFB0", "PLSFC0", "PLSFD0")
-		}
-	}
+	// (The plasma rifle's PLSF muzzle-flash hi-res override is dropped by
+	// assets.New itself — see noHiresSprites there — so every consumer of
+	// the asset loader, cmd/wad3d's frozen weapon set included, agrees.)
 
 	g.heretic = isHereticWAD(w)
 	if g.heretic {
@@ -905,10 +942,13 @@ func (g *Game) renderFrame() error {
 	}
 	g.drawHUD()
 	if g.ShowHUD {
+		st := g.procStats.Update(time.Now()) // this process only; re-measured twice a second
 		g.Raster.DrawHUD([]string{
 			fmt.Sprintf("%s  FPS %.0f", g.levelDisplayName(), g.fps),
 			fmt.Sprintf("XYZ %.0f %.0f %.0f", g.Camera.X, g.Camera.Y, g.Camera.Z),
 			fmt.Sprintf("ANGLE %.0f PITCH %.0f", g.Camera.Angle*180/math.Pi, g.Camera.Pitch*180/math.Pi),
+			cpuLine(st),
+			memLine(st),
 		})
 	}
 	// Walk the BSP into a triangle list, add a camera-facing billboard per
@@ -916,30 +956,50 @@ func (g *Game) renderFrame() error {
 	// overlay draws above (weapon / HUD / crosshair) landed in the crisp
 	// overlay plane, which the GPU blends over the world.
 	buildStart := time.Now()
+	geom, wc, lights, vis := g.buildWorldFrame()
+	g.dbgBuildMS = emaMS(g.dbgBuildMS, time.Since(buildStart))
+	drawStart := time.Now()
+	ovY0, ovY1 := g.Raster.OverlayDirty()
+	err := g.Renderer.DrawWorld(geom, wc, g.Raster.Width, g.Raster.Height, g.Raster.Overlay(), ovY0, ovY1, lights)
+	g.dbgDrawMS = emaMS(g.dbgDrawMS, time.Since(drawStart))
+	if g.dbgHWFrames < 5400 {
+		g.dbgHWFrames++
+		if g.dbgHWFrames <= 3 || g.dbgHWFrames%1800 == 0 {
+			log.Printf("engine: [hw] frame %d — collectLights -> %d light(s) to DrawWorld", g.dbgHWFrames, len(lights))
+			log.Printf("engine: [hw] frame %d — visibility grid: %d/%d draws, %d/%d verts drawn (culled %.0f%%)",
+				g.dbgHWFrames, vis.draws, vis.totalDraws, vis.verts, vis.totalVerts, 100*(1-float64(vis.draws)/float64(max(vis.totalDraws, 1))))
+			// Per-stage smoothed frame time: sim = every System +
+			// stepSimulation (CPU gameplay), build = BSP walk/geometry
+			// prep/visibility culling above (CPU, this engine's own
+			// code), draw = DrawWorld's command recording + submit +
+			// whatever fence wait it hits (Vulkan driver/GPU territory —
+			// see dbgDrawMS's own doc comment on why this is the number
+			// to compare across OSes/drivers).
+			log.Printf("engine: [hw] frame %d — timing: sim=%.2fms build=%.2fms draw=%.2fms (fps %.0f)",
+				g.dbgHWFrames, g.dbgSimMS, g.dbgBuildMS, g.dbgDrawMS, g.fps)
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("engine: draw world: %w", err)
+	}
+	return nil
+}
+
+// frameVisStats is UpdateVisibility's tally for one frame (draws / verts
+// kept of the total), for renderFrame's periodic debug log.
+type frameVisStats struct{ draws, totalDraws, verts, totalVerts int }
+
+// buildWorldFrame is the CPU half of a hardware frame: the static geometry
+// (rebuilt only when a sector or animated texture changed), this frame's
+// map objects, particles, decals, models and lights, and the visibility
+// cull — everything DrawWorld needs, with no GPU work. Split out of
+// renderFrame so it can be benchmarked without a window (perf_test.go).
+func (g *Game) buildWorldFrame() (*worldgeo.Geometry, worldgeo.Camera, []render.Light, frameVisStats) {
 	fov := g.Camera.FOVDeg
 	if fov <= 0 {
 		fov = 90
 	}
-	geomChanged := g.worldGeomChanged() // reads authoritative (pre-interp) heights
-	animChanged := g.animFrameChanged() // an animated flat/texture stepped a frame
-	restoreSecH := g.applySectorInterp()
-	// heightsChanged must run every frame (its snapshot update is a side
-	// effect other frames' comparisons depend on) even though it's only
-	// consulted when sectorInterpActive — see its own doc comment on why
-	// that check exists at all: a mid-glide mover reinterpolates every
-	// render frame, but most of those frames round to the exact same
-	// int16 height as the one before, and rebuilding for one of those
-	// would be a full-level Invalidate + a blocking GPU re-upload for no
-	// visual difference.
-	heightsChanged := g.renderedSectorHeightsChanged()
-	if geomChanged || animChanged || (g.sectorInterpActive && heightsChanged) {
-		// A mover changed a sector height between tics, an animated
-		// flat/wall texture advanced, or one is mid-glide this frame AND
-		// actually moved since the last frame we rebuilt for — rebuild
-		// the static geometry (its texture bindings are baked in, and the
-		// height version needs to track interpolation, not 35Hz).
-		g.WorldBuilder.Invalidate()
-	}
+	restoreSecH := g.syncWorldGeometry()
 	geom := g.WorldBuilder.Build(float32(g.Camera.X), float32(g.Camera.Y))
 	restoreSecH() // authoritative heights back before anything else reads them
 	sprites, voxels := g.collectWorldObjects()
@@ -950,7 +1010,7 @@ func (g *Game) renderFrame() error {
 	}
 	additiveParticles, transparentParticles := g.collectAllParticleSprites()
 	g.WorldBuilder.AddSprites(g.Camera.Angle, sprites)
-	g.WorldBuilder.AddParticleSprites(g.Camera.Angle, additiveParticles)
+	g.WorldBuilder.AddParticleSprites(g.Camera.Angle, append(additiveParticles, g.hwAddSprites...))
 	// Ground puddle decals first: they must land underneath the fire/smoke
 	// billboards rising off them (see AddGroundSplats' own doc comment on
 	// draw order), not drawn after and blended on top of them.
@@ -958,6 +1018,7 @@ func (g *Game) renderFrame() error {
 	g.WorldBuilder.AddTransparentSprites(float32(g.Camera.X), float32(g.Camera.Y), float32(g.Camera.Z),
 		g.Camera.Angle, transparentParticles)
 	g.WorldBuilder.AddVoxels(voxels)
+	g.WorldBuilder.AddModels(g.hwModels)
 	wc := worldgeo.Camera{
 		X: g.Camera.X, Y: g.Camera.Y, Z: g.Camera.Z,
 		Angle: g.Camera.Angle, Pitch: g.Camera.Pitch, FOVDeg: fov,
@@ -1002,33 +1063,9 @@ func (g *Game) renderFrame() error {
 	// render/vulkan/world.go's colour pass reads that to skip drawing
 	// what's out of view. Must run every frame (not just the debug-log
 	// window below): it's the actual cull now, not only a diagnostic.
-	visD, totD, visV, totV := g.WorldBuilder.UpdateVisibility(wc)
-	g.dbgBuildMS = emaMS(g.dbgBuildMS, time.Since(buildStart))
-	drawStart := time.Now()
-	ovY0, ovY1 := g.Raster.OverlayDirty()
-	err := g.Renderer.DrawWorld(geom, wc, g.Raster.Width, g.Raster.Height, g.Raster.Overlay(), ovY0, ovY1, lights)
-	g.dbgDrawMS = emaMS(g.dbgDrawMS, time.Since(drawStart))
-	if g.dbgHWFrames < 5400 {
-		g.dbgHWFrames++
-		if g.dbgHWFrames <= 3 || g.dbgHWFrames%1800 == 0 {
-			log.Printf("engine: [hw] frame %d — collectLights -> %d light(s) to DrawWorld", g.dbgHWFrames, len(lights))
-			log.Printf("engine: [hw] frame %d — visibility grid: %d/%d draws, %d/%d verts drawn (culled %.0f%%)",
-				g.dbgHWFrames, visD, totD, visV, totV, 100*(1-float64(visD)/float64(max(totD, 1))))
-			// Per-stage smoothed frame time: sim = every System +
-			// stepSimulation (CPU gameplay), build = BSP walk/geometry
-			// prep/visibility culling above (CPU, this engine's own
-			// code), draw = DrawWorld's command recording + submit +
-			// whatever fence wait it hits (Vulkan driver/GPU territory —
-			// see dbgDrawMS's own doc comment on why this is the number
-			// to compare across OSes/drivers).
-			log.Printf("engine: [hw] frame %d — timing: sim=%.2fms build=%.2fms draw=%.2fms (fps %.0f)",
-				g.dbgHWFrames, g.dbgSimMS, g.dbgBuildMS, g.dbgDrawMS, g.fps)
-		}
-	}
-	if err != nil {
-		return fmt.Errorf("engine: draw world: %w", err)
-	}
-	return nil
+	var vis frameVisStats
+	vis.draws, vis.totalDraws, vis.verts, vis.totalVerts = g.WorldBuilder.UpdateVisibility(wc)
+	return geom, wc, lights, vis
 }
 
 // capFrameRate sleeps out the rest of the frame budget when config.json's
@@ -1316,4 +1353,26 @@ func (g *Game) groundPlayer(floorZ float64) {
 	g.VelZ = 0
 	g.onGround = true
 	g.viewDip = 0
+}
+
+// cpuLine is the debug overlay's CPU row: the engine process's own CPU use
+// as a percentage of ONE core (so a busy multi-threaded frame can read over
+// 100%), with the machine's core count for scale.
+func cpuLine(st procstats.Sample) string {
+	if !st.CPUKnown {
+		return fmt.Sprintf("CPU --  (%d cores)", st.Cores)
+	}
+	return fmt.Sprintf("CPU %.0f%% of a core  (%d cores)", st.CPUPercent, st.Cores)
+}
+
+// memLine is the debug overlay's memory row: the engine process's resident
+// memory (everything the OS has given it, GPU-driver and cgo allocations
+// included — not video memory on the card) and the Go runtime's own share —
+// live heap objects of everything it has mapped.
+func memLine(st procstats.Sample) string {
+	goPart := fmt.Sprintf("Go heap %d MB of %d MB", st.GoHeap>>20, st.GoTotal>>20)
+	if st.RSS == 0 {
+		return "MEM " + goPart
+	}
+	return fmt.Sprintf("MEM %d MB  (%s)", st.RSS>>20, goPart)
 }

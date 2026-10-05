@@ -269,8 +269,8 @@ func TestWorldVolumeDefaultAndRepair(t *testing.T) {
 
 func TestDeprecatedFilterKeysReported(t *testing.T) {
 	dep := deprecatedKeys([]byte(`{"spriteFilter":"nearest","voxels":true,"voxelFilter":"smooth"}`))
-	if len(dep) != 2 || dep[0] != "spriteFilter" || dep[1] != "voxelFilter" {
-		t.Errorf("deprecatedKeys = %v, want [spriteFilter voxelFilter]", dep)
+	if len(dep) != 3 || dep[0] != "spriteFilter" || dep[1] != "voxelFilter" || dep[2] != "voxels" {
+		t.Errorf("deprecatedKeys = %v, want [spriteFilter voxelFilter voxels]", dep)
 	}
 	// The software-rasterizer keys retired along with it.
 	dep = deprecatedKeys([]byte(`{"renderer":"hardware","lightingMode":"enhanced","textureQuality":"aniso8x","shadows":true,"groundShadows":false}`))
@@ -320,23 +320,19 @@ func TestInputAndGameplayDefaultsAndRepair(t *testing.T) {
 	if (Config{Resolution: "720p", FOVDegrees: 90, ShowStatusBar: false}).repaired().ShowStatusBar {
 		t.Error("explicit showStatusBar:false was overridden")
 	}
-	if d.InvertMouseY || d.AlwaysRun || d.MaxFPS != 0 || !d.Voxels || d.VoxelScale != 1.0 {
+	if d.InvertMouseY || d.AlwaysRun || d.MaxFPS != 0 || d.ModelScale != 1.0 {
 		t.Errorf("unexpected defaults: %+v", d)
 	}
 
-	// voxelScale: absent -> default, out of range -> default, in range kept;
-	// an explicit voxels:false survives.
-	if r := (Config{Resolution: "720p", FOVDegrees: 90}).repaired(); r.VoxelScale != 1.0 {
-		t.Errorf("absent voxelScale not defaulted: %v", r.VoxelScale)
+	// modelScale: absent -> default, out of range -> default, in range kept.
+	if r := (Config{Resolution: "720p", FOVDegrees: 90}).repaired(); r.ModelScale != 1.0 {
+		t.Errorf("absent modelScale not defaulted: %v", r.ModelScale)
 	}
-	if r := (Config{Resolution: "720p", FOVDegrees: 90, VoxelScale: 99}).repaired(); r.VoxelScale != 1.0 {
-		t.Errorf("out-of-range voxelScale not clamped: %v", r.VoxelScale)
+	if r := (Config{Resolution: "720p", FOVDegrees: 90, ModelScale: 99}).repaired(); r.ModelScale != 1.0 {
+		t.Errorf("out-of-range modelScale not clamped: %v", r.ModelScale)
 	}
-	if r := (Config{Resolution: "720p", FOVDegrees: 90, VoxelScale: 2}).repaired(); r.VoxelScale != 2 {
-		t.Errorf("valid voxelScale altered: %v", r.VoxelScale)
-	}
-	if (Config{Resolution: "720p", FOVDegrees: 90, Voxels: false}).repaired().Voxels {
-		t.Error("explicit voxels:false was overridden")
+	if r := (Config{Resolution: "720p", FOVDegrees: 90, ModelScale: 2}).repaired(); r.ModelScale != 2 {
+		t.Errorf("valid modelScale altered: %v", r.ModelScale)
 	}
 
 	// iwad / map: empty by default, surrounding whitespace trimmed.
@@ -491,5 +487,54 @@ func TestRepairedFog(t *testing.T) {
 	c.FogDensity = -1
 	if got := c.repaired(); got.FogDensity != 0 {
 		t.Errorf("negative fogDensity not zeroed: %v", got.FogDensity)
+	}
+}
+
+// TestMonsterBehavior: roaming is the default; "classic" is kept; anything
+// else (or nothing) falls back to roaming.
+func TestMonsterBehavior(t *testing.T) {
+	if d := Default().MonsterBehavior; d != MonsterBehaviorRoaming {
+		t.Errorf("default monsterBehavior = %q, want %q", d, MonsterBehaviorRoaming)
+	}
+	for in, want := range map[string]string{"": MonsterBehaviorRoaming, "Classic": MonsterBehaviorClassic, " roaming ": MonsterBehaviorRoaming, "vanilla": MonsterBehaviorRoaming} {
+		if got := (Config{Resolution: "720p", FOVDegrees: 90, MonsterBehavior: in}).repaired().MonsterBehavior; got != want {
+			t.Errorf("monsterBehavior %q -> %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestObjectStyle: 3D models are the default; "voxels" is kept; anything
+// else (or nothing) falls back to models.
+func TestObjectStyle(t *testing.T) {
+	if d := Default().ObjectStyle; d != ObjectStyleModels {
+		t.Errorf("default objectStyle = %q, want %q", d, ObjectStyleModels)
+	}
+	for in, want := range map[string]string{"": ObjectStyleModels, "Voxels": ObjectStyleVoxels, " models ": ObjectStyleModels, "sprites": ObjectStyleModels} {
+		if got := (Config{Resolution: "720p", FOVDegrees: 90, ObjectStyle: in}).repaired().ObjectStyle; got != want {
+			t.Errorf("objectStyle %q -> %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestLegacyVoxelScale: an old config's "voxelScale" still sizes models
+// (it was renamed "modelScale" when 3D models started sharing it), unless
+// the file also has the new key.
+func TestLegacyVoxelScale(t *testing.T) {
+	dir := t.TempDir()
+	for _, c := range []struct {
+		json string
+		want float64
+	}{
+		{`{"voxelScale": 1.5}`, 1.5},
+		{`{"voxelScale": 1.5, "modelScale": 2}`, 2},
+		{`{}`, 1.0},
+	} {
+		p := dir + "/config.json"
+		if err := os.WriteFile(p, []byte(c.json), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := loadFile(p).ModelScale; got != c.want {
+			t.Errorf("%s: modelScale = %v, want %v", c.json, got, c.want)
+		}
 	}
 }

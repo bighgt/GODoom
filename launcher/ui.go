@@ -104,7 +104,7 @@ func (ui *UI) End() (changed bool) {
 			break
 		}
 		opt := d.options[idx]
-		r := Rect{d.list.X, d.list.Y + row*rowHeight, d.list.W, rowHeight}
+		r := Rect{X: d.list.X, Y: d.list.Y + row*rowHeight, W: d.list.W, H: rowHeight}
 		bg := theme.Panel
 		if opt.value == d.current {
 			bg = theme.AccentDim
@@ -123,8 +123,8 @@ func (ui *UI) End() (changed bool) {
 		if maxScroll > 0 {
 			thumbY += (trackH - thumbH) * d.scroll / maxScroll
 		}
-		ui.C.FillRect(Rect{d.list.X + d.list.W - 4, d.list.Y, 4, trackH}, theme.Panel)
-		ui.C.FillRect(Rect{d.list.X + d.list.W - 4, thumbY, 4, thumbH}, theme.ScrollThumb)
+		ui.C.FillRect(Rect{X: d.list.X + d.list.W - 4, Y: d.list.Y, W: 4, H: trackH}, theme.Panel)
+		ui.C.FillRect(Rect{X: d.list.X + d.list.W - 4, Y: thumbY, W: 4, H: thumbH}, theme.ScrollThumb)
 	}
 
 	// Scrolling and closing both leave the dropdown open for another frame
@@ -214,7 +214,7 @@ func (ui *UI) drawTooltip(t *tooltip) {
 	if x < panelPad {
 		x = panelPad
 	}
-	r := Rect{x, y, w, h}
+	r := Rect{X: x, Y: y, W: w, H: h}
 	ui.C.FillRect(r, theme.Panel)
 	ui.C.StrokeRect(r, theme.Accent, 1)
 	ui.C.TextLeft(r, t.text, theme.Text)
@@ -266,8 +266,8 @@ func (ui *UI) Button(r Rect, label string, style ButtonStyle) bool {
 // Checkbox draws label:box in r (label in the left labelWidth column, a
 // small box after it) and flips *v on click, reporting whether it changed.
 func (ui *UI) Checkbox(id string, r Rect, label string, v *bool) bool {
-	ui.Label(Rect{r.X, r.Y, labelWidth, r.H}, label, false)
-	box := Rect{r.X + labelWidth, r.Y + (r.H-18)/2, 18, 18}
+	ui.Label(Rect{X: r.X, Y: r.Y, W: labelWidth, H: r.H}, label, false)
+	box := Rect{X: r.X + labelWidth, Y: r.Y + (r.H-18)/2, W: 18, H: 18}
 	bg := theme.Control
 	if ui.hover(box) {
 		bg = theme.ControlHover
@@ -288,9 +288,9 @@ func (ui *UI) Checkbox(id string, r Rect, label string, v *bool) bool {
 // Click-and-drag anywhere on the track jumps/moves the value; format is a
 // fmt.Sprintf verb for the value readout (e.g. "%.2f", "%.0f%%").
 func (ui *UI) Slider(id string, r Rect, label string, v *float64, min, max float64, format string) bool {
-	ui.Label(Rect{r.X, r.Y, labelWidth, r.H}, label, false)
+	ui.Label(Rect{X: r.X, Y: r.Y, W: labelWidth, H: r.H}, label, false)
 	valueW := 64
-	track := Rect{r.X + labelWidth, r.Y + r.H/2 - 3, r.W - labelWidth - valueW - 8, 6}
+	track := Rect{X: r.X + labelWidth, Y: r.Y + r.H/2 - 3, W: r.W - labelWidth - valueW - 8, H: 6}
 	ui.C.FillRect(track, theme.Control)
 	ui.C.StrokeRect(track, theme.Border, 1)
 
@@ -300,7 +300,7 @@ func (ui *UI) Slider(id string, r Rect, label string, v *float64, min, max float
 	frac := (*v - min) / (max - min)
 	frac = clamp01(frac)
 	handleX := track.X + int(frac*float64(track.W)) - 4
-	handle := Rect{handleX, r.Y + r.H/2 - 8, 8, 16}
+	handle := Rect{X: handleX, Y: r.Y + r.H/2 - 8, W: 8, H: 16}
 	handleCol := theme.Accent
 	if ui.hover(track) || ui.dragSlider == id {
 		handleCol = theme.AccentDim
@@ -331,7 +331,7 @@ func (ui *UI) Slider(id string, r Rect, label string, v *float64, min, max float
 		ui.dragSlider = ""
 	}
 
-	valueRect := Rect{track.X + track.W + 8, r.Y, valueW, r.H}
+	valueRect := Rect{X: track.X + track.W + 8, Y: r.Y, W: valueW, H: r.H}
 	ui.C.TextLeft(valueRect, fmt.Sprintf(format, *v), theme.TextDim)
 	return changed
 }
@@ -357,8 +357,8 @@ func labelFor(options []choice, value string) string {
 }
 
 func (ui *UI) Options(id string, r Rect, label string, current string, options []choice, write func(string)) {
-	ui.Label(Rect{r.X, r.Y, labelWidth, r.H}, label, false)
-	box := Rect{r.X + labelWidth, r.Y, r.W - labelWidth, r.H}
+	ui.Label(Rect{X: r.X, Y: r.Y, W: labelWidth, H: r.H}, label, false)
+	box := Rect{X: r.X + labelWidth, Y: r.Y, W: r.W - labelWidth, H: r.H}
 	open := ui.openDropdown == id
 	bg := theme.Control
 	if ui.hover(box) || open {
@@ -382,7 +382,7 @@ func (ui *UI) Options(id string, r Rect, label string, current string, options [
 		maxScroll := max(len(options)-visible, 0)
 		ui.deferred = &deferredDropdown{
 			id: id, control: box, current: current, options: options, write: write,
-			list:    Rect{box.X, box.Y + box.H, box.W, visible * rowHeight},
+			list:    Rect{X: box.X, Y: box.Y + box.H, W: box.W, H: visible * rowHeight},
 			scroll:  max(0, min(maxScroll, ui.dropdownScroll[id])),
 			visible: visible,
 		}
@@ -395,8 +395,8 @@ func (ui *UI) Options(id string, r Rect, label string, current string, options [
 // supported — good enough for the paths/short strings this launcher edits
 // (a WAD/IWAD path, a hex fog colour).
 func (ui *UI) TextField(id string, r Rect, label string, v *string) bool {
-	ui.Label(Rect{r.X, r.Y, labelWidth, r.H}, label, false)
-	box := Rect{r.X + labelWidth, r.Y, r.W - labelWidth, r.H}
+	ui.Label(Rect{X: r.X, Y: r.Y, W: labelWidth, H: r.H}, label, false)
+	box := Rect{X: r.X + labelWidth, Y: r.Y, W: r.W - labelWidth, H: r.H}
 	focused := ui.focusText == id
 
 	if ui.In.MouseLeftClicked {
@@ -462,7 +462,7 @@ func (ui *UI) TextField(id string, r Rect, label string, v *string) bool {
 	ui.C.TextLeft(box, *v, theme.Text)
 	if focused {
 		cx := box.X + 8 + ui.textCursor[id]*glyphAdvance
-		ui.C.FillRect(Rect{cx, box.Y + 4, 1, box.H - 8}, theme.Accent)
+		ui.C.FillRect(Rect{X: cx, Y: box.Y + 4, W: 1, H: box.H - 8}, theme.Accent)
 	}
 	return changed
 }

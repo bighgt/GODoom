@@ -51,6 +51,22 @@ func PickWADFile() (string, error) {
 	return pickWAD()
 }
 
+// PickSaveWADFile opens the platform's native "save as" dialog for a WAD —
+// cmd/wad3d's "where should the converted WAD go?" — starting in
+// defaultPath's folder with its file name filled in. The OS dialog asks
+// before overwriting an existing file (declining counts as a cancel).
+// Returns ErrPickCancelled on cancel; the path always ends in .wad.
+func PickSaveWADFile(title, defaultPath string) (string, error) {
+	p, err := pickSaveWAD(title, defaultPath)
+	if err != nil {
+		return "", err
+	}
+	if !strings.EqualFold(filepath.Ext(p), ".wad") {
+		p += ".wad"
+	}
+	return p, nil
+}
+
 // PickImageFile opens the platform's native "open file" dialog filtered to
 // PNG images — the level editor's "Import Texture..." command (a single
 // file; see PickFolder for a whole directory of them).

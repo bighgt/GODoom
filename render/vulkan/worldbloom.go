@@ -132,70 +132,20 @@ func (r *Renderer) worldCreateBloom() error {
 	// passes serialise their read-after-write / write-after-read on the
 	// shared mip images (the pyramid reuses images across frames-in-flight,
 	// like the old ping-pong bloom did).
-	mkRP := func(loadOp vk.AttachmentLoadOp, initLayout vk.ImageLayout) (vk.RenderPass, error) {
-		att := vk.AttachmentDescription{
-			Format: sceneHDRFormat, Samples: vk.SampleCount1Bit,
-			LoadOp: loadOp, StoreOp: vk.AttachmentStoreOpStore,
-			StencilLoadOp: vk.AttachmentLoadOpDontCare, StencilStoreOp: vk.AttachmentStoreOpDontCare,
-			InitialLayout: initLayout, FinalLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-		}
-		ref := vk.AttachmentReference{Attachment: 0, Layout: vk.ImageLayoutColorAttachmentOptimal}
-		sub := vk.SubpassDescription{
-			PipelineBindPoint: vk.PipelineBindPointGraphics, ColorAttachmentCount: 1,
-			PColorAttachments: []vk.AttachmentReference{ref},
-		}
-		deps := []vk.SubpassDependency{
-			{
-				SrcSubpass: vk.SubpassExternal, DstSubpass: 0,
-				SrcStageMask:  vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit),
-				DstStageMask:  vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit),
-				SrcAccessMask: vk.AccessFlags(vk.AccessShaderReadBit),
-				DstAccessMask: vk.AccessFlags(vk.AccessColorAttachmentReadBit) | vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
-			},
-			{
-				SrcSubpass: 0, DstSubpass: vk.SubpassExternal,
-				SrcStageMask:  vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit),
-				DstStageMask:  vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit),
-				SrcAccessMask: vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
-				DstAccessMask: vk.AccessFlags(vk.AccessShaderReadBit),
-			},
-		}
-		info := vk.RenderPassCreateInfo{
-			SType: vk.StructureTypeRenderPassCreateInfo, AttachmentCount: 1, PAttachments: []vk.AttachmentDescription{att},
-			SubpassCount: 1, PSubpasses: []vk.SubpassDescription{sub},
-			DependencyCount: uint32(len(deps)), PDependencies: deps,
-		}
-		var rp vk.RenderPass
-		if res := vk.CreateRenderPass(r.device, &info, nil, &rp); res != vk.Success {
-			return nil, fmt.Errorf("vulkan: bloom render pass: %s", vk.Error(res))
-		}
-		return rp, nil
-	}
 	var err error
-	if bl.rpClear, err = mkRP(vk.AttachmentLoadOpClear, vk.ImageLayoutUndefined); err != nil {
+	if bl.rpClear, err = r.newSampledColorPass(sceneHDRFormat, vk.AttachmentLoadOpClear, vk.ImageLayoutUndefined, "bloom"); err != nil {
 		return err
 	}
-	if bl.rpAdd, err = mkRP(vk.AttachmentLoadOpLoad, vk.ImageLayoutShaderReadOnlyOptimal); err != nil {
+	if bl.rpAdd, err = r.newSampledColorPass(sceneHDRFormat, vk.AttachmentLoadOpLoad, vk.ImageLayoutShaderReadOnlyOptimal, "bloom"); err != nil {
 		return err
 	}
 
-	mkFB := func(rp vk.RenderPass, view vk.ImageView, w, h int) (vk.Framebuffer, error) {
-		info := vk.FramebufferCreateInfo{
-			SType: vk.StructureTypeFramebufferCreateInfo, RenderPass: rp,
-			AttachmentCount: 1, PAttachments: []vk.ImageView{view},
-			Width: uint32(w), Height: uint32(h), Layers: 1,
-		}
-		var fb vk.Framebuffer
-		if res := vk.CreateFramebuffer(r.device, &info, nil, &fb); res != vk.Success {
-			return nil, fmt.Errorf("vulkan: bloom framebuffer: %s", vk.Error(res))
-		}
-		return fb, nil
-	}
-	for i := 0; i < bloomMips; i++ {
-		if bl.mip[i].fbClear, err = mkFB(bl.rpClear, bl.mip[i].img.view, bl.mip[i].w, bl.mip[i].h); err != nil {
+	for i := range bl.mip {
+		m := &bl.mip[i]
+		if m.fbClear, err = r.newFramebuffer(bl.rpClear, m.w, m.h, "bloom", m.img.view); err != nil {
 			return err
 		}
-		if bl.mip[i].fbAdd, err = mkFB(bl.rpAdd, bl.mip[i].img.view, bl.mip[i].w, bl.mip[i].h); err != nil {
+		if m.fbAdd, err = r.newFramebuffer(bl.rpAdd, m.w, m.h, "bloom", m.img.view); err != nil {
 			return err
 		}
 	}
@@ -206,13 +156,9 @@ func (r *Renderer) worldCreateBloom() error {
 	// bl is inside the big worldResources heap object, and passing a pointer
 	// into it to a cgo call trips Go's cgocheck ("Go pointer to unpinned Go
 	// pointer") since the struct is full of pointer-typed vk handles.
-	dslInfo := vk.DescriptorSetLayoutCreateInfo{
-		SType: vk.StructureTypeDescriptorSetLayoutCreateInfo, BindingCount: 1,
-		PBindings: []vk.DescriptorSetLayoutBinding{samplerBinding(0)},
-	}
-	var dsl vk.DescriptorSetLayout
-	if res := vk.CreateDescriptorSetLayout(r.device, &dslInfo, nil, &dsl); res != vk.Success {
-		return fmt.Errorf("vulkan: bloom dsl: %s", vk.Error(res))
+	dsl, err := r.newDescriptorSetLayout("bloom", samplerBinding(0))
+	if err != nil {
+		return err
 	}
 	bl.dsl = dsl
 
@@ -229,24 +175,10 @@ func (r *Renderer) worldCreateBloom() error {
 	bl.pool = pool
 
 	alloc := func() (vk.DescriptorSet, error) {
-		info := vk.DescriptorSetAllocateInfo{
-			SType: vk.StructureTypeDescriptorSetAllocateInfo, DescriptorPool: bl.pool,
-			DescriptorSetCount: 1, PSetLayouts: []vk.DescriptorSetLayout{bl.dsl},
-		}
-		var s vk.DescriptorSet
-		if res := vk.AllocateDescriptorSets(r.device, &info, &s); res != vk.Success {
-			return nil, fmt.Errorf("vulkan: bloom descriptor set: %s", vk.Error(res))
-		}
-		return s, nil
+		return r.allocDescriptorSet(bl.pool, bl.dsl, "bloom")
 	}
 	img := func(set vk.DescriptorSet, view vk.ImageView) vk.WriteDescriptorSet {
-		return vk.WriteDescriptorSet{
-			SType: vk.StructureTypeWriteDescriptorSet, DstSet: set, DstBinding: 0, DescriptorCount: 1,
-			DescriptorType: vk.DescriptorTypeCombinedImageSampler,
-			PImageInfo: []vk.DescriptorImageInfo{{
-				Sampler: wr.clampSampler, ImageView: view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-			}},
-		}
+		return imageWrite(set, 0, wr.clampSampler, view)
 	}
 	var writes []vk.WriteDescriptorSet
 	for i := range bl.setScene {

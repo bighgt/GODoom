@@ -39,7 +39,7 @@ const (
 	KindLiquidLava                 // lava floor flat: warm emissive glow
 	KindLiquidNukage               // nukage/slime floor flat: green emissive tint
 	KindSpriteTrans                // billboard, real alpha blend (Vert.Alpha) — see AddTransparentSprites
-	KindTeleport                   // teleporter-pad floor flat: procedural blue/white shimmer, ignores Tex entirely
+	KindTeleport                   // teleporter-pad floor flat: procedural shimmering blue water, ignores Tex entirely
 )
 
 // liquidKindOfFlat classifies a floor flat's lump name for the liquid
@@ -94,6 +94,11 @@ type Vert struct {
 	Alpha      float32
 	Tex        uint16
 	Kind       uint16
+	// Sector is the level sector this wall/flat surface belongs to, plus
+	// one — 0 means "none" (sprites, particles). The dynamic lights use it
+	// to light only the sectors each one can actually reach
+	// (render.Light.Reach), so a light doesn't shine through walls.
+	Sector uint16
 }
 
 // Draw is one contiguous run of Geometry.Tris that shares a texture: the
@@ -162,6 +167,20 @@ type Geometry struct {
 	Tris  []Vert // dynamic: sprite + voxel-billboard quads, refilled per frame
 	Draws []Draw
 
+	// LiveDraws is the geometry of the "live" sectors (Builder.
+	// SetLiveSectors — ones currently moving, flickering or scrolling):
+	// their floors, ceilings and every wall touching them, re-emitted by
+	// each Build from the sectors' current state (interpolated heights,
+	// light, offsets) into Tris — so a moving door or a strobing light
+	// costs a few quads a frame instead of rebuilding and re-uploading the
+	// whole static mesh. Kinds are world kinds (wall/flat/sky/masked/
+	// liquid), drawn with the world pipeline right after StaticDraws. The
+	// first LiveOpaqueDraws entries are the solid walls/flats (what a
+	// depth-only pass such as shadow casting wants); sky, masked and
+	// water runs follow.
+	LiveDraws       []Draw
+	LiveOpaqueDraws int
+
 	// ParticleDraws is AddParticleSprites' own output — same Tris buffer,
 	// same texture slots as Draws, but meant for a backend's separate
 	// additive, no-depth-write pipeline (see render/vulkan's pipeParticleAdd)
@@ -191,6 +210,9 @@ type Geometry struct {
 	// Voxels is this frame's voxel-model instances (AddVoxels), drawn by the
 	// backend with their own pipeline after the textured geometry.
 	Voxels []VoxelInstance
+	// Models are this frame's textured 3D model parts (modelinst.go) —
+	// drawn by the backend's model pipeline, like Voxels.
+	Models []ModelInstance
 }
 
 // skyTextureForMap mirrors raster.skyTextureForMap / PrBoom's P_SetupLevel:
@@ -259,12 +281,34 @@ type Builder struct {
 	fan              []bsp.Point                 // reused scratch for the seg-fan fallback
 	grid             *visGrid                    // Stage 1 visibility-culling scoping — see visgrid.go
 	curCell          int32                       // this subsector's grid cell, set once per emitSubsectorIdx call
+	curSector        uint16                      // this subsector's sector + 1 (Vert.Sector), set with curCell
 	buckets          map[uint16]map[int32][]Vert // opaque static: per texture slot (SkyTex for sky), per grid cell
 	masked           map[uint16]map[int32][]Vert // static KindMasked (2-sided middles): per texture slot, per grid cell
 	waterBuckets     map[uint16]map[int32][]Vert // static KindLiquidWater: per texture slot, per grid cell — kept apart from buckets so it can become its own Draw list (Geometry.WaterDraws)
 	sprites          map[uint16][]Vert           // per texture slot, AddSprites billboards — reused across calls
 	particleSprites  map[uint16][]Vert           // per texture slot, AddParticleSprites billboards — reused across calls
 	transparentItems []transparentItem           // AddTransparentSprites' own sort scratch — reused across calls
+
+	// Live sectors (SetLiveSectors): live marks them by sector index;
+	// liveSS lists the subsectors with any live geometry (their own
+	// sector live, or a seg whose other side is); liveBuckets is the
+	// per-frame emission scratch, the same shape as buckets/masked/
+	// waterBuckets (emitLive swaps it in).
+	live        []bool
+	liveSS      []int
+	liveBuckets [3]map[uint16]map[int32][]Vert
+	// The live geometry is cached: emitLive re-emits it only when one of
+	// its inputs changed — liveSecs (the live sectors and their
+	// neighbours) or liveSides (the involved walls' sidedefs), compared
+	// against liveSnapSec/liveSnapSide. liveVerts is its length at the
+	// head of Tris; liveValid is false until the first emission and after
+	// any rebuild.
+	liveSecs     []int
+	liveSides    []int
+	liveSnapSec  []wad.Sector
+	liveSnapSide []wad.Sidedef
+	liveVerts    int
+	liveValid    bool
 
 	// SkipCeilings, when true, omits every ceiling flat from the static
 	// geometry (floors, walls, and sky are unaffected) — a top-down/
@@ -313,6 +357,9 @@ func New(lvl *wad.Level, tree bsp.Node, tex *assets.Textures) *Builder {
 		waterBuckets:    make(map[uint16]map[int32][]Vert),
 		sprites:         make(map[uint16][]Vert),
 		particleSprites: make(map[uint16][]Vert),
+		liveBuckets: [3]map[uint16]map[int32][]Vert{
+			make(map[uint16]map[int32][]Vert), make(map[uint16]map[int32][]Vert), make(map[uint16]map[int32][]Vert),
+		},
 	}
 	b.grid = newLevelVisGrid(lvl)
 	// Resolve the per-map WAD sky (a wall texture named SKY1..4) once; a
@@ -352,87 +399,343 @@ func newLevelVisGrid(lvl *wad.Level) *visGrid {
 }
 
 // Invalidate rebuilds the static world geometry (all subsectors' walls and
-// flats) and bumps StaticVersion so the backend re-uploads it. Call after a
-// door / lift / floor mover changes a sector's height — otherwise the
-// per-frame Build reuses the cached list untouched.
+// flats, less the live sectors' — see SetLiveSectors) and bumps
+// StaticVersion so the backend re-uploads it. Call after something baked
+// into it changes outside a live sector (a height, a light, a texture
+// Retexture can't follow) — otherwise the per-frame Build reuses the
+// cached list untouched.
 func (b *Builder) Invalidate() {
-	for slot := range b.buckets {
-		for cell := range b.buckets[slot] {
-			b.buckets[slot][cell] = b.buckets[slot][cell][:0]
-		}
-	}
-	for slot := range b.masked {
-		for cell := range b.masked[slot] {
-			b.masked[slot][cell] = b.masked[slot][cell][:0]
-		}
-	}
-	for slot := range b.waterBuckets {
-		for cell := range b.waterBuckets[slot] {
-			b.waterBuckets[slot][cell] = b.waterBuckets[slot][cell][:0]
-		}
+	b.liveValid = false
+	for _, m := range [...]map[uint16]map[int32][]Vert{b.buckets, b.masked, b.waterBuckets} {
+		truncateBuckets(m)
 	}
 	for i := range b.lvl.Subsectors {
-		b.emitSubsectorIdx(i)
+		b.emitSubsectorIdx(i, passStatic)
 	}
 	// Concatenate into one triangle list: opaque per-texture runs, then the
 	// sky run, then (after StaticOpaqueCount) the alpha-tested 2-sided
-	// middle-texture runs. One Draw per (texture, grid cell) run — see
-	// visgrid.go; this doesn't change what's drawn (every Draw is still
-	// submitted every frame), just how many Draw entries describe it.
-	b.g.StaticTris = b.g.StaticTris[:0]
-	b.g.StaticDraws = b.g.StaticDraws[:0]
-	for slot := uint16(0); int(slot) < len(b.g.Textures); slot++ {
-		for _, cell := range sortedCells(b.buckets[slot]) {
-			bk := b.buckets[slot][cell]
-			if len(bk) == 0 {
-				continue
-			}
-			minX, minY, maxX, maxY := bucketBounds(bk)
-			b.g.StaticDraws = append(b.g.StaticDraws, Draw{Tex: b.g.Textures[slot], Bright: b.g.Brightmaps[slot], First: len(b.g.StaticTris), Count: len(bk), Cell: cell, MinX: minX, MinY: minY, MaxX: maxX, MaxY: maxY})
-			b.g.StaticTris = append(b.g.StaticTris, bk...)
-		}
+	// middle-texture runs, then water (its own Draw list, Geometry.
+	// WaterDraws — a backend wanting real refraction draws everything else
+	// first). One Draw per (texture, grid cell) run — see visgrid.go — in
+	// sorted cell order, so the Draw order is the same build to build.
+	g := &b.g
+	g.StaticTris, g.StaticDraws, g.WaterDraws = g.StaticTris[:0], g.StaticDraws[:0], g.WaterDraws[:0]
+	for slot := range uint16(len(g.Textures)) {
+		b.appendRuns(&g.StaticDraws, &g.StaticTris, b.buckets, slot, true)
 	}
-	for _, cell := range sortedCells(b.buckets[SkyTex]) {
-		sky := b.buckets[SkyTex][cell]
-		if len(sky) == 0 {
-			continue
-		}
-		minX, minY, maxX, maxY := bucketBounds(sky)
-		b.g.StaticDraws = append(b.g.StaticDraws, Draw{Tex: nil, First: len(b.g.StaticTris), Count: len(sky), Cell: cell, MinX: minX, MinY: minY, MaxX: maxX, MaxY: maxY})
-		b.g.StaticTris = append(b.g.StaticTris, sky...)
+	b.appendRuns(&g.StaticDraws, &g.StaticTris, b.buckets, SkyTex, true)
+	g.StaticOpaqueCount = len(g.StaticTris)
+	for slot := range uint16(len(g.Textures)) {
+		b.appendRuns(&g.StaticDraws, &g.StaticTris, b.masked, slot, true)
 	}
-	b.g.StaticOpaqueCount = len(b.g.StaticTris)
-	for slot := uint16(0); int(slot) < len(b.g.Textures); slot++ {
-		for _, cell := range sortedCells(b.masked[slot]) {
-			bk := b.masked[slot][cell]
-			if len(bk) == 0 {
-				continue
-			}
-			minX, minY, maxX, maxY := bucketBounds(bk)
-			b.g.StaticDraws = append(b.g.StaticDraws, Draw{Tex: b.g.Textures[slot], Bright: b.g.Brightmaps[slot], First: len(b.g.StaticTris), Count: len(bk), Cell: cell, MinX: minX, MinY: minY, MaxX: maxX, MaxY: maxY})
-			b.g.StaticTris = append(b.g.StaticTris, bk...)
-		}
-	}
-	// Water is its own Draw list (Geometry.WaterDraws), not StaticDraws — a
-	// backend wanting real refraction needs to draw everything else first,
-	// then water in its own pass step. Still appended to the same
-	// StaticTris buffer as everything above.
-	b.g.WaterDraws = b.g.WaterDraws[:0]
-	for slot := uint16(0); int(slot) < len(b.g.Textures); slot++ {
-		for _, cell := range sortedCells(b.waterBuckets[slot]) {
-			bk := b.waterBuckets[slot][cell]
-			if len(bk) == 0 {
-				continue
-			}
-			minX, minY, maxX, maxY := bucketBounds(bk)
-			b.g.WaterDraws = append(b.g.WaterDraws, Draw{Tex: b.g.Textures[slot], Bright: b.g.Brightmaps[slot], First: len(b.g.StaticTris), Count: len(bk), Cell: cell, MinX: minX, MinY: minY, MaxX: maxX, MaxY: maxY})
-			b.g.StaticTris = append(b.g.StaticTris, bk...)
-		}
+	for slot := range uint16(len(g.Textures)) {
+		b.appendRuns(&g.WaterDraws, &g.StaticTris, b.waterBuckets, slot, true)
 	}
 	// Process-monotonic so a fresh builder (level change) and a door move
 	// both hand the backend a version it hasn't uploaded yet.
 	staticVersionSeq++
-	b.g.StaticVersion = staticVersionSeq
+	g.StaticVersion = staticVersionSeq
+}
+
+// truncateBuckets empties every (slot, cell) bucket of m in place, keeping
+// the backing arrays for the next emission.
+func truncateBuckets(m map[uint16]map[int32][]Vert) {
+	for _, byCell := range m {
+		for cell := range byCell {
+			byCell[cell] = byCell[cell][:0]
+		}
+	}
+}
+
+// appendRuns moves texture slot's buckets in m onto *tris as one Draw per
+// non-empty grid cell (appended to *draws), each carrying its vertices'
+// bounding box for UpdateVisibility. sorted orders the cells (the static
+// mesh, rebuilt rarely, wants a deterministic Draw order); the per-frame
+// live pass skips the sort.
+func (b *Builder) appendRuns(draws *[]Draw, tris *[]Vert, m map[uint16]map[int32][]Vert, slot uint16, sorted bool) {
+	byCell := m[slot]
+	if len(byCell) == 0 {
+		return
+	}
+	var tex, bright *assets.RGBA // nil Tex = the sky
+	if slot != SkyTex {
+		tex, bright = b.g.Textures[slot], b.g.Brightmaps[slot]
+	}
+	add := func(cell int32) {
+		bk := byCell[cell]
+		if len(bk) == 0 {
+			return
+		}
+		minX, minY, maxX, maxY := bucketBounds(bk)
+		*draws = append(*draws, Draw{Tex: tex, Bright: bright, First: len(*tris), Count: len(bk), Cell: cell, MinX: minX, MinY: minY, MaxX: maxX, MaxY: maxY})
+		*tris = append(*tris, bk...)
+	}
+	if !sorted {
+		for cell := range byCell {
+			add(cell)
+		}
+		return
+	}
+	for _, cell := range sortedCells(byCell) {
+		add(cell)
+	}
+}
+
+// SetLiveSectors marks the sectors whose baked-in state is changing right
+// now — moving (doors, lifts, crushers), flickering (light specials) or
+// scrolling (wall scrollers); secs are sector indices, nil for none.
+// Their floors, ceilings and every wall touching them leave the static
+// mesh and are re-emitted by each Build from their current state instead
+// (Geometry.LiveDraws), so a change costs a few quads per frame rather
+// than a full static rebuild and GPU re-upload. A room-over-room sector
+// whose platform's control sector is live counts as live too. Rebuilds
+// the static mesh (Invalidate) only when the set actually changes;
+// reports whether it did.
+func (b *Builder) SetLiveSectors(secs []int) bool {
+	n := len(b.lvl.Sectors)
+	next := make([]bool, n)
+	marked := false
+	for _, s := range secs {
+		if s >= 0 && s < n {
+			next[s], marked = true, true
+		}
+	}
+	for target, ctrls := range b.extraFloors {
+		for _, c := range ctrls {
+			if c >= 0 && c < n && next[c] && target >= 0 && target < n {
+				next[target] = true
+			}
+		}
+	}
+	if !marked {
+		next = nil
+	}
+	if slices.Equal(next, b.live) {
+		return false
+	}
+	b.live = next
+	b.liveSS = b.liveSS[:0]
+	if next != nil {
+		for i := range b.lvl.Subsectors {
+			if b.subsectorHasLive(i) {
+				b.liveSS = append(b.liveSS, i)
+			}
+		}
+	}
+	b.collectLiveInputs()
+	b.Invalidate()
+	return true
+}
+
+// collectLiveInputs lists what the live geometry is built from: every
+// sector on either side of a live subsector's segs (plus the control
+// sectors of its room-over-room platforms) and every such seg's front
+// sidedef — so emitLive can tell when nothing it reads has changed.
+func (b *Builder) collectLiveInputs() {
+	secSeen, sideSeen := map[int]bool{}, map[int]bool{}
+	b.liveSecs, b.liveSides = b.liveSecs[:0], b.liveSides[:0]
+	addSec := func(s int) {
+		if s < 0 || s >= len(b.lvl.Sectors) || secSeen[s] {
+			return
+		}
+		secSeen[s] = true
+		b.liveSecs = append(b.liveSecs, s)
+		for _, c := range b.extraFloors[s] {
+			if c >= 0 && c < len(b.lvl.Sectors) && !secSeen[c] {
+				secSeen[c] = true
+				b.liveSecs = append(b.liveSecs, c)
+			}
+		}
+	}
+	for _, i := range b.liveSS {
+		ss := b.lvl.Subsectors[i]
+		for _, seg := range b.lvl.Segs[ss.FirstSeg : int(ss.FirstSeg)+int(ss.SegCount)] {
+			if int(seg.Linedef) >= len(b.lvl.Linedefs) {
+				continue
+			}
+			ld := &b.lvl.Linedefs[seg.Linedef]
+			for side, sd := range [2]uint16{ld.FrontSidedef, ld.BackSidedef} {
+				if sd == wad.NoSidedef || int(sd) >= len(b.lvl.Sidedefs) {
+					continue
+				}
+				addSec(int(b.lvl.Sidedefs[sd].Sector))
+				// The seg's own (front) side supplies its textures/offsets.
+				if (side == 0) == (seg.Direction == 0) && !sideSeen[int(sd)] {
+					sideSeen[int(sd)] = true
+					b.liveSides = append(b.liveSides, int(sd))
+				}
+			}
+		}
+	}
+	b.liveSnapSec = slices.Grow(b.liveSnapSec[:0], len(b.liveSecs))[:len(b.liveSecs)]
+	b.liveSnapSide = slices.Grow(b.liveSnapSide[:0], len(b.liveSides))[:len(b.liveSides)]
+}
+
+// liveInputsUnchanged reports whether every input of the live geometry is
+// as it was at the last emission.
+func (b *Builder) liveInputsUnchanged() bool {
+	for i, s := range b.liveSecs {
+		if b.lvl.Sectors[s] != b.liveSnapSec[i] {
+			return false
+		}
+	}
+	for i, s := range b.liveSides {
+		if b.lvl.Sidedefs[s] != b.liveSnapSide[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// isLive reports whether sector index sec is in the SetLiveSectors set.
+func (b *Builder) isLive(sec int) bool { return sec >= 0 && sec < len(b.live) && b.live[sec] }
+
+// segTouchesLive reports whether either side of seg is a live sector — its
+// wall pieces then depend on that sector's current height (or, on its own
+// side, light and offsets).
+func (b *Builder) segTouchesLive(seg wad.Seg) bool {
+	if b.live == nil || int(seg.Linedef) >= len(b.lvl.Linedefs) {
+		return false
+	}
+	ld := &b.lvl.Linedefs[seg.Linedef]
+	for _, sd := range [2]uint16{ld.FrontSidedef, ld.BackSidedef} {
+		if sd != wad.NoSidedef && int(sd) < len(b.lvl.Sidedefs) && b.isLive(int(b.lvl.Sidedefs[sd].Sector)) {
+			return true
+		}
+	}
+	return false
+}
+
+// subsectorHasLive reports whether subsector idx has any live geometry: its
+// own sector live, or a seg bordering one.
+func (b *Builder) subsectorHasLive(idx int) bool {
+	ss := b.lvl.Subsectors[idx]
+	first, n := int(ss.FirstSeg), int(ss.SegCount)
+	if n <= 0 || first < 0 || first+n > len(b.lvl.Segs) {
+		return false
+	}
+	for _, s := range b.lvl.Segs[first : first+n] {
+		if b.segTouchesLive(s) {
+			return true
+		}
+	}
+	return false
+}
+
+// emitLive puts every live sector's geometry, from its current state, at
+// the head of Tris / LiveDraws — Build's per-frame half of SetLiveSectors.
+// It's re-emitted only when an input changed (a door's drawn height, a
+// light stepping, a scroller ticking); otherwise last frame's copy,
+// already in place, is kept.
+// Emission reuses the static path by swapping the live scratch buckets in
+// for the static ones for the duration.
+func (b *Builder) emitLive() {
+	g := &b.g
+	if b.liveValid && b.liveInputsUnchanged() {
+		g.Tris = g.Tris[:b.liveVerts] // last frame's, still at the head of Tris
+		return
+	}
+	g.LiveDraws, g.LiveOpaqueDraws = g.LiveDraws[:0], 0
+	b.liveVerts, b.liveValid = 0, false
+	if len(b.liveSS) == 0 {
+		return
+	}
+	mb := &b.liveBuckets
+	for _, m := range mb {
+		truncateBuckets(m)
+	}
+	b.buckets, b.masked, b.waterBuckets, mb[0], mb[1], mb[2] = mb[0], mb[1], mb[2], b.buckets, b.masked, b.waterBuckets
+	for _, i := range b.liveSS {
+		b.emitSubsectorIdx(i, passLive)
+	}
+	b.buckets, b.masked, b.waterBuckets, mb[0], mb[1], mb[2] = mb[0], mb[1], mb[2], b.buckets, b.masked, b.waterBuckets
+
+	for slot := range uint16(len(g.Textures)) {
+		b.appendRuns(&g.LiveDraws, &g.Tris, mb[0], slot, false)
+	}
+	g.LiveOpaqueDraws = len(g.LiveDraws)
+	b.appendRuns(&g.LiveDraws, &g.Tris, mb[0], SkyTex, false)
+	for slot := range uint16(len(g.Textures)) {
+		b.appendRuns(&g.LiveDraws, &g.Tris, mb[1], slot, false)
+		b.appendRuns(&g.LiveDraws, &g.Tris, mb[2], slot, false)
+	}
+	for i, s := range b.liveSecs {
+		b.liveSnapSec[i] = b.lvl.Sectors[s]
+	}
+	for i, s := range b.liveSides {
+		b.liveSnapSide[i] = b.lvl.Sidedefs[s]
+	}
+	b.liveVerts, b.liveValid = len(g.Tris), true
+}
+
+// Retexture follows animated textures stepping a frame without rebuilding
+// the static mesh: every static draw showing the flat named by a key of
+// flats (or the wall texture named by a key of walls) is repointed at the
+// value's texture. Only the bound texture changes — the GPU reads no
+// per-vertex texture — so this is valid while the old and new frames share
+// a size and texel density (UVs are baked from those). Reports false,
+// changing nothing, when that doesn't hold or a texture would map to two
+// different ones; the caller then rebuilds with Invalidate. The live
+// sectors' geometry needs nothing: it's re-emitted from the current names
+// every Build.
+func (b *Builder) Retexture(flats, walls map[string]string) bool {
+	type swap struct{ tex, bright *assets.RGBA }
+	remap := make(map[*assets.RGBA]swap, len(flats)+len(walls))
+	add := func(oldName, newName string, lookup func(string) (*assets.RGBA, bool)) bool {
+		o, ok1 := lookup(oldName)
+		n, ok2 := lookup(newName)
+		if !ok1 || !ok2 || o == nil || n == nil {
+			return ok1 == ok2 && o == n // both unresolved: nothing drawn either way
+		}
+		if o.Width != n.Width || o.Height != n.Height || o.TexelsPerUnit != n.TexelsPerUnit {
+			return false
+		}
+		if prev, dup := remap[o]; dup && prev.tex != n {
+			return false
+		}
+		bm, _ := b.tex.Brightmap(newName, n)
+		remap[o] = swap{n, bm}
+		return true
+	}
+	for o, n := range flats {
+		if !add(o, n, b.tex.Flat) {
+			return false
+		}
+	}
+	for o, n := range walls {
+		if !add(o, n, b.tex.WallTexture) {
+			return false
+		}
+	}
+	for _, sw := range remap {
+		b.slot(sw.tex, sw.bright) // registered, so the backend uploads it
+	}
+	for _, draws := range [2][]Draw{b.g.StaticDraws, b.g.WaterDraws} {
+		for i := range draws {
+			if sw, ok := remap[draws[i].Tex]; ok && draws[i].Tex != nil {
+				draws[i].Tex, draws[i].Bright = sw.tex, sw.bright
+			}
+		}
+	}
+	return true
+}
+
+// PreloadTextures registers the named flats and wall textures with the
+// geometry (Geometry.Textures), so a backend uploads them up front — the
+// frames of every animated texture at level load, rather than a GPU stall
+// the first time each frame is shown.
+func (b *Builder) PreloadTextures(flats, walls []string) {
+	for _, set := range [2]struct {
+		names  []string
+		lookup func(string) (*assets.RGBA, bool)
+	}{{flats, b.tex.Flat}, {walls, b.tex.WallTexture}} {
+		for _, name := range set.names {
+			if t, ok := set.lookup(name); ok && t != nil {
+				bm, _ := b.tex.Brightmap(name, t)
+				b.slot(t, bm)
+			}
+		}
+	}
 }
 
 // bucketBounds is the world-space (X, Y) bounding box of a bucket's
@@ -503,9 +806,10 @@ func cullDraws(cam Camera, draws []Draw, visible *[]bool) (visibleDraws, totalDr
 	} else {
 		*visible = (*visible)[:totalDraws]
 	}
+	cone := NewViewCone(cam)
 	for i, d := range draws {
 		totalVerts += d.Count
-		vis := cellVisible(cam, d.MinX, d.MinY, d.MaxX, d.MaxY)
+		vis := cone.boxVisible(d.MinX, d.MinY, d.MaxX, d.MaxY)
 		(*visible)[i] = vis
 		if vis {
 			visibleDraws++
@@ -518,7 +822,8 @@ func cullDraws(cam Camera, draws []Draw, visible *[]bool) (visibleDraws, totalDr
 var staticVersionSeq uint32
 
 // Build clears the per-frame dynamic geometry (AddSprites / AddVoxels refill
-// it) and returns the Geometry. The static world part is untouched — no BSP
+// it), emits the live sectors (SetLiveSectors) from their current state,
+// and returns the Geometry. The static world part is untouched — no BSP
 // walk, no per-frame triangle rebuild. The camera args are unused now (the
 // whole level's geometry is submitted and the GPU depth-tests it); kept for
 // call-site stability.
@@ -528,6 +833,7 @@ func (b *Builder) Build(_, _ float32) *Geometry {
 	b.g.ParticleDraws = b.g.ParticleDraws[:0]
 	b.g.TransparentDraws = b.g.TransparentDraws[:0]
 	b.g.Voxels = b.g.Voxels[:0]
+	b.emitLive()
 	return &b.g
 }
 
@@ -882,9 +1188,10 @@ func (b *Builder) slot(t, bright *assets.RGBA) uint16 {
 // of the depth pre-pass), the water set for KindLiquidWater (kept apart so
 // it can become its own Draw list — see Geometry.WaterDraws; lava/nukage
 // are NOT split out, they stay in the opaque set like any other flat), the
-// opaque set otherwise. b.curCell is set once per subsector by
-// emitSubsectorIdx before any of its triangles reach here.
+// opaque set otherwise. b.curCell / b.curSector are set once per subsector
+// by emitSubsectorIdx before any of its triangles reach here.
 func (b *Builder) emit(a, c, d Vert) {
+	a.Sector, c.Sector, d.Sector = b.curSector, b.curSector, b.curSector
 	m := b.buckets
 	switch a.Kind {
 	case KindMasked:
@@ -900,7 +1207,17 @@ func (b *Builder) emit(a, c, d Vert) {
 	byCell[b.curCell] = append(byCell[b.curCell], a, c, d)
 }
 
-func (b *Builder) emitSubsectorIdx(idx int) {
+// emitPass picks which of a subsector's geometry emitSubsectorIdx emits:
+// the static mesh (everything not tied to a SetLiveSectors sector) or the
+// per-frame live geometry (exactly the rest).
+type emitPass uint8
+
+const (
+	passStatic emitPass = iota
+	passLive
+)
+
+func (b *Builder) emitSubsectorIdx(idx int, pass emitPass) {
 	if idx < 0 || idx >= len(b.lvl.Subsectors) {
 		return
 	}
@@ -944,18 +1261,32 @@ func (b *Builder) emitSubsectorIdx(idx int) {
 		cx, cy = cx/n, cy/n
 	}
 	b.curCell = b.grid.cellOf(cx, cy)
+	b.curSector = SectorTag(int(frontSD.Sector))
 
-	b.emitFlat(poly, frontSec, false) // floor, faces up
-	if !b.SkipCeilings {
-		b.emitFlat(poly, frontSec, true) // ceiling, faces down
-	}
-	if len(b.extraFloors) > 0 {
-		b.emitExtraFloors(poly, int(frontSD.Sector))
+	if b.isLive(int(frontSD.Sector)) == (pass == passLive) {
+		b.emitFlat(poly, frontSec, false) // floor, faces up
+		if !b.SkipCeilings {
+			b.emitFlat(poly, frontSec, true) // ceiling, faces down
+		}
+		if len(b.extraFloors) > 0 {
+			b.emitExtraFloors(poly, int(frontSD.Sector))
+		}
 	}
 
 	for _, s := range segs {
-		b.emitSegWalls(s)
+		if b.segTouchesLive(s) == (pass == passLive) {
+			b.emitSegWalls(s)
+		}
 	}
+}
+
+// SectorTag is Vert.Sector / VoxelInstance.Sector for level sector sec:
+// sec+1, or 0 (unmasked) past what the packed 16 bits can hold.
+func SectorTag(sec int) uint16 {
+	if sec < 0 || sec >= 0xFFFF {
+		return 0
+	}
+	return uint16(sec + 1)
 }
 
 // pt converts a wad vertex to a bsp.Point (the seg-fan fallback path).

@@ -83,76 +83,22 @@ func (r *Renderer) worldCreateResolvePass() error {
 		return err
 	}
 
-	// Same shape as worldCreateAmbientPass's own render pass: a previous
-	// frame's blit read must finish before this frame's clear/write, and
-	// this frame's write must be visible to the blit's later read.
-	color := vk.AttachmentDescription{
-		Format: resolveFormat, Samples: vk.SampleCount1Bit,
-		LoadOp: vk.AttachmentLoadOpClear, StoreOp: vk.AttachmentStoreOpStore,
-		StencilLoadOp: vk.AttachmentLoadOpDontCare, StencilStoreOp: vk.AttachmentStoreOpDontCare,
-		InitialLayout: vk.ImageLayoutUndefined, FinalLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-	}
-	ref := vk.AttachmentReference{Attachment: 0, Layout: vk.ImageLayoutColorAttachmentOptimal}
-	sub := vk.SubpassDescription{
-		PipelineBindPoint: vk.PipelineBindPointGraphics, ColorAttachmentCount: 1,
-		PColorAttachments: []vk.AttachmentReference{ref},
-	}
-	deps := []vk.SubpassDependency{
-		{
-			SrcSubpass:    vk.SubpassExternal,
-			DstSubpass:    0,
-			SrcStageMask:  vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit),
-			DstStageMask:  vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit),
-			SrcAccessMask: vk.AccessFlags(vk.AccessShaderReadBit),
-			DstAccessMask: vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
-		},
-		{
-			SrcSubpass:    0,
-			DstSubpass:    vk.SubpassExternal,
-			SrcStageMask:  vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit),
-			DstStageMask:  vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit),
-			SrcAccessMask: vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
-			DstAccessMask: vk.AccessFlags(vk.AccessShaderReadBit),
-		},
-	}
-	rpInfo := vk.RenderPassCreateInfo{
-		SType: vk.StructureTypeRenderPassCreateInfo, AttachmentCount: 1,
-		PAttachments: []vk.AttachmentDescription{color}, SubpassCount: 1,
-		PSubpasses: []vk.SubpassDescription{sub}, DependencyCount: uint32(len(deps)), PDependencies: deps,
-	}
-	var rp vk.RenderPass
-	if res := vk.CreateRenderPass(r.device, &rpInfo, nil, &rp); res != vk.Success {
-		return fmt.Errorf("vulkan: resolve render pass: %s", vk.Error(res))
+	rp, err := r.newSampledColorPass(resolveFormat, vk.AttachmentLoadOpClear, vk.ImageLayoutUndefined, "resolve")
+	if err != nil {
+		return err
 	}
 	wr.resolve.rp = rp
 
-	fbInfo := vk.FramebufferCreateInfo{
-		SType: vk.StructureTypeFramebufferCreateInfo, RenderPass: rp,
-		AttachmentCount: 1, PAttachments: []vk.ImageView{wr.resolve.img.view},
-		Width: uint32(w), Height: uint32(h), Layers: 1,
-	}
-	var fb vk.Framebuffer
-	if res := vk.CreateFramebuffer(r.device, &fbInfo, nil, &fb); res != vk.Success {
-		return fmt.Errorf("vulkan: resolve framebuffer: %s", vk.Error(res))
+	fb, err := r.newFramebuffer(rp, w, h, "resolve", wr.resolve.img.view)
+	if err != nil {
+		return err
 	}
 	wr.resolve.fb = fb
 
-	mk := func(bindings []vk.DescriptorSetLayoutBinding) (vk.DescriptorSetLayout, error) {
-		info := vk.DescriptorSetLayoutCreateInfo{
-			SType:        vk.StructureTypeDescriptorSetLayoutCreateInfo,
-			BindingCount: uint32(len(bindings)),
-			PBindings:    bindings,
-		}
-		var l vk.DescriptorSetLayout
-		if res := vk.CreateDescriptorSetLayout(r.device, &info, nil, &l); res != vk.Success {
-			return nil, fmt.Errorf("vulkan: resolve dsl: %s", vk.Error(res))
-		}
-		return l, nil
-	}
-	if wr.resolve.dslSrc, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0), samplerBinding(1), samplerBinding(2), samplerBinding(3)}); err != nil {
+	if wr.resolve.dslSrc, err = r.newDescriptorSetLayout("resolve", samplerBinding(0), samplerBinding(1), samplerBinding(2), samplerBinding(3)); err != nil {
 		return err
 	}
-	if wr.resolve.dslSample, err = mk([]vk.DescriptorSetLayoutBinding{samplerBinding(0)}); err != nil {
+	if wr.resolve.dslSample, err = r.newDescriptorSetLayout("resolve", samplerBinding(0)); err != nil {
 		return err
 	}
 
@@ -177,15 +123,7 @@ func (r *Renderer) worldCreateResolvePass() error {
 	wr.resolve.pool = pool
 
 	alloc := func(layout vk.DescriptorSetLayout) (vk.DescriptorSet, error) {
-		info := vk.DescriptorSetAllocateInfo{
-			SType: vk.StructureTypeDescriptorSetAllocateInfo, DescriptorPool: pool,
-			DescriptorSetCount: 1, PSetLayouts: []vk.DescriptorSetLayout{layout},
-		}
-		var s vk.DescriptorSet
-		if res := vk.AllocateDescriptorSets(r.device, &info, &s); res != vk.Success {
-			return nil, fmt.Errorf("vulkan: resolve descriptor set: %s", vk.Error(res))
-		}
-		return s, nil
+		return r.allocDescriptorSet(pool, layout, "resolve")
 	}
 
 	var writes []vk.WriteDescriptorSet
@@ -197,34 +135,10 @@ func (r *Renderer) worldCreateResolvePass() error {
 		}
 		wr.resolve.setSrc[i] = s
 		writes = append(writes,
-			vk.WriteDescriptorSet{
-				SType: vk.StructureTypeWriteDescriptorSet, DstSet: s, DstBinding: 0,
-				DescriptorCount: 1, DescriptorType: vk.DescriptorTypeCombinedImageSampler,
-				PImageInfo: []vk.DescriptorImageInfo{{
-					Sampler: wr.clampSampler, ImageView: sl.scene.view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-				}},
-			},
-			vk.WriteDescriptorSet{
-				SType: vk.StructureTypeWriteDescriptorSet, DstSet: s, DstBinding: 1,
-				DescriptorCount: 1, DescriptorType: vk.DescriptorTypeCombinedImageSampler,
-				PImageInfo: []vk.DescriptorImageInfo{{
-					Sampler: wr.clampSampler, ImageView: wr.bloom.mip[0].img.view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-				}},
-			},
-			vk.WriteDescriptorSet{
-				SType: vk.StructureTypeWriteDescriptorSet, DstSet: s, DstBinding: 2,
-				DescriptorCount: 1, DescriptorType: vk.DescriptorTypeCombinedImageSampler,
-				PImageInfo: []vk.DescriptorImageInfo{{
-					Sampler: wr.depthSampler, ImageView: sl.depth.view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-				}},
-			},
-			vk.WriteDescriptorSet{
-				SType: vk.StructureTypeWriteDescriptorSet, DstSet: s, DstBinding: 3,
-				DescriptorCount: 1, DescriptorType: vk.DescriptorTypeCombinedImageSampler,
-				PImageInfo: []vk.DescriptorImageInfo{{
-					Sampler: wr.clampSampler, ImageView: wr.ambient.imgBlur.view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-				}},
-			},
+			imageWrite(s, 0, wr.clampSampler, sl.scene.view),
+			imageWrite(s, 1, wr.clampSampler, wr.bloom.mip[0].img.view),
+			imageWrite(s, 2, wr.depthSampler, sl.depth.view),
+			imageWrite(s, 3, wr.clampSampler, wr.ambient.imgBlur.view),
 		)
 	}
 	ss, err := alloc(wr.resolve.dslSample)
@@ -232,13 +146,7 @@ func (r *Renderer) worldCreateResolvePass() error {
 		return err
 	}
 	wr.resolve.setSample = ss
-	writes = append(writes, vk.WriteDescriptorSet{
-		SType: vk.StructureTypeWriteDescriptorSet, DstSet: ss, DstBinding: 0,
-		DescriptorCount: 1, DescriptorType: vk.DescriptorTypeCombinedImageSampler,
-		PImageInfo: []vk.DescriptorImageInfo{{
-			Sampler: wr.clampSampler, ImageView: wr.resolve.img.view, ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
-		}},
-	})
+	writes = append(writes, imageWrite(ss, 0, wr.clampSampler, wr.resolve.img.view))
 	vk.UpdateDescriptorSets(r.device, uint32(len(writes)), writes, 0, nil)
 
 	if wr.resolve.plGen, err = r.litPipelineLayout(wr.resolve.dslSrc, 64); err != nil {

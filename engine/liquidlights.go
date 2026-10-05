@@ -11,10 +11,9 @@ import (
 // nukage as plain animated flats — no light comes off them. Here every
 // lava sector seeds one or more warm point lights so the pool throws
 // orange light onto the walls, monsters and the player around it, and
-// every nukage/slime sector seeds a dim sickly-green light so a toxic room
-// reads green even in the dark. Water and blood get nothing (blood is just
-// decor; water has no distinct look of its own beyond its flat's own
-// animation).
+// every nukage/slime sector seeds a slight green glow that hugs the pool.
+// Water and blood get nothing (blood is just decor; water has no distinct
+// look of its own beyond its flat's own animation).
 //
 // Built once per level by buildStaticLights (after the decoration lights)
 // and sampled every frame by collectLights like any other static emitter,
@@ -61,7 +60,23 @@ func (g *Game) hwLiquidTint() (r, gg, b, amt float32) {
 	if sec == nil {
 		return 0, 0, 0, 0
 	}
-	return liquidTintFor(liquidKindOfFlat(sec.FloorTexture))
+	kind := liquidKindOfFlat(sec.FloorTexture)
+	r, gg, b, amt = liquidTintFor(kind)
+	if kind == liqAcid {
+		amt *= float32(lookDownFactor(g.Camera.Pitch))
+	}
+	return r, gg, b, amt
+}
+
+// lookDownFactor is 0 looking level or up, rising smoothly to 1 between
+// 10° and 60° down. Nukage's screen wash is only a faint green glow off
+// the pool you're looking at: tinting the whole frame whatever you looked
+// at turned every wall, monster and the sky green just for standing in it.
+func lookDownFactor(pitch float64) float64 {
+	const from, to = 10 * math.Pi / 180, 60 * math.Pi / 180
+	t := (-pitch - from) / (to - from)
+	t = math.Max(0, math.Min(1, t))
+	return t * t * (3 - 2*t)
 }
 
 // liquidTintFor maps a liquid kind (liquidKindOfFlat) to worldblit.frag's
@@ -72,7 +87,7 @@ func liquidTintFor(kind int) (r, gg, b, amt float32) {
 	case liqLava:
 		return 1.0, 0.42, 0.12, -0.32
 	case liqAcid:
-		return 0.26, 0.80, 0.16, 0.30
+		return 0.26, 0.80, 0.16, 0.10 // at most — hwLiquidTint scales it by lookDownFactor
 	case liqBlood:
 		return 0.72, 0.06, 0.06, 0.34
 	}
@@ -120,15 +135,20 @@ func (g *Game) appendLiquidLights(firstSeed int) int {
 
 		var r, gg, b, inten, baseRad float32
 		var flicker bool
+		lift := 16.0
 		switch kind {
 		case liqLava:
 			r, gg, b = 1.0, 0.42, 0.13
 			inten, flicker = 1.7, true
 			baseRad = 260
 		case liqAcid:
-			r, gg, b = 0.32, 0.85, 0.28
-			inten, flicker = 0.75, true
-			baseRad = 200
+			// A slight glow hugging the pool — dim, short and low, so it
+			// tints the floor and the foot of the walls around it, not the
+			// whole room (and everything in it) green.
+			r, gg, b = 0.45, 0.85, 0.40
+			inten, flicker = 0.3, true
+			baseRad = 110
+			lift = 4
 		}
 		// Radius scales up for a big pool, clamped so one lake isn't lit by a
 		// single sun.
@@ -141,7 +161,7 @@ func (g *Game) appendLiquidLights(firstSeed int) int {
 			if added >= maxLiquidLights {
 				break
 			}
-			z := s.FloorZAt(p[0], p[1]) + 16
+			z := s.FloorZAt(p[0], p[1]) + lift
 			g.staticLights = append(g.staticLights, staticLight{
 				x: p[0], y: p[1], z: z,
 				r: r, g: gg, b: b,

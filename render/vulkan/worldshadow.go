@@ -365,8 +365,9 @@ func (r *Renderer) worldCreateShadowPipeline() error {
 }
 
 // recordShadowMaps renders this frame's shadow-casting lights' cube depth
-// maps (see shadowBudget) into sl.shadowCube[], static geometry only
-// (g.StaticDraws' opaque prefix — no sprites/voxels/particles: walls/
+// maps (see shadowBudget) into sl.shadowCube[], level geometry only
+// (g.StaticDraws' opaque prefix plus the live sectors' solid walls and
+// flats, g.LiveDraws[:LiveOpaqueDraws] — no sprites/voxels/particles: walls/
 // floors/ceilings are what matters for room-shadowing, and skipping the
 // rest keeps the 6-or-12 extra draws this costs cheap). No-op when
 // !wr.realShadows or there's nothing to cast from.
@@ -382,7 +383,6 @@ func (r *Renderer) recordShadowMaps(cmd vk.CommandBuffer, frame int, g *worldgeo
 	sl := &wr.slots[frame]
 
 	vk.CmdBindPipeline(cmd, vk.PipelineBindPointGraphics, wr.pipeShadow)
-	vk.CmdBindVertexBuffers(cmd, 0, 1, []vk.Buffer{wr.staticVBO}, []vk.DeviceSize{0})
 	vk.CmdSetViewport(cmd, 0, 1, []vk.Viewport{fullViewport(shadowMapSize, shadowMapSize)})
 	vk.CmdSetScissor(cmd, 0, 1, []vk.Rect2D{fullScissor(shadowMapSize, shadowMapSize)})
 
@@ -405,11 +405,18 @@ func (r *Renderer) recordShadowMaps(cmd vk.CommandBuffer, frame int, g *worldgeo
 			}, vk.SubpassContentsInline)
 			vk.CmdPushConstants(cmd, wr.plShadow,
 				vk.ShaderStageFlags(vk.ShaderStageVertexBit)|vk.ShaderStageFlags(vk.ShaderStageFragmentBit), 0, 80, unsafe.Pointer(&pc[0]))
+			vk.CmdBindVertexBuffers(cmd, 0, 1, []vk.Buffer{wr.staticVBO}, []vk.DeviceSize{0})
 			for _, d := range g.StaticDraws {
 				if d.First >= g.StaticOpaqueCount || d.Count == 0 {
 					continue
 				}
 				vk.CmdDraw(cmd, uint32(d.Count), 1, uint32(d.First), 0)
+			}
+			if live := g.LiveDraws[:g.LiveOpaqueDraws]; len(live) > 0 { // a moving door still blocks light
+				vk.CmdBindVertexBuffers(cmd, 0, 1, []vk.Buffer{sl.vbuf}, []vk.DeviceSize{0})
+				for _, d := range live {
+					vk.CmdDraw(cmd, uint32(d.Count), 1, uint32(d.First), 0)
+				}
 			}
 			vk.CmdEndRenderPass(cmd)
 

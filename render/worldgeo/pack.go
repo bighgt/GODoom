@@ -35,7 +35,7 @@ func PackVerts(verts []Vert, buf []byte) []byte {
 		le.PutUint32(buf[o+12:], math.Float32bits(v.U))
 		le.PutUint32(buf[o+16:], math.Float32bits(v.V))
 		le.PutUint32(buf[o+20:], math.Float32bits(v.Light))
-		le.PutUint32(buf[o+24:], uint32(v.Kind))
+		le.PutUint32(buf[o+24:], uint32(v.Kind)|uint32(v.Sector)<<16)
 		le.PutUint32(buf[o+28:], math.Float32bits(v.Nx))
 		le.PutUint32(buf[o+32:], math.Float32bits(v.Ny))
 		le.PutUint32(buf[o+36:], math.Float32bits(v.Nz))
@@ -58,7 +58,8 @@ type VertexAttribute struct {
 //	0  vec3  position   (world, map units)
 //	1  vec2  uv         (texture tiles, 0..1)
 //	2  float light      (sector light 0..1, fake contrast folded in for walls)
-//	3  uint  kind       (Kind* — the shader keys texturing / alpha-test / sky off it)
+//	3  uint  kind       (low 16 bits: Kind* — the shader keys texturing / alpha-test /
+//	                     sky off it; high 16 bits: Vert.Sector, for dynamic-light reach)
 //	4  vec3  normal      (unit world-space surface normal, for the dynamic-light Lambert term)
 //	5  float alpha      (KindSpriteTrans's real blend weight; ignored by every other kind)
 func VertexAttributes() []VertexAttribute {
